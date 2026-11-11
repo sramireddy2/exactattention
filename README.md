@@ -32,6 +32,7 @@ certified falls back to the exact path.
 | Standard `scaled_dot_product_attention`, same rows, CPU vs Intel GPU | **98.7%** of rows differ in bf16, 9.7% in fp32 |
 | Elements off float64 attention by at least 1 ulp, vs standard fp32 attention | **3× fewer** |
 | Narrowest window with zero fallbacks on sampled real rows | 44 bits (cliff at 40: 8/150 rows) |
+| **Speculative decoding** (Qwen3-0.6B, 48 greedy tokens, 4-token drafts) vs sequential decoding | standard: tokens diverge at position 4, 47/48 logit rows differ. Row-invariant linears with SDPA: still 47/48. **ExactAttention: identical tokens, 0/48 rows differ** ([details](results/spec_decode_qwen3-0.6b.md)) |
 | Portable fixture: 2 real heads, 4,096 rows | same SHA-256 from the C++ kernel, torch on CPU and torch on the Intel GPU; standard SDPA hashes differ per device |
 
 **Check it on any machine:** `python scripts/fixture.py check --backend cpp` (or `torch:cuda`,
