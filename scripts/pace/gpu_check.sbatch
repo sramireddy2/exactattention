@@ -31,3 +31,7 @@ python scripts/fixture.py check --backend tritontc:cuda
 
 echo "== kernel test suites on CUDA =="
 EA_TRITON_DEVICE=cuda python -m pytest -q -p no:cacheprovider tests/test_triton.py tests/test_torch_impl.py tests/test_cpu_kernel.py
+
+echo "== decode-shape timing vs SDPA =="
+mkdir -p results/pace
+python scripts/bench_decode.py --rows 16 --keys 1024,4096,16384 --out "results/pace/bench_decode_${SLURM_JOB_ID:-local}.md"

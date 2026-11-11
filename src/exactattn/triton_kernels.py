@@ -409,50 +409,44 @@ def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, O
 # Host wrapper
 # ---------------------------------------------------------------------------
 
-def attention_triton(q_bits, k_bits, v_bits, alpha, kv_len, out: str = "bf16", splits: int = 4,
-                     block_m: int = 16, block_n: int = 16, block_dv: int | None = None,
-                     merge_order=None, device: str = "cpu", fallback: bool = True,
-                     exp2_margin: float = 2.0 ** -26, use_tc: bool = False, sq: int = 3, sk: int = 4,
-                     k_slices=None, tc_fallback: bool = True):
-    """q: (R, d), k: (n, d), v: (n, dv) bf16 bits (numpy uint16). Row r attends keys
-    [0, kv_len[r]): causal, decode, prefill and chunked prefill all have this shape.
-    Returns (out, flags)."""
-    R, d = q_bits.shape
-    n, dv = v_bits.shape
+def tc_slices(bits: np.ndarray, S: int, dev) -> list:
+    """int8 slices of q or K rows, as device tensors: [X, lsb, l1, lost]. For K, do this once when
+    the KV cache is written."""
+    X, lsb, l1, lost = slice_rows(bits, S)
+    return [torch.from_numpy(np.ascontiguousarray(X)).to(dev), torch.from_numpy(lsb.astype(np.int64)).to(dev),
+            torch.from_numpy(l1.astype(np.float64)).to(dev),
+            torch.from_numpy(lost.any(axis=1).astype(np.int32)).to(dev)]
+
+
+def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int = 4, block_m: int = 16,
+           block_n: int = 16, block_dv: int = 32, merge_order=None, exp2_margin: float = 2.0 ** -26,
+           q_tc=None, k_tc=None, tc_fallback: bool = True):
+    """Device-level launch with no host transfers and no sync.
+
+    Qt (R, d), Kt (n, d), Vt (n, dv) are int16 views of bf16 on the device; KL (R,) is int32.
+    Pass q_tc/k_tc (from tc_slices) to use tensor-core scores. Returns (OUT int32 (R, dv),
+    split_flags, combine_flags), all on the device."""
+    R, d = Qt.shape
+    n, dv = Vt.shape
     assert d <= 128 and (d & (d - 1)) == 0, "d must be a power of two <= 128"
-    block_dv = block_dv or min(dv, 32)
     assert dv % block_dv == 0
-    dev = torch.device(device)
-    kv_len = np.asarray(kv_len, dtype=np.int32)
-    maxlen = int(kv_len.max(initial=0))
+    dev = Qt.device
     key_log2 = max(1, int(np.ceil(np.log2(max(2, maxlen)))))
     fz = fn = 64 - 3 - key_log2
     split_len = max(block_n, -(-max(maxlen, 1) // splits))
     split_len = -(-split_len // block_n) * block_n
     nsplit = max(1, -(-max(maxlen, 1) // split_len))
     am, ae = decode_fp32(np.float32(alpha))
-
-    def t16(x):
-        return torch.from_numpy(np.ascontiguousarray(x, dtype=np.uint16).view(np.int16)).to(dev)
-
-    Qt, Kt, Vt = t16(q_bits), t16(k_bits), t16(v_bits)
-    KL = torch.from_numpy(kv_len).to(dev)
+    use_tc = q_tc is not None
     if use_tc:
-        # int8 slices: q per call; K once per cache write (pass k_slices to reuse them).
-        qX, qlsb, ql1, qlost = slice_rows(q_bits, sq)
-        kX, klsb, kl1, klost = k_slices if k_slices is not None else slice_rows(k_bits, sk)
-        sk = kX.shape[0]
-        tc = [torch.from_numpy(np.ascontiguousarray(qX)).to(dev), torch.from_numpy(np.ascontiguousarray(kX)).to(dev),
-              torch.from_numpy(qlsb.astype(np.int64)).to(dev), torch.from_numpy(ql1.astype(np.float64)).to(dev),
-              torch.from_numpy(qlost.any(axis=1).astype(np.int32)).to(dev),
-              torch.from_numpy(klsb.astype(np.int64)).to(dev), torch.from_numpy(kl1.astype(np.float64)).to(dev),
-              torch.from_numpy(klost.any(axis=1).astype(np.int32)).to(dev)]
+        tc = [q_tc[0], k_tc[0], q_tc[1], q_tc[2], q_tc[3], k_tc[1], k_tc[2], k_tc[3]]
+        sq, sk = q_tc[0].shape[0], k_tc[0].shape[0]
     else:
         z8 = torch.zeros(1, dtype=torch.int8, device=dev)
         z64 = torch.zeros(1, dtype=torch.int64, device=dev)
         zf = torch.zeros(1, dtype=torch.float64, device=dev)
         z32 = torch.zeros(1, dtype=torch.int32, device=dev)
-        tc = [z8, z8, z64, zf, z32, z64, zf, z32]
+        tc, sq, sk = [z8, z8, z64, zf, z32, z64, zf, z32], 1, 1
     i64 = dict(dtype=torch.int64, device=dev)
     PR_ = torch.empty((nsplit, R), **i64)
     PZ_ = torch.empty((nsplit, R), **i64)
@@ -482,13 +476,44 @@ def attention_triton(q_bits, k_bits, v_bits, alpha, kv_len, out: str = "bf16", s
     _ea_combine_kernel[(triton.cdiv(R, block_m), ncb)](PR_, PZ_, PZE_, PNR_, PN_, PNE_, ORD, nsplit, R, fz, fn,
                                                        OUT, OF, DV=dv, BLOCK_M=block_m, BLOCK_DV=block_dv,
                                                        P=p, QMIN=qmin, N_ITER=96, OUT_FP32=(out == "fp32"))
-    _LAST_DEBUG.update(split_flags=FL.cpu().numpy(), combine_flags=OF.cpu().numpy(), PR=PR_.cpu().numpy(),
-                       PZ=PZ_.cpu().numpy(), PZE=PZE_.cpu().numpy(), PNR=PNR_.cpu().numpy(), PN=PN_.cpu().numpy(),
-                       PNE=PNE_.cpu().numpy(), fz=fz, fn=fn)
+    _LAST_DEBUG.update(split_flags=FL, combine_flags=OF, PR=PR_, PZ=PZ_, PZE=PZE_, PNR=PNR_, PN=PN_, PNE=PNE_,
+                       fz=fz, fn=fn)
+    return OUT, FL, OF
+
+
+def attention_triton(q_bits, k_bits, v_bits, alpha, kv_len, out: str = "bf16", splits: int = 4,
+                     block_m: int = 16, block_n: int = 16, block_dv: int | None = None,
+                     merge_order=None, device: str = "cpu", fallback: bool = True,
+                     exp2_margin: float = 2.0 ** -26, use_tc: bool = False, sq: int = 3, sk: int = 4,
+                     k_slices=None, tc_fallback: bool = True):
+    """numpy-level API. q: (R, d), k: (n, d), v: (n, dv) bf16 bits (uint16). Row r attends keys
+    [0, kv_len[r]): causal, decode, prefill and chunked prefill all have this shape.
+    Returns (out, flags); flagged rows are recomputed exactly when fallback=True."""
+    dev = torch.device(device)
+    dv = v_bits.shape[1]
+    block_dv = block_dv or min(dv, 32)
+    kv_len = np.asarray(kv_len, dtype=np.int32)
+
+    def t16(x):
+        return torch.from_numpy(np.ascontiguousarray(x, dtype=np.uint16).view(np.int16)).to(dev)
+
+    q_tc = k_tc = None
+    if use_tc:
+        q_tc = tc_slices(q_bits, sq, dev)
+        if k_slices is not None:
+            kX, klsb, kl1, klost = k_slices
+            k_tc = [torch.from_numpy(np.ascontiguousarray(kX)).to(dev), torch.from_numpy(klsb.astype(np.int64)).to(dev),
+                    torch.from_numpy(kl1.astype(np.float64)).to(dev),
+                    torch.from_numpy(klost.any(axis=1).astype(np.int32)).to(dev)]
+        else:
+            k_tc = tc_slices(k_bits, sk, dev)
+    OUT, FL, OF = launch(t16(q_bits), t16(k_bits), t16(v_bits), torch.from_numpy(kv_len).to(dev),
+                         int(kv_len.max(initial=0)), alpha, out=out, splits=splits, block_m=block_m,
+                         block_n=block_n, block_dv=block_dv, merge_order=merge_order, exp2_margin=exp2_margin,
+                         q_tc=q_tc, k_tc=k_tc, tc_fallback=tc_fallback)
     flags = np.maximum(FL.amax(dim=(0, 2)).cpu().numpy(), OF.amax(dim=1).cpu().numpy()).astype(np.uint8)
     o = OUT.cpu().numpy()
-    res = o.astype(np.uint32).view(np.float32) if out == "fp32" else (o & 0xFFFF).astype(np.uint16)
-    res = res.copy()
+    res = (o.astype(np.uint32).view(np.float32) if out == "fp32" else (o & 0xFFFF).astype(np.uint16)).copy()
     if fallback:
         for r in np.flatnonzero(flags):
             L = int(kv_len[r])

@@ -112,6 +112,47 @@ Bug found during testing:
   so certification caught a host-side bug.
 - Fixed: the wrapper now always passes a permutation of the actual splits.
 
+## D8. Scores on tensor cores via int8 slices (Q2 answered)
+
+Each q row and each K row is stored as block fixed point: one exponent per row, plus `S`
+signed 7-bit digits per element as int8 (`slices.py`). Each slice pair `(s, t)` is one int8
+MMA with exact int32 accumulation (`|·| < 128 · 127² < 2^21`). Pairs are combined in int64
+with shifts of `7(s+t)`; 3×4 slices give at most 2^56, which fits.
+
+The truncation bound uses per-row L1 norms: `2^qlsb·‖k‖₁ + 2^klsb·‖q‖₁`, applied only to
+rows that lost bits. It certifies `t = RN32(α·s)` exactly as the windowed path does. K slices
+are computed once, when K is written to the cache.
+
+Measured on 57,800 real scores ([results/slice_study_qwen3-0.6b.md](../results/slice_study_qwen3-0.6b.md)):
+
+| slices | int8 MMA k-steps per score | uncertified |
+|---|---|---|
+| 3×3 | 9 | 9.2e-2 |
+| 3×4 | 12 | 2.1e-4 |
+| 4×4 | 16 | 2.1e-4 |
+| 5×5 | 25 | 0 |
+
+No certified score was ever wrong. At 3×4 the cost is 12 int8 k-steps, about 6 bf16-MMA
+equivalents.
+
+- **Prefill:** roughly 6× the QK^T tensor work.
+- **Decode:** a row group of `g` queries (GQA group × draft length) reads 2 bytes per key
+  element and does `12·g` int8 MACs on it. For g ≤ 16 that stays below the A100/H100 int8
+  ridge point (about 300–600 ops/byte), so decode remains memory-bound.
+
+The per-score fallback is required, not optional:
+
+- In real layer 0, one K row in 1,000 has an exponent spread that needs 5 slices. Every
+  later query attends to it.
+- A row-level fallback would therefore fire on every row. The kernel recomputes only tiles
+  that contain an uncertified score, on the windowed int64 path, and only those entries take
+  the recomputed value.
+
+Testing lesson: the first tensor-core tests passed **only through the fallback**; the
+pure-int8 path certified nothing on synthetic outlier data. A `TC_FALLBACK=False` switch and
+a compact-range test now prove the int8 path is exact by itself. On real head 27:11 it
+certifies 32/32 rows bit-exactly with no fallback.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
