@@ -4,7 +4,7 @@
 # Creates a venv in ~/scratch (keeps your home quota free) with CUDA PyTorch, Triton and the
 # test dependencies, then builds the C++ kernel.
 set -euo pipefail
-module load anaconda3 2>/dev/null || module load python 2>/dev/null || true
+module load python/3.12.5 2>/dev/null || module load python 2>/dev/null || true
 VENV=${EA_VENV:-$HOME/scratch/exactattn-venv}
 python3 -m venv "$VENV"
 source "$VENV/bin/activate"
