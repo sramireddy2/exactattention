@@ -153,6 +153,35 @@ pure-int8 path certified nothing on synthetic outlier data. A `TC_FALLBACK=False
 a compact-range test now prove the int8 path is exact by itself. On real head 27:11 it
 certifies 32/32 rows bit-exactly with no fallback.
 
+## D9. P·V on tensor cores: harder than scores (Q3, measured)
+
+Weights are anchored once per row at the largest term (tensor-core friendly). V rows are
+block fixed point. `N_c = Σ_j W_j·Vfix_jc` is computed as int8 slice MMAs, and the result is
+certified as `RN_bf16(N_c / Z)` with Z exact.
+
+Measured on 3,072 real outputs ([results/pv_slice_study_qwen3-0.6b.md](../results/pv_slice_study_qwen3-0.6b.md)):
+
+| Sw × Sv | bound | uncertified |
+|---|---|---|
+| 4×3 | per-row | 3.2% |
+| 4×3 | per-channel | 1.2% |
+| 5×3 | either | 0.42% |
+| 4×4 | per-channel | 0.78% |
+
+Conclusions:
+
+1. **V truncation dominates.** Exponent spread within a V row reaches 25 bits (D4), so
+   3 digits lose bits. The current V bound charges `W_j + 1` to *every* channel of a key
+   whose row lost any bits.
+   - Next: a per-element loss mask, which is one more 0/1 int8 MMA.
+   - Or: block exponents per (key tile, channel) instead of per key row.
+2. **The fallback must be per (row, channel block), not per row.** At 0.4% per element and
+   128 channels, a row-level fallback would fire on about 40% of rows.
+3. **P·V costs more than QK** at 15–20 int8 k-steps against 12 for scores. Decode still has
+   headroom below the int8 ridge point for g ≤ 16.
+
+Status: studied in numpy, not yet in the Triton kernel. P·V is still int64 CUDA-core work there.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model

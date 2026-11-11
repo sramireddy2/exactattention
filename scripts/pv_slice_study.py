@@ -1,0 +1,124 @@
+"""P·V on tensor cores: how many int8 slices do weights and V need? Measured on real activations.
+
+For sampled rows of the captured model, compute exact weights w_j = RN24(2^t_j), then
+N_c = sum_j w_j v_jc through int8 slices:
+  * V rows: block fixed point per key row (slices.slice_rows), with Sv digits
+  * weights: fixed point relative to the row's largest term exponent, with Sw digits; one
+    shared anchor per row (tensor-core friendly), unlike the CUDA-core path's per-channel anchor
+Each output element gets a rigorous error interval, and we count how often bf16 RN(N_c / Z)
+is certified. Z is exact (weights are cheap to sum on CUDA cores).
+
+    python scripts/pv_slice_study.py --data <captures> --out results/pv_slice_study_qwen3-0.6b.md
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+sys.path.insert(0, os.path.dirname(__file__))
+
+from exactattn.formats import BF16, decode_fp32, round_rational  # noqa: E402
+from exactattn.reference import trace_row  # noqa: E402
+from exactattn.slices import slice_rows  # noqa: E402
+from validate_model import alpha_for  # noqa: E402
+
+CONFIGS = [(3, 3, False), (4, 3, False), (4, 3, True), (5, 3, False), (5, 3, True), (4, 4, True)]
+
+
+def rn(num, den):
+    if num == 0:
+        return (0, 0)
+    m, e = round_rational(num, den, BF16)
+    return (0, 0) if m == 0 else (m, e)
+
+
+def study_row(tr, v, Sw, Sv, tight):
+    """tr: reference trace (exact weights). Returns (certified, total) channels."""
+    M = np.array([m for m, _ in tr.w], dtype=object)
+    E = np.array([e for _, e in tr.w], dtype=np.int64)
+    VX, vlsb, vl1, vlost = slice_rows(v, Sv)                       # VX (Sv, n, dv)
+    G = E + vlsb                                                   # term = M * Vfix * 2^G
+    Gtop = int((G + 24).max())
+    Bw = 7 * Sw
+    base = Gtop - Bw                                               # unit of N
+    W, lostW = [], []
+    for m, g in zip(M.tolist(), G.tolist()):
+        sh = g - base
+        if sh >= 0:
+            W.append(m << sh)
+            lostW.append(False)
+        else:
+            w = m >> -sh
+            W.append(w)
+            lostW.append((w << -sh) != m)
+    W = np.array(W, dtype=object)
+    assert max(W) < (1 << Bw)
+    # Exact sum_j W_j Vfix_jc via slices (Python ints stand in for int8 MMA plus combine).
+    Vfix = sum((VX[b].astype(object) * (1 << (7 * b)) for b in range(Sv)))   # (n, dv), signed
+    N = (W[:, None] * Vfix).sum(axis=0)                            # (dv,) exact integers
+    # Error bounds in units of 2^base:
+    #   weight truncation: |dW_j| < 1, so the term error is <= |Vfix_jc| < 2^(7*Sv)
+    #   V truncation: |dVfix_jc| < 1 (vlsb absorbed into G_j), so the term error is <= W_j + 1
+    lw = np.array(lostW)
+    v_err = int(sum(int(W[j]) + 1 for j in np.flatnonzero(vlost.any(axis=1))))
+    if tight:   # per channel: sum_j lostW_j * |Vfix_jc| (one extra small int8 MMA with a 0/1 mask)
+        errs = [int(np.abs(Vfix[lw, c]).sum()) + v_err for c in range(v.shape[1])]
+    else:       # per row: (#truncated weights) * max|Vfix|
+        errs = [int(lw.sum()) * (1 << (7 * Sv)) + v_err] * v.shape[1]
+    Zm, Ze = tr.Z
+    ok = 0
+    for c in range(v.shape[1]):
+        lo, hi = int(N[c]) - errs[c], int(N[c]) + errs[c]
+        # N/Z = (x * 2^base) / (Zm * 2^Ze)
+        sh = base - Ze
+
+        def ratio(x):
+            return rn(x << sh, Zm) if sh >= 0 else rn(x, Zm << -sh)
+
+        ok += ratio(lo) == ratio(hi)
+    return ok, v.shape[1]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--rows", type=int, default=24)
+    args = ap.parse_args()
+    meta = json.load(open(os.path.join(args.data, "meta.json")))
+    L = meta["tokens"]
+    rng = np.random.default_rng(3)
+    picks = [(int(rng.integers(0, 28)), int(rng.integers(0, 16)), int(rng.integers(64, 600))) for _ in range(args.rows)]
+    tot = {c: [0, 0] for c in CONFIGS}
+    for li, h, pos in picks:
+        lm = meta["layers"][str(li)]
+        kv = h // lm["groups"]
+        q = np.array(np.load(os.path.join(args.data, f"layer{li:02d}_q.npy"), mmap_mode="r")[h, pos])
+        k = np.array(np.load(os.path.join(args.data, f"layer{li:02d}_k.npy"), mmap_mode="r")[kv, : pos + 1])
+        v = np.array(np.load(os.path.join(args.data, f"layer{li:02d}_v.npy"), mmap_mode="r")[kv, : pos + 1])
+        tr = trace_row(q, k, v, alpha_for(lm["scaling"]))
+        for cfg in CONFIGS:
+            ok, n = study_row(tr, v, *cfg)
+            tot[cfg][0] += ok
+            tot[cfg][1] += n
+        print(f"row {li}/{h}/{pos} done", flush=True)
+    lines = [f"# P·V on tensor cores: int8 slices for weights and V ({meta['model']})", "",
+             f"{len(picks)} random rows (positions 64–600), every channel. One weight anchor per row,",
+             "with exact Z. Generated by `scripts/pv_slice_study.py`.", "",
+             "| weight digits Sw | V digits Sv | bound | int8 MMA k-steps per (key, channel) | outputs certified | uncertified rate |",
+             "|---|---|---|---|---|---|"]
+    for (Sw, Sv, tight), (ok, n) in tot.items():
+        lines.append(f"| {Sw} | {Sv} | {'per-channel' if tight else 'per-row'} | {Sw * Sv}{' + ' + str(Sv) if tight else ''} | {ok:,} / {n:,} | {1 - ok / n:.2e} |")
+    with open(args.out, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print("\n".join(lines))
+
+
+if __name__ == "__main__":
+    main()
