@@ -48,13 +48,13 @@ def run_backend(backend, q, k, v, alpha):
 
         mask = np.tril(np.ones((L, L), bool))
         return attention_torch(q, k, v, alpha, mask, device=dev or "cpu", tile=128, row_chunk=128)
-    if kind == "triton":
+    if kind in ("triton", "tritontc"):
         if not dev or dev == "cpu":
             os.environ["TRITON_INTERPRET"] = "1"
         from exactattn.triton_kernels import attention_triton
 
-        return attention_triton(q, k, v, alpha, kv_len, splits=8, block_m=4, block_n=16, block_dv=32,
-                                device=dev or "cpu")
+        return attention_triton(q, k, v, alpha, kv_len, splits=8, block_m=16, block_n=16, block_dv=32,
+                                device=dev or "cpu", use_tc=(kind == "tritontc"), sq=3, sk=4)
     raise ValueError(backend)
 
 

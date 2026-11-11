@@ -29,6 +29,7 @@ import triton.language as tl
 
 from .formats import decode_fp32
 from .reference import attention_row
+from .slices import slice_rows
 
 NEG = tl.constexpr(-(1 << 60))  # "empty" sentinel for reference exponents
 _LAST_DEBUG: dict = {}  # last call's intermediate buffers, for debugging
@@ -167,6 +168,64 @@ def _ratio_round(a, b, sh, P: tl.constexpr, QMIN: tl.constexpr, N_ITER: tl.const
 
 
 # ---------------------------------------------------------------------------
+# Scores: windowed int64 (CUDA cores) and int8-sliced (tensor cores)
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _windowed_logits(qm, qe, km, ke, AM, AE, FS: tl.constexpr):
+    """Certified t = RN32(alpha * q.k) from a windowed int64 dot product. Returns (t, uncertified)."""
+    P = qm[:, None, :] * km[None, :, :]                               # (M, N, D)
+    E = qe[:, None, :] + ke[None, :, :]
+    nzp = P != 0
+    lead = tl.where(nzp, E + _bitlen(tl.abs(P)) - 1, NEG)
+    Lmax = tl.max(lead, axis=2)                                        # (M, N)
+    base = Lmax + 1 - FS
+    term, lost = _floor_shift(P, E - base[:, :, None])
+    acc = tl.sum(tl.where(nzp, term, 0), axis=2)
+    err = tl.sum((lost & nzp).to(tl.int64), axis=2)
+    anyp = tl.max(nzp.to(tl.int32), axis=2) != 0
+    big = (tl.abs(acc) + err) >= (1 << 62)
+    t_lo, ov1 = _rn32_product(AM, AE, acc, base)
+    t_hi, ov2 = _rn32_product(AM, AE, acc + err, base)
+    t = tl.where(anyp, t_lo, 0.0)
+    unc = anyp & ((t_lo != t_hi) | ov1 | ov2 | big)
+    return t, unc
+
+
+@triton.jit
+def _tc_logits(QX, KX, rows, rmask, nn, nmask, ROWS, NKEYS, QLSB, QL1, QLOST, KLSB, KL1, KLOST,
+               AM, AE, D: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr):
+    """Certified t = RN32(alpha * q.k) from int8 slices (slices.py) on tensor cores.
+
+    q.k = 2^(qlsb + klsb) * (sum_{s,t} 2^(7(s+t)) Q[s].K[t] + truncation), where each Q[s].K[t] is
+    an exact int8 x int8 -> int32 MMA. The truncation bound comes from per-row L1 norms."""
+    dd = tl.arange(0, D)
+    acc = tl.zeros((rows.shape[0], nn.shape[0]), tl.int64)
+    for t_ in tl.static_range(SK):
+        kt = tl.load(KX + (t_ * NKEYS + nn[:, None]) * D + dd[None, :], mask=nmask[:, None], other=0)
+        for s_ in tl.static_range(SQ):
+            qs = tl.load(QX + (s_ * ROWS + rows[:, None]) * D + dd[None, :], mask=rmask[:, None], other=0)
+            dot = tl.dot(qs, tl.trans(kt), out_dtype=tl.int32)            # (M, N), exact
+            acc += dot.to(tl.int64) << (7 * (s_ + t_))
+    qlsb = tl.load(QLSB + rows, mask=rmask, other=0)
+    ql1 = tl.load(QL1 + rows, mask=rmask, other=0.0)
+    qlost = tl.load(QLOST + rows, mask=rmask, other=0) != 0
+    klsb = tl.load(KLSB + nn, mask=nmask, other=0)
+    kl1 = tl.load(KL1 + nn, mask=nmask, other=0.0)
+    klost = tl.load(KLOST + nn, mask=nmask, other=0) != 0
+    errf = tl.where(qlost[:, None], kl1[None, :] * tl.exp2(-klsb[None, :].to(tl.float64)), 0.0) \
+        + tl.where(klost[None, :], ql1[:, None] * tl.exp2(-qlsb[:, None].to(tl.float64)), 0.0)
+    big = errf > 2.0 ** 60
+    err = tl.where(errf > 0, tl.ceil(tl.minimum(errf, 2.0 ** 60) * (1.0 + 2.0 ** -40)) + 1.0, 0.0).to(tl.int64)
+    base = qlsb[:, None] + klsb[None, :]
+    big = big | ((tl.abs(acc) + err) >= (1 << 62))
+    t_lo, ov1 = _rn32_product(AM, AE, acc - err, base)
+    t_hi, ov2 = _rn32_product(AM, AE, acc + err, base)
+    unc = (t_lo != t_hi) | ov1 | ov2 | big
+    return t_lo, unc
+
+
+# ---------------------------------------------------------------------------
 # Kernels
 # ---------------------------------------------------------------------------
 
@@ -174,8 +233,10 @@ def _ratio_round(a, b, sh, P: tl.constexpr, QMIN: tl.constexpr, N_ITER: tl.const
 def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                      PR, PZ, PZE, PNR, PN, PNE, FLAG,
                      SPLIT_LEN, FZ, FN,
+                     QX, KX, QLSB, QL1, QLOST, KLSB, KL1, KLOST, NKEYS,
                      D: tl.constexpr, DV: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-                     BLOCK_DV: tl.constexpr, FS: tl.constexpr, EXP2_MARGIN: tl.constexpr):
+                     BLOCK_DV: tl.constexpr, FS: tl.constexpr, EXP2_MARGIN: tl.constexpr,
+                     USE_TC: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr, TC_FALLBACK: tl.constexpr):
     pid_m = tl.program_id(0)
     pid_s = tl.program_id(1)
     pid_c = tl.program_id(2)
@@ -202,22 +263,18 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
         kb = tl.load(K + nn[:, None] * D + dd[None, :], mask=(nn < kmax)[:, None], other=0)
         km, ke, kbad = _decode_bf16(kb)                                    # (N, D)
         flag = tl.maximum(flag, tl.max((vis & (tl.max(kbad.to(tl.int32), axis=1) != 0)[None, :]).to(tl.int32), axis=1))
-        # ---- scores: windowed int64 ----
-        P = qm[:, None, :] * km[None, :, :]                               # (M, N, D)
-        E = qe[:, None, :] + ke[None, :, :]
-        nzp = P != 0
-        lead = tl.where(nzp, E + _bitlen(tl.abs(P)) - 1, NEG)
-        Lmax = tl.max(lead, axis=2)                                        # (M, N)
-        base = Lmax + 1 - FS
-        term, lost = _floor_shift(P, E - base[:, :, None])
-        acc = tl.sum(tl.where(nzp, term, 0), axis=2)
-        err = tl.sum((lost & nzp).to(tl.int64), axis=2)
-        anyp = tl.max(nzp.to(tl.int32), axis=2) != 0
-        big = (tl.abs(acc) + err) >= (1 << 62)
-        t_lo, ov1 = _rn32_product(AM, AE, acc, base)
-        t_hi, ov2 = _rn32_product(AM, AE, acc + err, base)
-        t = tl.where(anyp, t_lo, 0.0)
-        unc = anyp & ((t_lo != t_hi) | ov1 | ov2 | big)
+        # ---- scores ----
+        if USE_TC:
+            # Tensor cores: int8 slice products, certified; windowed recompute only for
+            # tiles that contain an uncertified score.
+            t, unc = _tc_logits(QX, KX, rows, rmask, nn, nn < kmax, ROWS, NKEYS, QLSB, QL1, QLOST,
+                                KLSB, KL1, KLOST, AM, AE, D, SQ, SK)
+            if TC_FALLBACK and tl.max(tl.max((unc & vis).to(tl.int32), axis=1), axis=0) > 0:
+                t_w, unc_w = _windowed_logits(qm, qe, km, ke, AM, AE, FS)
+                t = tl.where(unc, t_w, t)
+                unc = unc & unc_w
+        else:
+            t, unc = _windowed_logits(qm, qe, km, ke, AM, AE, FS)
         # ---- weights ----
         td = t.to(tl.float64)
         nfl = tl.floor(td)
@@ -355,7 +412,8 @@ def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, O
 def attention_triton(q_bits, k_bits, v_bits, alpha, kv_len, out: str = "bf16", splits: int = 4,
                      block_m: int = 16, block_n: int = 16, block_dv: int | None = None,
                      merge_order=None, device: str = "cpu", fallback: bool = True,
-                     exp2_margin: float = 2.0 ** -26):
+                     exp2_margin: float = 2.0 ** -26, use_tc: bool = False, sq: int = 3, sk: int = 4,
+                     k_slices=None, tc_fallback: bool = True):
     """q: (R, d), k: (n, d), v: (n, dv) bf16 bits (numpy uint16). Row r attends keys
     [0, kv_len[r]): causal, decode, prefill and chunked prefill all have this shape.
     Returns (out, flags)."""
@@ -379,6 +437,22 @@ def attention_triton(q_bits, k_bits, v_bits, alpha, kv_len, out: str = "bf16", s
 
     Qt, Kt, Vt = t16(q_bits), t16(k_bits), t16(v_bits)
     KL = torch.from_numpy(kv_len).to(dev)
+    if use_tc:
+        # int8 slices: q per call; K once per cache write (pass k_slices to reuse them).
+        qX, qlsb, ql1, qlost = slice_rows(q_bits, sq)
+        kX, klsb, kl1, klost = k_slices if k_slices is not None else slice_rows(k_bits, sk)
+        sk = kX.shape[0]
+        tc = [torch.from_numpy(np.ascontiguousarray(qX)).to(dev), torch.from_numpy(np.ascontiguousarray(kX)).to(dev),
+              torch.from_numpy(qlsb.astype(np.int64)).to(dev), torch.from_numpy(ql1.astype(np.float64)).to(dev),
+              torch.from_numpy(qlost.any(axis=1).astype(np.int32)).to(dev),
+              torch.from_numpy(klsb.astype(np.int64)).to(dev), torch.from_numpy(kl1.astype(np.float64)).to(dev),
+              torch.from_numpy(klost.any(axis=1).astype(np.int32)).to(dev)]
+    else:
+        z8 = torch.zeros(1, dtype=torch.int8, device=dev)
+        z64 = torch.zeros(1, dtype=torch.int64, device=dev)
+        zf = torch.zeros(1, dtype=torch.float64, device=dev)
+        z32 = torch.zeros(1, dtype=torch.int32, device=dev)
+        tc = [z8, z8, z64, zf, z32, z64, zf, z32]
     i64 = dict(dtype=torch.int64, device=dev)
     PR_ = torch.empty((nsplit, R), **i64)
     PZ_ = torch.empty((nsplit, R), **i64)
@@ -390,8 +464,9 @@ def attention_triton(q_bits, k_bits, v_bits, alpha, kv_len, out: str = "bf16", s
     FL = torch.zeros((nsplit, R, ncb), dtype=torch.int32, device=dev)
     grid = (triton.cdiv(R, block_m), nsplit, ncb)
     _ea_split_kernel[grid](Qt, Kt, Vt, KL, R, am, ae, PR_, PZ_, PZE_, PNR_, PN_, PNE_, FL,
-                           split_len, fz, fn, D=d, DV=dv, BLOCK_M=block_m, BLOCK_N=block_n,
-                           BLOCK_DV=block_dv, FS=SCORE_FS, EXP2_MARGIN=exp2_margin)
+                           split_len, fz, fn, *tc, n, D=d, DV=dv, BLOCK_M=block_m, BLOCK_N=block_n,
+                           BLOCK_DV=block_dv, FS=SCORE_FS, EXP2_MARGIN=exp2_margin,
+                           USE_TC=use_tc, SQ=sq, SK=sk, TC_FALLBACK=tc_fallback)
     if merge_order is None:
         order = np.arange(nsplit)
     else:
