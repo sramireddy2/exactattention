@@ -4,86 +4,112 @@
 # On embers, a job is guaranteed its first hour. After that a priority job can take the GPU,
 # and the embers job is CANCELLED, not requeued, with about 30 s warning. So:
 #   * each job asks for <= 55 min, inside the guarantee (shorter jobs also backfill sooner);
-#   * the work is split into small stages, and each finished stage writes a .done marker;
-#   * a job skips stages that are already done, runs the rest within its time budget, and if
-#     anything is left it submits the next job in the chain (at most EA_MAX_CHAIN jobs);
-#   * on SIGTERM (preemption or time limit) it stops the running stage, leaves it not-done,
-#     resubmits, and exits.
+#   * the work is split into small stages (one fixture head, one test group, one benchmark
+#     shape), and each finished stage writes a .done marker. Finished stages are never re-run;
+#   * at startup a job queues its successor with --dependency=afterany:<this job>, so the
+#     chain continues even if this job is killed outright with no chance to react. When every
+#     stage is done, the spare successor is cancelled;
+#   * on SIGTERM it stops the running stage (left not-done), writes the summary and exits;
+#   * a stage that hits its cap EA_MAX_TIMEOUTS times is recorded as TIMEOUT, so the chain cannot
+#     loop forever. The chain is at most EA_MAX_CHAIN jobs long.
 #
-# Results go to results/pace/run-<RUN>/, one log per stage, plus summary.md.
+# Results: results/pace/run-<RUN>/<stage>.log, .done, .attempts, plus summary.md.
 set -uo pipefail
 
 REPO="${EA_REPO:-$HOME/scratch/exactattention}"
 RUN="${EA_RUN:?set EA_RUN to a run name}"
 CHAIN="${EA_CHAIN:-1}"
-MAX_CHAIN="${EA_MAX_CHAIN:-6}"
-BUDGET_S="${EA_BUDGET_S:-3000}"          # leave about 5 min of the 55-min limit for setup and resubmit
-MAX_TIMEOUTS="${EA_MAX_TIMEOUTS:-2}"     # after this many timeouts, a stage is recorded as TIMEOUT and skipped
+MAX_CHAIN="${EA_MAX_CHAIN:-8}"
+BUDGET_S="${EA_BUDGET_S:-3000}"          # leave about 5 min of the 55-min limit for setup
+MAX_TIMEOUTS="${EA_MAX_TIMEOUTS:-2}"
 OUT="$REPO/results/pace/run-$RUN"
 mkdir -p "$OUT"
 cd "$REPO"
 source "${EA_VENV:-$HOME/scratch/exactattn-venv}/bin/activate"
 START=$(date +%s)
+FIX="python scripts/fixture.py check"
+PYT="python -m pytest -q -p no:cacheprovider"
 
 # name | per-stage cap in seconds | command
 STAGES=(
   "env|120|nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv && python -c \"import torch, triton; print(torch.__version__, torch.version.cuda, triton.__version__, torch.cuda.get_device_name(0))\""
-  "fixture_cpp|600|python scripts/fixture.py check --backend cpp"
-  "fixture_torch_cuda|900|python scripts/fixture.py check --backend torch:cuda"
-  "tests_torch_cuda|900|python -m pytest -q -p no:cacheprovider tests/test_torch_impl.py"
-  "tests_cpu_kernel|900|python -m pytest -q -p no:cacheprovider tests/test_cpu_kernel.py"
-  "tests_triton_cuda|1500|EA_TRITON_DEVICE=cuda python -m pytest -q -p no:cacheprovider tests/test_triton.py"
-  "fixture_triton_cuda|1500|python scripts/fixture.py check --backend triton:cuda"
-  "fixture_tritontc_cuda|1500|python scripts/fixture.py check --backend tritontc:cuda"
+  "fixture_cpp|600|$FIX --backend cpp"
+  "fixture_torch_cuda_0_0|900|$FIX --backend torch:cuda --only 0_0"
+  "fixture_torch_cuda_27_11|900|$FIX --backend torch:cuda --only 27_11"
+  "tests_cpu_kernel|900|$PYT tests/test_cpu_kernel.py"
+  "tests_torch_cuda|900|$PYT tests/test_torch_impl.py"
+  "tests_triton_windowed|1500|EA_TRITON_DEVICE=cuda $PYT tests/test_triton.py -k 'matches_reference and False'"
+  "tests_triton_tc|1500|EA_TRITON_DEVICE=cuda $PYT tests/test_triton.py -k 'matches_reference and True'"
+  "tests_triton_rest|1500|EA_TRITON_DEVICE=cuda $PYT tests/test_triton.py -k 'not matches_reference'"
+  "fixture_triton_0_0|1500|$FIX --backend triton:cuda --only 0_0"
+  "fixture_triton_27_11|1500|$FIX --backend triton:cuda --only 27_11"
+  "fixture_tritontc_0_0|1500|$FIX --backend tritontc:cuda --only 0_0"
+  "fixture_tritontc_27_11|1500|$FIX --backend tritontc:cuda --only 27_11"
   "bench_n1024|900|python scripts/bench_decode.py --rows 16 --keys 1024 --out $OUT/bench_n1024.md"
   "bench_n4096|1200|python scripts/bench_decode.py --rows 16 --keys 4096 --out $OUT/bench_n4096.md"
   "bench_n16384|1800|python scripts/bench_decode.py --rows 16 --keys 16384 --out $OUT/bench_n16384.md"
 )
 
-resubmit() {
-  if [ "$CHAIN" -lt "$MAX_CHAIN" ]; then
-    sbatch -A "${SLURM_JOB_ACCOUNT:-gts-agarg35}" -q embers \
-      --export=ALL,EA_RUN="$RUN",EA_CHAIN=$((CHAIN + 1)) \
-      -o "$HOME/scratch/ea_jobs/exactattn-$RUN-%j.out" "$REPO/scripts/pace/gpu_check.sbatch" \
-      && echo "chain: submitted job $((CHAIN + 1))/$MAX_CHAIN"
-  else
-    echo "chain: reached EA_MAX_CHAIN=$MAX_CHAIN, not resubmitting"
-  fi
+stage_name() { echo "${1%%|*}"; }
+count_pending() {
+  local n=0 e
+  for e in "${STAGES[@]}"; do [ -f "$OUT/$(stage_name "$e").done" ] || n=$((n + 1)); done
+  echo "$n"
 }
 
 write_summary() {
   {
     echo "# PACE run $RUN"; echo
-    echo "| stage | result | last lines |"; echo "|---|---|---|"
-    for entry in "${STAGES[@]}"; do
-      name="${entry%%|*}"
-      if [ -f "$OUT/$name.done" ]; then res=$(cat "$OUT/$name.done"); else res="pending"; fi
-      last=$(tail -n 2 "$OUT/$name.log" 2>/dev/null | tr '\n|' ' /' | cut -c1-160)
-      echo "| $name | $res | $last |"
+    echo "Updated $(date '+%F %T') by job ${SLURM_JOB_ID:-local} (chain $CHAIN) on $(hostname)."; echo
+    echo "| stage | result | attempts | last lines |"; echo "|---|---|---|---|"
+    for e in "${STAGES[@]}"; do
+      local name; name=$(stage_name "$e")
+      local res="pending"; [ -f "$OUT/$name.done" ] && res=$(cat "$OUT/$name.done")
+      local att; att=$(cat "$OUT/$name.attempts" 2>/dev/null || echo 0)
+      local last; last=$(tail -n 2 "$OUT/$name.log" 2>/dev/null | tr '\n|' ' /' | cut -c1-160)
+      echo "| $name | $res | $att | $last |"
     done
     echo; cat "$OUT"/bench_n*.md 2>/dev/null | grep -E '^\| [0-9]' | sed 's/^/bench: /'
   } > "$OUT/summary.md"
 }
 
+submit_next() {   # $1 = extra sbatch args (e.g. a dependency)
+  if [ "$CHAIN" -ge "$MAX_CHAIN" ]; then echo "chain: at EA_MAX_CHAIN=$MAX_CHAIN, no successor"; return; fi
+  sbatch --parsable -A "${SLURM_JOB_ACCOUNT:-gts-agarg35}" -q embers $1 \
+    --export=ALL,EA_RUN="$RUN",EA_CHAIN=$((CHAIN + 1)) \
+    -o "$HOME/scratch/ea_jobs/exactattn-$RUN-%j.out" "$REPO/scripts/pace/gpu_check.sbatch" 2>/dev/null
+}
+
+# Nothing left: mark done and stop. Covers a successor that starts after its predecessor
+# already finished everything.
+if [ "$(count_pending)" -eq 0 ]; then write_summary; touch "$OUT/ALL_DONE"; echo "all stages already done"; exit 0; fi
+
+# Queue the successor now, so the chain survives even a hard kill of this job.
+NEXT=""
+if [ -n "${SLURM_JOB_ID:-}" ]; then
+  NEXT=$(submit_next "--dependency=afterany:$SLURM_JOB_ID")
+  [ -n "$NEXT" ] && echo "chain: pre-queued successor job $NEXT (chain $((CHAIN + 1)))"
+fi
+
 CHILD=0
 on_term() {
-  echo "SIGTERM at $(date) - stopping stage, leaving it not-done, resubmitting"
+  echo "SIGTERM at $(date) - stopping stage (left not-done)"
   [ "$CHILD" -ne 0 ] && kill -TERM "$CHILD" 2>/dev/null
   write_summary
-  resubmit
+  if [ -z "$NEXT" ] && [ -n "${SLURM_JOB_ID:-}" ]; then NEXT=$(submit_next ""); echo "chain: submitted $NEXT"; fi
   exit 143
 }
 trap on_term TERM
 
 remaining() { echo $(( BUDGET_S - ($(date +%s) - START) )); }
 
-pending=0
-for entry in "${STAGES[@]}"; do
-  name="${entry%%|*}"; rest="${entry#*|}"; cap="${rest%%|*}"; cmd="${rest#*|}"
+for e in "${STAGES[@]}"; do
+  name="${e%%|*}"; rest="${e#*|}"; cap="${rest%%|*}"; cmd="${rest#*|}"
   [ -f "$OUT/$name.done" ] && continue
   left=$(remaining)
-  if [ "$left" -lt 90 ]; then pending=1; continue; fi
+  [ "$left" -lt 90 ] && continue
   t=$(( cap < left ? cap : left ))
+  echo $(( $(cat "$OUT/$name.attempts" 2>/dev/null || echo 0) + 1 )) > "$OUT/$name.attempts"
   echo "== $name (cap ${t}s) $(date +%T) on $(hostname) job ${SLURM_JOB_ID:-local} chain $CHAIN"
   timeout --signal=TERM --kill-after=20 "$t" bash -c "$cmd" > "$OUT/$name.log" 2>&1 &
   CHILD=$!
@@ -91,12 +117,17 @@ for entry in "${STAGES[@]}"; do
   if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
     n=$(( $(cat "$OUT/$name.timeouts" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$OUT/$name.timeouts"
     echo "   timeout #$n"
-    if [ "$n" -ge "$MAX_TIMEOUTS" ]; then echo "TIMEOUT" > "$OUT/$name.done"; else pending=1; fi
+    [ "$n" -ge "$MAX_TIMEOUTS" ] && echo "TIMEOUT" > "$OUT/$name.done"
   else
     echo "rc=$rc" > "$OUT/$name.done"; echo "   rc=$rc"
   fi
+  write_summary   # checkpoint the summary after every stage
 done
 
 write_summary
-
-if [ "$pending" -eq 1 ]; then resubmit; else echo "all stages done"; touch "$OUT/ALL_DONE"; fi
+if [ "$(count_pending)" -eq 0 ]; then
+  touch "$OUT/ALL_DONE"; echo "all stages done"
+  [ -n "$NEXT" ] && scancel "$NEXT" && echo "chain: cancelled spare successor $NEXT"
+else
+  echo "chain: $(count_pending) stages pending; successor ${NEXT:-none} continues"
+fi

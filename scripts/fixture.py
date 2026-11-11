@@ -75,6 +75,7 @@ def main():
     ap.add_argument("--data")
     ap.add_argument("--heads", default="0:0,27:11")
     ap.add_argument("--backend", default="cpp")
+    ap.add_argument("--only", default=None, help="comma-separated head keys to check (default: all)")
     args = ap.parse_args()
 
     if args.mode == "make":
@@ -109,7 +110,10 @@ def main():
     expected = json.load(open(EXPECTED))
     ok = True
     print(f"host {platform.node()} | {platform.processor() or platform.machine()} | backend {args.backend}")
+    only = set(args.only.split(",")) if args.only else None   # e.g. --only 0_0 (one head per stage)
     for key, info in expected["heads"].items():
+        if only is not None and key not in only:
+            continue
         q, k, v, alpha = z[f"q_{key}"], z[f"k_{key}"], z[f"v_{key}"], np.float32(z[f"alpha_{key}"])
         t0 = time.perf_counter()
         out, flags = run_backend(args.backend, q, k, v, alpha)
