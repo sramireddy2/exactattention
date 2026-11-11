@@ -182,6 +182,45 @@ Conclusions:
 
 Status: studied in numpy, not yet in the Triton kernel. P·V is still int64 CUDA-core work there.
 
+## D10. P·V on tensor cores, implemented: 5×3 row layout with per-element bounds
+
+The bounds are tightened from D9. Weight loss is charged per channel (`lostW mask × |V|` MMA),
+and V loss **per element** (`W × lostV mask` MMA plus a `vis × lostV` MMA). That costs 15
+value MMAs plus 8 bound MMAs per (key, channel).
+
+On 3,072 real outputs ([results/pv_slice_study_qwen3-0.6b.md](../results/pv_slice_study_qwen3-0.6b.md)):
+
+| layout | uncertified |
+|---|---|
+| row-elem 5×3 | **0** |
+| row-elem 4×3 | 7.8e-3 |
+| row-chan 5×3 (D9) | 4.2e-3 |
+| col-elem 4×3 (V exponent per tile × channel) | 4.2e-3 |
+
+Per-tile column exponents do not help: V spread *along a channel* is not smaller than
+within a row.
+
+Implementation (`_tc_pv` in `triton_kernels.py`, `USE_TC_PV`):
+
+1. Weights times `2^vlsb` are anchored per row at the tile's largest term, then truncated to 5
+   unsigned 7-bit digits.
+2. V is precomputed once per cache write (`tc_v_slices`).
+3. The tile result is re-anchored to the partial format at `TNR = base + ANCH`, with
+   `ANCH = 7·SW + 7·SV + log2(BLOCK_N)`. Every byte stays inside int64; the host asserts
+   `ANCH + 1 < 63`, which caps 5×3 at BLOCK_N ≤ 32.
+4. Merges and certification are unchanged.
+
+Tests (Triton interpreter, 120 passing in total):
+
+- **Real activations:** layer 27 rows are bit-exact with both int8 paths on, and every row
+  certified.
+- **Compact synthetic data, score fallback off:** 16/16 rows certified, bit-exact.
+- **Adversarial synthetic data:** outlier scores with repeated V values, or "wide" V spanning
+  48 bits of exponent. More rows are flagged here, never wrong ones.
+
+Not yet done: an in-kernel second tier for uncertified (row, channel-block) pairs. Flagged rows
+currently go to the host reference.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model

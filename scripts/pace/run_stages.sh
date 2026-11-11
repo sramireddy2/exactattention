@@ -45,6 +45,8 @@ STAGES=(
   "fixture_triton_27_11|1500|$FIX --backend triton:cuda --only 27_11"
   "fixture_tritontc_0_0|1500|$FIX --backend tritontc:cuda --only 0_0"
   "fixture_tritontc_27_11|1500|$FIX --backend tritontc:cuda --only 27_11"
+  "fixture_tritontcpv_0_0|1500|$FIX --backend tritontcpv:cuda --only 0_0"
+  "fixture_tritontcpv_27_11|1500|$FIX --backend tritontcpv:cuda --only 27_11"
   "bench_n1024|900|python scripts/bench_decode.py --rows 16 --keys 1024 --out $OUT/bench_n1024.md"
   "bench_n4096|1200|python scripts/bench_decode.py --rows 16 --keys 4096 --out $OUT/bench_n4096.md"
   "bench_n16384|1800|python scripts/bench_decode.py --rows 16 --keys 16384 --out $OUT/bench_n16384.md"

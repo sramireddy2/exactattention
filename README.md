@@ -54,7 +54,7 @@ Reports: [validation](results/validation_qwen3-0.6b.md), [window widths](results
 | `src/exactattn/certified.py` | bit-accurate model of the windowed split-KV algorithm |
 | `csrc/exact_attention_cpu.cpp` | C++ certified kernel: int64/int128, threads, CSR masks |
 | `src/exactattn/torch_impl.py` | the same algorithm as int64 tensor ops (Intel XPU / CUDA / CPU) |
-| `src/exactattn/triton_kernels.py` | fused split-KV Triton kernels (split + combine), tested in the CPU interpreter |
+| `src/exactattn/triton_kernels.py` | fused split-KV Triton kernels: int64 path, int8 tensor-core scores (3×4 slices) and int8 tensor-core P·V (5×3 slices), all certified |
 | `fixtures/` | two real Qwen3-0.6B heads and the SHA-256 of their exact outputs |
 | `scripts/` | activation capture, width study, full-model validation, cross-device check |
 
@@ -88,8 +88,8 @@ out_bits = attention(q, k, v, default_alpha(64))   # bf16 bit patterns, shape (2
 
 1. Run the fused Triton kernel on NVIDIA (PACE) and on the Intel iGPU, which needs a newer
    driver for `triton-xpu`.
-2. Exact scores on tensor cores (int8 slices) and P·V on tensor cores; overhead measured
-   against FlashInfer and FlashAttention at decode and prefill.
+2. ~~Exact scores and P·V on tensor cores (int8 slices)~~: implemented and bit-exact in the interpreter (DESIGN D8, D10).
+   Next: measure on A100/H100 (PACE free tier) against FlashInfer and FlashAttention at decode and prefill.
 3. Draft-tree verification end to end: bit-identical speculative decoding.
 4. Spec v1: optionally a higher-precision logit, which removes the remaining amplification on
    heavily cancelling outputs (DESIGN D5).

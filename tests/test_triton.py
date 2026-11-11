@@ -111,3 +111,64 @@ def test_tensor_core_path_alone_is_exact():
     for r in range(R):
         L = int(kv_len[r])
         assert np.array_equal(got[r], attention_row(Q[r], K[:L], V[:L], alpha))
+
+@pytest.mark.parametrize("kind", ["normal", "outlier", "dupes"])
+@pytest.mark.parametrize("vkind", ["normal", "wide", "dupes"])
+def test_tensor_core_pv_matches_reference(kind, vkind):
+    """P·V on int8 tensor cores (5x3 slices, per-element bounds). Every row the kernel certifies must
+    equal the exact reference; rows it cannot certify are flagged, never wrong."""
+    rng = np.random.default_rng(zlib.crc32(f"pv/{kind}/{vkind}".encode()))
+    d, dv, R, n = 64, 32, 16, 100
+    Q, K, V = bf16(rng, (R, d), kind), bf16(rng, (n, d), kind), bf16(rng, (n, dv), vkind)
+    kv_len = rng.integers(1, n + 1, size=R)
+    alpha = default_alpha(d)
+    got, flags = attention_triton(Q, K, V, alpha, kv_len, splits=2, block_m=16, block_n=16, block_dv=16,
+                                  device=DEVICE, fallback=False, use_tc=True, use_tc_pv=True)
+    # Synthetic outlier/dupes data is harder than real activations (wide weight spreads, exact
+    # ties), so only require that the test is not vacuous. The real-data bar is in the next test.
+    # "wide" V spans ~48 bits of exponent per row (real V rows: <= 25), far beyond 3 digits, so
+    # most of those rows are legitimately uncertified: only correctness is required there.
+    if vkind != "wide":
+        assert (flags == 0).sum() >= R // 2, flags
+    for r in np.flatnonzero(flags == 0):
+        L = int(kv_len[r])
+        assert np.array_equal(got[r], attention_row(Q[r], K[:L], V[:L], alpha)), r
+
+
+def test_tensor_core_scores_and_pv_alone_are_exact():
+    """Both int8 paths on, the windowed score fallback off, compact-range inputs: every row must
+    certify, and match the reference bit for bit."""
+    from exactattn.formats import float_to_bf16_bits
+
+    rng = np.random.default_rng(91)
+
+    def compact(shape):
+        return float_to_bf16_bits(rng.choice([-1.0, 1.0], size=shape) * np.exp2(rng.uniform(-6, 1, size=shape)))
+
+    d, dv, R, n = 128, 32, 16, 90
+    Q, K, V = compact((R, d)), compact((n, d)), compact((n, dv))
+    kv_len = rng.integers(1, n + 1, size=R)
+    alpha = default_alpha(d)
+    got, flags = attention_triton(Q, K, V, alpha, kv_len, splits=3, block_m=16, block_n=16, block_dv=32,
+                                  device=DEVICE, fallback=False, use_tc=True, tc_fallback=False, use_tc_pv=True)
+    assert not flags.any(), flags
+    for r in range(R):
+        L = int(kv_len[r])
+        assert np.array_equal(got[r], attention_row(Q[r], K[:L], V[:L], alpha))
+
+def test_tensor_core_pv_on_real_activations():
+    """Real Qwen3-0.6B rows (fixtures/): both int8 paths, tensor-core certification must hold on
+    nearly every row, bit-exact. (DESIGN D10: 5x3 P·V slices left 0 of 3,072 real outputs uncertified.)"""
+    import os
+
+    z = np.load(os.path.join(os.path.dirname(__file__), "..", "fixtures", "qwen3_0.6b_heads.npz"))
+    q, k, v, alpha = z["q_27_11"], z["k_27_11"], z["v_27_11"], np.float32(z["alpha_27_11"])
+    rows = np.arange(300, 332)
+    kv_len = rows + 1
+    n = int(kv_len.max())
+    got, flags = attention_triton(q[rows], k[:n], v[:n, :32], alpha, kv_len, splits=2, block_m=16, block_n=16,
+                                  block_dv=32, device=DEVICE, fallback=False, use_tc=True, use_tc_pv=True)
+    assert (flags == 0).sum() >= len(rows) - 1, flags
+    for i in np.flatnonzero(flags == 0):
+        r = int(rows[i])
+        assert np.array_equal(got[i], attention_row(q[r], k[: r + 1], v[: r + 1, :32], alpha)), r

@@ -225,6 +225,58 @@ def _tc_logits(QX, KX, rows, rmask, nn, nmask, ROWS, NKEYS, QLSB, QL1, QLOST, KL
     return t_lo, unc
 
 
+@triton.jit
+def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nmask, cc, NKEYS, FN, DV: tl.constexpr, SW: tl.constexpr,
+           SV: tl.constexpr, ANCH: tl.constexpr):
+    """One tile's P·V on tensor cores (DESIGN D9/D10). Returns (TNR, TN, TNE) in the partial format:
+    value N_c lies in [TN, TN + TNE] * 2^(TNR - FN).
+
+    V rows are block fixed point (per-key exponent vlsb, SV signed 7-bit digits, a per-element
+    lost-bits mask), made once at cache write. Weights times 2^vlsb are anchored per row at the
+    tile's largest term and truncated to SW unsigned 7-bit digits. Each digit pair is an exact
+    int8 MMA, and two more small MMAs bound the truncation per element:
+      weight loss  sum_j lostW_mj * |Vfix_jc|       (lost-weight mask x |V| digits)
+      V loss       sum_j (W_mj + 1) * vlost_jc      (weight digits x lost-V mask)."""
+    vlsb = tl.load(VLSB + nn, mask=nmask, other=0)
+    G = Ew + vlsb[None, :]                                                 # term = M * Vfix * 2^G
+    gtop = tl.max(tl.where(vis, G + 24, NEG), axis=1)                      # (M,)
+    base = gtop - 7 * SW
+    Wf, lw = _floor_shift(Mw, G - base[:, None])                           # Wf < 2^(7*SW)
+    Wf = tl.where(vis, Wf, 0)
+    lw = lw & vis
+    acc = tl.zeros((Mw.shape[0], cc.shape[0]), tl.int64)
+    e = tl.zeros((Mw.shape[0], cc.shape[0]), tl.int64)
+    nz = tl.zeros((nn.shape[0], cc.shape[0]), tl.int32)
+    for b in tl.static_range(SV):
+        vb = tl.load(VX + (b * NKEYS + nn[:, None]) * DV + cc[None, :], mask=nmask[:, None], other=0)
+        nz = nz | (vb != 0).to(tl.int32)
+        e += tl.dot(lw.to(tl.int8), tl.abs(vb), out_dtype=tl.int32).to(tl.int64) << (7 * b)
+        for s in tl.static_range(SW):
+            ws = ((Wf >> (7 * s)) & 127).to(tl.int8)
+            acc += tl.dot(ws, vb, out_dtype=tl.int32).to(tl.int64) << (7 * (s + b))
+    vl = tl.load(VLOST + nn[:, None] * DV + cc[None, :], mask=nmask[:, None], other=0)
+    for s in tl.static_range(SW):
+        ws = ((Wf >> (7 * s)) & 127).to(tl.int8)
+        e += tl.dot(ws, vl, out_dtype=tl.int32).to(tl.int64) << (7 * s)
+    visb = vis.to(tl.int8)
+    e += tl.dot(visb, vl, out_dtype=tl.int32).to(tl.int64)
+    chan = tl.dot(visb, nz.to(tl.int8), out_dtype=tl.int32) > 0           # channel has any term
+    # True N in [acc - e, acc + e] * 2^base, with |acc| < 2^ANCH (ANCH = 7*SW + 7*SV + log2 BLOCK_N).
+    # Re-anchor at TNR = base + ANCH, i.e. units 2^(base + ANCH - FN): a right shift by
+    # sr = ANCH - FN (counted truncation) or an exact left shift.
+    lo = acc - e
+    wid = 2 * e
+    sr = ANCH - FN
+    TN_r, TNE_r = _rescale(lo, wid, tl.full(lo.shape, 0, tl.int64) + tl.maximum(sr, 0))
+    sl = tl.minimum(tl.maximum(-sr, 0), 62)
+    TN = tl.where(sr >= 0, TN_r, lo << sl)
+    TNE = tl.where(sr >= 0, TNE_r, wid << sl)
+    TNR = tl.where(chan, base[:, None] + ANCH, NEG)
+    TN = tl.where(chan, TN, 0)
+    TNE = tl.where(chan, TNE, 0)
+    return TNR, TN, TNE
+
+
 # ---------------------------------------------------------------------------
 # Kernels
 # ---------------------------------------------------------------------------
@@ -233,10 +285,11 @@ def _tc_logits(QX, KX, rows, rmask, nn, nmask, ROWS, NKEYS, QLSB, QL1, QLOST, KL
 def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                      PR, PZ, PZE, PNR, PN, PNE, FLAG,
                      SPLIT_LEN, FZ, FN,
-                     QX, KX, QLSB, QL1, QLOST, KLSB, KL1, KLOST, NKEYS,
+                     QX, KX, QLSB, QL1, QLOST, KLSB, KL1, KLOST, NKEYS, VX, VLSB, VLOST,
                      D: tl.constexpr, DV: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                      BLOCK_DV: tl.constexpr, FS: tl.constexpr, EXP2_MARGIN: tl.constexpr,
-                     USE_TC: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr, TC_FALLBACK: tl.constexpr):
+                     USE_TC: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr, TC_FALLBACK: tl.constexpr,
+                     USE_TC_PV: tl.constexpr, SW: tl.constexpr, SV: tl.constexpr, ANCH: tl.constexpr):
     pid_m = tl.program_id(0)
     pid_s = tl.program_id(1)
     pid_c = tl.program_id(2)
@@ -302,14 +355,17 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
         vb = tl.load(V + nn[:, None] * DV + cc[None, :], mask=(nn < kmax)[:, None], other=0)
         vm, ve, vbad = _decode_bf16(vb)                                    # (N, BDV)
         flag = tl.maximum(flag, tl.max((vis & (tl.max(vbad.to(tl.int32), axis=1) != 0)[None, :]).to(tl.int32), axis=1))
-        lv = tl.where(vm != 0, ve + _bitlen(tl.abs(vm)) - 1, NEG)
-        valid = vis[:, :, None] & (vm != 0)[None, :, :]                    # (M, N, BDV)
-        L = tl.where(valid, top[:, :, None] + 1 + lv[None, :, :], NEG)
-        TNR = tl.max(L, axis=1)                                            # (M, BDV)
-        nt, nl = _floor_shift(Mw[:, :, None] * vm[None, :, :],
-                              Ew[:, :, None] + ve[None, :, :] - (TNR[:, None, :] - FN))
-        TN = tl.sum(tl.where(valid, nt, 0), axis=1)
-        TNE = tl.sum((nl & valid).to(tl.int64), axis=1)
+        if USE_TC_PV:
+            TNR, TN, TNE = _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nn < kmax, cc, NKEYS, FN, DV, SW, SV, ANCH)
+        else:
+            lv = tl.where(vm != 0, ve + _bitlen(tl.abs(vm)) - 1, NEG)
+            valid = vis[:, :, None] & (vm != 0)[None, :, :]                # (M, N, BDV)
+            L = tl.where(valid, top[:, :, None] + 1 + lv[None, :, :], NEG)
+            TNR = tl.max(L, axis=1)                                        # (M, BDV)
+            nt, nl = _floor_shift(Mw[:, :, None] * vm[None, :, :],
+                                  Ew[:, :, None] + ve[None, :, :] - (TNR[:, None, :] - FN))
+            TN = tl.sum(tl.where(valid, nt, 0), axis=1)
+            TNE = tl.sum((nl & valid).to(tl.int64), axis=1)
         # ---- merge into the running partial ----
         nR = tl.maximum(PRr, TR)
         a1, e1 = _rescale(PZr, PZEr, nR - PRr)
@@ -418,9 +474,17 @@ def tc_slices(bits: np.ndarray, S: int, dev) -> list:
             torch.from_numpy(lost.any(axis=1).astype(np.int32)).to(dev)]
 
 
+def tc_v_slices(v_bits: np.ndarray, S: int, dev) -> list:
+    """int8 slices of V rows for tensor-core P·V: [X (S, n, dv) int8, lsb (n,) int64, lost (n, dv) int8].
+    Done once when the KV cache is written."""
+    X, lsb, _, lost = slice_rows(v_bits, S)
+    return [torch.from_numpy(np.ascontiguousarray(X)).to(dev), torch.from_numpy(lsb.astype(np.int64)).to(dev),
+            torch.from_numpy(np.ascontiguousarray(lost.astype(np.int8))).to(dev)]
+
+
 def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int = 4, block_m: int = 16,
            block_n: int = 16, block_dv: int = 32, merge_order=None, exp2_margin: float = 2.0 ** -26,
-           q_tc=None, k_tc=None, tc_fallback: bool = True):
+           q_tc=None, k_tc=None, tc_fallback: bool = True, v_tc=None, sw: int = 5):
     """Device-level launch with no host transfers and no sync.
 
     Qt (R, d), Kt (n, d), Vt (n, dv) are int16 views of bf16 on the device; KL (R,) is int32.
@@ -447,6 +511,16 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
         zf = torch.zeros(1, dtype=torch.float64, device=dev)
         z32 = torch.zeros(1, dtype=torch.int32, device=dev)
         tc, sq, sk = [z8, z8, z64, zf, z32, z64, zf, z32], 1, 1
+    use_tc_pv = v_tc is not None
+    if use_tc_pv:
+        vtc, sv = list(v_tc), v_tc[0].shape[0]
+    else:
+        z8 = torch.zeros(1, dtype=torch.int8, device=dev)
+        vtc, sv, sw = [z8, torch.zeros(1, dtype=torch.int64, device=dev), z8], 1, 1
+    anch = 7 * sw + 7 * sv + int(np.ceil(np.log2(block_n)))
+    if use_tc_pv:
+        # Largest tile partial: block_n * 127 * 127 * 2^(7(sw+sv-2)) (all digit pairs combined) must fit int64.
+        assert anch + 1 < 63, f"P·V slices too wide for int64: sw={sw}, sv={sv}, block_n={block_n}"
     i64 = dict(dtype=torch.int64, device=dev)
     PR_ = torch.empty((nsplit, R), **i64)
     PZ_ = torch.empty((nsplit, R), **i64)
@@ -458,9 +532,10 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     FL = torch.zeros((nsplit, R, ncb), dtype=torch.int32, device=dev)
     grid = (triton.cdiv(R, block_m), nsplit, ncb)
     _ea_split_kernel[grid](Qt, Kt, Vt, KL, R, am, ae, PR_, PZ_, PZE_, PNR_, PN_, PNE_, FL,
-                           split_len, fz, fn, *tc, n, D=d, DV=dv, BLOCK_M=block_m, BLOCK_N=block_n,
+                           split_len, fz, fn, *tc, n, *vtc, D=d, DV=dv, BLOCK_M=block_m, BLOCK_N=block_n,
                            BLOCK_DV=block_dv, FS=SCORE_FS, EXP2_MARGIN=exp2_margin,
-                           USE_TC=use_tc, SQ=sq, SK=sk, TC_FALLBACK=tc_fallback)
+                           USE_TC=use_tc, SQ=sq, SK=sk, TC_FALLBACK=tc_fallback,
+                           USE_TC_PV=use_tc_pv, SW=sw, SV=sv, ANCH=anch)
     if merge_order is None:
         order = np.arange(nsplit)
     else:
@@ -485,7 +560,8 @@ def attention_triton(q_bits, k_bits, v_bits, alpha, kv_len, out: str = "bf16", s
                      block_m: int = 16, block_n: int = 16, block_dv: int | None = None,
                      merge_order=None, device: str = "cpu", fallback: bool = True,
                      exp2_margin: float = 2.0 ** -26, use_tc: bool = False, sq: int = 3, sk: int = 4,
-                     k_slices=None, tc_fallback: bool = True):
+                     k_slices=None, tc_fallback: bool = True, use_tc_pv: bool = False, sw: int = 5,
+                     sv: int = 3):
     """numpy-level API. q: (R, d), k: (n, d), v: (n, dv) bf16 bits (uint16). Row r attends keys
     [0, kv_len[r]): causal, decode, prefill and chunked prefill all have this shape.
     Returns (out, flags); flagged rows are recomputed exactly when fallback=True."""
@@ -510,7 +586,8 @@ def attention_triton(q_bits, k_bits, v_bits, alpha, kv_len, out: str = "bf16", s
     OUT, FL, OF = launch(t16(q_bits), t16(k_bits), t16(v_bits), torch.from_numpy(kv_len).to(dev),
                          int(kv_len.max(initial=0)), alpha, out=out, splits=splits, block_m=block_m,
                          block_n=block_n, block_dv=block_dv, merge_order=merge_order, exp2_margin=exp2_margin,
-                         q_tc=q_tc, k_tc=k_tc, tc_fallback=tc_fallback)
+                         q_tc=q_tc, k_tc=k_tc, tc_fallback=tc_fallback,
+                         v_tc=tc_v_slices(v_bits, sv, dev) if use_tc_pv else None, sw=sw)
     flags = np.maximum(FL.amax(dim=(0, 2)).cpu().numpy(), OF.amax(dim=1).cpu().numpy()).astype(np.uint8)
     o = OUT.cpu().numpy()
     res = (o.astype(np.uint32).view(np.float32) if out == "fp32" else (o & 0xFFFF).astype(np.uint16)).copy()

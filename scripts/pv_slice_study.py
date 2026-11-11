@@ -28,7 +28,13 @@ from exactattn.reference import trace_row  # noqa: E402
 from exactattn.slices import slice_rows  # noqa: E402
 from validate_model import alpha_for  # noqa: E402
 
-CONFIGS = [(3, 3, False), (4, 3, False), (4, 3, True), (5, 3, False), (5, 3, True), (4, 4, True)]
+# (layout, Sw, Sv). Layouts:
+#   row-chan  V exponent per key row; weight-truncation bound per channel, V-loss bound per key row (D9)
+#   row-elem  same, but the V-loss bound charges only the elements that actually lost bits
+#   col-elem  V exponent per (64-key tile, channel); weights anchored per tile; per-element bounds
+CONFIGS = [("row-chan", 5, 3), ("row-elem", 4, 3), ("row-elem", 5, 3), ("col-elem", 3, 2), ("col-elem", 4, 2),
+           ("col-elem", 3, 3), ("col-elem", 4, 3)]
+TILE = 64
 
 
 def rn(num, den):
@@ -38,52 +44,74 @@ def rn(num, den):
     return (0, 0) if m == 0 else (m, e)
 
 
-def study_row(tr, v, Sw, Sv, tight):
-    """tr: reference trace (exact weights). Returns (certified, total) channels."""
-    M = np.array([m for m, _ in tr.w], dtype=object)
-    E = np.array([e for _, e in tr.w], dtype=np.int64)
-    VX, vlsb, vl1, vlost = slice_rows(v, Sv)                       # VX (Sv, n, dv)
-    G = E + vlsb                                                   # term = M * Vfix * 2^G
-    Gtop = int((G + 24).max())
-    Bw = 7 * Sw
-    base = Gtop - Bw                                               # unit of N
-    W, lostW = [], []
-    for m, g in zip(M.tolist(), G.tolist()):
-        sh = g - base
-        if sh >= 0:
-            W.append(m << sh)
-            lostW.append(False)
-        else:
-            w = m >> -sh
-            W.append(w)
-            lostW.append((w << -sh) != m)
-    W = np.array(W, dtype=object)
-    assert max(W) < (1 << Bw)
-    # Exact sum_j W_j Vfix_jc via slices (Python ints stand in for int8 MMA plus combine).
-    Vfix = sum((VX[b].astype(object) * (1 << (7 * b)) for b in range(Sv)))   # (n, dv), signed
-    N = (W[:, None] * Vfix).sum(axis=0)                            # (dv,) exact integers
-    # Error bounds in units of 2^base:
-    #   weight truncation: |dW_j| < 1, so the term error is <= |Vfix_jc| < 2^(7*Sv)
-    #   V truncation: |dVfix_jc| < 1 (vlsb absorbed into G_j), so the term error is <= W_j + 1
-    lw = np.array(lostW)
-    v_err = int(sum(int(W[j]) + 1 for j in np.flatnonzero(vlost.any(axis=1))))
-    if tight:   # per channel: sum_j lostW_j * |Vfix_jc| (one extra small int8 MMA with a 0/1 mask)
-        errs = [int(np.abs(Vfix[lw, c]).sum()) + v_err for c in range(v.shape[1])]
-    else:       # per row: (#truncated weights) * max|Vfix|
-        errs = [int(lw.sum()) * (1 << (7 * Sv)) + v_err] * v.shape[1]
+def _fix(m, sh):
+    """Truncate the integer m * 2^sh toward zero. Returns (value, lost)."""
+    if sh >= 0:
+        return m << sh, False
+    a = abs(m) >> -sh
+    return (a if m >= 0 else -a), (a << -sh) != abs(m)
+
+
+def certify(N, err, unit, tr):
+    """N, err: per-channel exact ints in units 2^unit. Returns the number of certified channels."""
     Zm, Ze = tr.Z
+    sh = unit - Ze
     ok = 0
-    for c in range(v.shape[1]):
-        lo, hi = int(N[c]) - errs[c], int(N[c]) + errs[c]
-        # N/Z = (x * 2^base) / (Zm * 2^Ze)
-        sh = base - Ze
+    for n, e in zip(N, err):
+        lo, hi = n - e, n + e
+        r = (lambda x: rn(x << sh, Zm)) if sh >= 0 else (lambda x: rn(x, Zm << -sh))
+        ok += r(lo) == r(hi)
+    return ok
 
-        def ratio(x):
-            return rn(x << sh, Zm) if sh >= 0 else rn(x, Zm << -sh)
 
-        ok += ratio(lo) == ratio(hi)
-    return ok, v.shape[1]
-
+def study_row(tr, v, layout, Sw, Sv):
+    M = [m for m, _ in tr.w]
+    E = [e for _, e in tr.w]
+    n, dv = v.shape
+    if layout.startswith("row"):
+        VX, vlsb, _, vlost = slice_rows(v, Sv)                         # vlost: (n, dv) per element
+        Vfix = sum(VX[b].astype(object) * (1 << (7 * b)) for b in range(Sv))
+        G = [e + int(l) for e, l in zip(E, vlsb)]
+        base = max(g + 24 for g in G) - 7 * Sw
+        W, lw = zip(*(_fix(m, g - base) for m, g in zip(M, G)))
+        N = [sum(W[j] * int(Vfix[j, c]) for j in range(n)) for c in range(dv)]
+        err = []
+        for c in range(dv):
+            e1 = sum(abs(int(Vfix[j, c])) for j in range(n) if lw[j])
+            if layout == "row-chan":
+                e2 = sum(W[j] + 1 for j in range(n) if vlost[j].any())
+            else:
+                e2 = sum(W[j] + 1 for j in range(n) if vlost[j, c])
+            err.append(e1 + e2)
+        return certify(N, err, base, tr), dv
+    # col-elem: tile-local exponents per channel, exact combination across tiles
+    from fractions import Fraction
+    Nf = [Fraction(0)] * dv
+    Ef = [Fraction(0)] * dv
+    from exactattn.reference import decode_bf16_array
+    vm, ve = decode_bf16_array(v)
+    for t0 in range(0, n, TILE):
+        js = range(t0, min(n, t0 + TILE))
+        top = max(E[j] + 24 for j in js)
+        wbase = top - 7 * Sw
+        W, lw = zip(*(_fix(M[j], E[j] - wbase) for j in js))
+        for c in range(dv):
+            leads = [int(ve[j, c]) + abs(int(vm[j, c])).bit_length() - 1 for j in js if vm[j, c] != 0]
+            if not leads:
+                continue
+            vbase = max(leads) + 1 - 7 * Sv
+            Vc = [_fix(int(vm[j, c]), int(ve[j, c]) - vbase) for j in js]
+            s = sum(w * vf for w, (vf, _) in zip(W, Vc))
+            e = sum(abs(vf) for (vf, _), l in zip(Vc, lw) if l) + sum(w + 1 for w, (_, vl) in zip(W, Vc) if vl)
+            scale = Fraction(2) ** (wbase + vbase)
+            Nf[c] += s * scale
+            Ef[c] += e * scale
+    # Put everything over a common power-of-two denominator to reuse certify().
+    den = max((x.denominator for x in Nf + Ef), default=1)
+    unit = -(den.bit_length() - 1)
+    N = [int(x * den) for x in Nf]
+    err = [int(x * den) for x in Ef]
+    return certify(N, err, unit, tr), dv
 
 def main():
     ap = argparse.ArgumentParser()
@@ -111,10 +139,13 @@ def main():
     lines = [f"# P·V on tensor cores: int8 slices for weights and V ({meta['model']})", "",
              f"{len(picks)} random rows (positions 64–600), every channel. One weight anchor per row,",
              "with exact Z. Generated by `scripts/pv_slice_study.py`.", "",
-             "| weight digits Sw | V digits Sv | bound | int8 MMA k-steps per (key, channel) | outputs certified | uncertified rate |",
+             "| layout | Sw | Sv | int8 MMA k-steps (value + bound) | outputs certified | uncertified rate |",
              "|---|---|---|---|---|---|"]
-    for (Sw, Sv, tight), (ok, n) in tot.items():
-        lines.append(f"| {Sw} | {Sv} | {'per-channel' if tight else 'per-row'} | {Sw * Sv}{' + ' + str(Sv) if tight else ''} | {ok:,} / {n:,} | {1 - ok / n:.2e} |")
+    for (layout, Sw, Sv), (ok, n) in tot.items():
+        extra = Sv + Sw if layout.endswith("elem") else Sv
+        lines.append(f"| {layout} | {Sw} | {Sv} | {Sw * Sv} + {extra} | {ok:,} / {n:,} | {1 - ok / n:.2e} |")
+    lines += ["", "Bound MMAs: per-channel weight loss = lost-weight mask × |V| (Sv k-steps); per-element V loss =",
+              "W × lost-V mask (Sw k-steps). Earlier results (D9): row-chan 4×3 1.2e-2, 5×3 4.2e-3."]
     with open(args.out, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     print("\n".join(lines))
