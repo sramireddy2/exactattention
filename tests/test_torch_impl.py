@@ -1,5 +1,7 @@
 """Tensor-op implementation on every available torch device vs the exact reference."""
 
+import zlib
+
 import numpy as np
 import pytest
 
@@ -20,7 +22,7 @@ if torch.cuda.is_available():
 @pytest.mark.parametrize("kind", KINDS)
 @pytest.mark.parametrize("vkind", ["normal", "wide", "dupes"])
 def test_matches_reference(device, kind, vkind):
-    rng = np.random.default_rng(hash((kind, vkind)) % 2**32)
+    rng = np.random.default_rng(zlib.crc32(f"{kind}/{vkind}".encode()))
     d, dv, R, n = 64, 32, 6, 150
     Q, K, V = bf16(rng, (R, d), kind), bf16(rng, (n, d), kind), bf16(rng, (n, dv), vkind)
     mask = rng.random((R, n)) < 0.8
