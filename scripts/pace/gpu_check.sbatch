@@ -1,10 +1,12 @@
 #!/bin/bash
-# Bit-identity and kernel tests on one NVIDIA GPU, on PACE Phoenix's FREE "embers" QOS.
-# embers has UsageFactor 0 (`sacctmgr show qos embers`), so nothing is charged. It runs on idle
-# nodes, can be preempted, and is capped at 8 h. Pass the account on the command line:
-#   sbatch -A <your-gts-account> scripts/pace/gpu_check.sbatch
-# Listing several partitions lets Slurm start the job wherever a GPU frees up first. All of
-# them are sm_80 or newer, which the int8 tensor-core path needs.
+# GPU checks and benchmarks on PACE Phoenix's FREE embers QOS (UsageFactor 0: nothing is charged).
+#
+# On embers only the first hour is guaranteed; after that the job can be cancelled (not
+# requeued) with about 30 s warning. So this job asks for 55 min and runs scripts/pace/run_stages.sh,
+# which checkpoints per stage and chains further jobs until every stage is done.
+#
+# Start a run (the account is only needed for embers access; embers is never charged):
+#   sbatch -A <gts-account> --export=ALL,EA_RUN=$(date +%m%d-%H%M) scripts/pace/gpu_check.sbatch
 #SBATCH -J exactattn-gpu
 #SBATCH -q embers
 #SBATCH -p gpu-a100,gpu-h100,gpu-h200,gpu-l40s,gpu-rtxpro-blackwell
@@ -13,25 +15,9 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G
-#SBATCH -t 01:30:00
+#SBATCH -t 00:55:00
+#SBATCH --signal=B:TERM@60
 #SBATCH -o exactattn-gpu-%j.out
 
-set -uo pipefail
-cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/../..}"
-source "${EA_VENV:-$HOME/scratch/exactattn-venv}/bin/activate"
-echo "partition: ${SLURM_JOB_PARTITION:-?}  node: $(hostname)  qos: ${SLURM_JOB_QOS:-?}"
-nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv
-python -c "import torch, triton; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'triton', triton.__version__, torch.cuda.get_device_name(0))"
-
-echo "== fixture: same SHA-256 as the laptop (Intel Arc GPU + x86 CPU) =="
-python scripts/fixture.py check --backend cpp
-python scripts/fixture.py check --backend torch:cuda
-python scripts/fixture.py check --backend triton:cuda
-python scripts/fixture.py check --backend tritontc:cuda
-
-echo "== kernel test suites on CUDA =="
-EA_TRITON_DEVICE=cuda python -m pytest -q -p no:cacheprovider tests/test_triton.py tests/test_torch_impl.py tests/test_cpu_kernel.py
-
-echo "== decode-shape timing vs SDPA =="
-mkdir -p results/pace
-python scripts/bench_decode.py --rows 16 --keys 1024,4096,16384 --out "results/pace/bench_decode_${SLURM_JOB_ID:-local}.md"
+# --signal=B:TERM@60 gives the stage runner 60 s of notice before the time limit as well.
+exec bash "${EA_REPO:-$HOME/scratch/exactattention}/scripts/pace/run_stages.sh"

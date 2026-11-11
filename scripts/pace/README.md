@@ -1,38 +1,51 @@
-# Running on Georgia Tech PACE (free tier)
+# Running on Georgia Tech PACE (free tier only)
 
-Everything here uses the **free `embers` QOS** on Phoenix: no charge, but jobs can be
-preempted. The goal of the first run is to show that an NVIDIA GPU reproduces exactly the
-SHA-256 hashes recorded on the laptop (an Intel Arc 140V GPU and an x86 CPU).
+Everything here uses Phoenix's **free `embers` QOS**. Its UsageFactor is 0, so nothing is
+charged; check with `sacctmgr show qos embers`.
 
-1. **Connect.** Connect to the GT VPN, then
-   `ssh <gt-username>@login-phoenix.pace.gatech.edu`. For ICE, the course cluster, use
-   `login-ice.pace.gatech.edu`.
-2. **Get the code and set up once.**
-   ```bash
-   git clone https://github.com/sramireddy2/exactattention.git ~/scratch/exactattention
-   cd ~/scratch/exactattention
-   bash scripts/pace/setup.sh
-   ```
-3. **Edit the charge account.** Change `#SBATCH -A gts-REPLACE_ME` in
-   `scripts/pace/gpu_check.sbatch` to your account; `pace-quota` lists yours. On ICE, remove
-   the `-A` and `-q` lines.
-4. **Submit and watch.**
-   ```bash
-   sbatch scripts/pace/gpu_check.sbatch
-   squeue -u $USER
-   cat exactattn-gpu-*.out
-   ```
+## How embers behaves, and how the job copes
 
-What success looks like:
+- **Only the first hour is guaranteed.** After that a priority job can take the GPU, and the
+  embers job is **cancelled, not requeued** (`PreemptMode=CANCEL`), with about 30 s warning.
+  Busy partitions such as L40S lose it at about 1 h almost every time, even with an 8 h
+  request.
+- So each job asks for **55 minutes**, inside the guarantee. Shorter requests also backfill
+  sooner.
+- The work is split into **stages** (`run_stages.sh`), each with its own time cap, and each
+  writes a `.done` marker when it finishes. A new job skips finished stages.
+- When stages remain, the job **submits the next job in the chain** itself (at most
+  `EA_MAX_CHAIN`, default 6). On SIGTERM, whether preemption or the time limit, the running
+  stage stays not-done and the chain resubmits.
+- A stage that hits its cap twice is recorded as `TIMEOUT` and skipped, so the chain cannot
+  loop forever.
 
-- Every `fixture.py check` line prints **MATCH**, and each prints `ALL MATCH`.
-- The `standard SDPA` hash printed next to each one differs from the laptop's. Standard
-  attention is device-dependent; ExactAttention is not.
-- The CUDA test suites pass.
+## Setup (once, on a login node)
 
-Some details above couldn't be confirmed from the laptop, so check them against PACE's
-documentation:
+```bash
+git clone https://github.com/sramireddy2/exactattention.git ~/scratch/exactattention
+cd ~/scratch/exactattention && bash scripts/pace/setup.sh
+```
 
-- the GPU type names for `--gres`;
-- whether `module load anaconda3` exists on your cluster;
-- which charge account your group uses for `embers`.
+## Start a run
+
+```bash
+cd ~/scratch/exactattention
+sbatch -A <gts-account> --export=ALL,EA_RUN=$(date +%m%d-%H%M) -o ~/scratch/ea_jobs/exactattn-%j.out scripts/pace/gpu_check.sbatch
+squeue -u $USER
+cat results/pace/run-<RUN>/summary.md        # updated by every job in the chain
+```
+
+Stages, in order:
+
+1. environment
+2. C++ fixture
+3. torch-CUDA fixture
+4. torch-CUDA tests
+5. C++ tests
+6. Triton CUDA tests
+7. Triton fixture: windowed scores
+8. Triton fixture: tensor-core scores
+9. decode benchmarks at 1K, 4K and 16K keys
+
+Every fixture stage should print `ALL MATCH`, meaning the same SHA-256 as the laptop's Intel GPU
+and CPU.
