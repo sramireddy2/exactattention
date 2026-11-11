@@ -19,9 +19,16 @@ from functools import lru_cache
 
 import numpy as np
 from mpmath import iv
-from mpmath.libmp import to_man_exp
 
 P = 24  # weight precision (FP24inf)
+
+
+def _raw_to_man_exp(raw) -> tuple[int, int]:
+    """Signed (man, exp) of a raw mpmath mpf tuple (sign, man, exp, bc)."""
+    sign, man, exp, _ = raw
+    if not man and exp:
+        raise ValueError("non-finite interval endpoint")
+    return (-int(man) if sign else int(man)), int(exp)
 
 
 def _split(t: float) -> tuple[int, float]:
@@ -55,8 +62,8 @@ def exp2_weight_oracle(t: float, p: int = P) -> tuple[int, int]:
             lo_raw, hi_raw = y._mpi_
         finally:
             iv.prec = old
-        lo_m, lo_e = to_man_exp(lo_raw, signed=True)
-        hi_m, hi_e = to_man_exp(hi_raw, signed=True)
+        lo_m, lo_e = _raw_to_man_exp(lo_raw)
+        hi_m, hi_e = _raw_to_man_exp(hi_raw)
         q_lo = _rn_int_of_dyadic(lo_m, lo_e + (p - 1))
         q_hi = _rn_int_of_dyadic(hi_m, hi_e + (p - 1))
         if q_lo == q_hi:
