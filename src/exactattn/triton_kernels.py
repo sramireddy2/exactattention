@@ -497,7 +497,12 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     dev = Qt.device
     key_log2 = max(1, int(np.ceil(np.log2(max(2, maxlen)))))
     fz = fn = 64 - 3 - key_log2
-    split_len = max(block_n, -(-max(maxlen, 1) // splits))
+    if v_tc is not None:
+        # P·V contracts over the key tile, and int8 MMAs on NVIDIA need K >= 32 (mma.m16n8k32).
+        # The CPU interpreter does not enforce this. The tile size cannot change the output
+        # (SPEC §5.3), so raising it is free.
+        block_n = max(block_n, 32)
+    split_len = max(block_n,-(-max(maxlen, 1) // splits))
     split_len = -(-split_len // block_n) * block_n
     nsplit = max(1, -(-max(maxlen, 1) // split_len))
     am, ae = decode_fp32(np.float32(alpha))
