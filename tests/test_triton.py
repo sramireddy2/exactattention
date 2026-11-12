@@ -172,3 +172,75 @@ def test_tensor_core_pv_on_real_activations():
     for i in np.flatnonzero(flags == 0):
         r = int(rows[i])
         assert np.array_equal(got[i], attention_row(q[r], k[: r + 1], v[: r + 1, :32], alpha)), r
+
+@pytest.mark.parametrize("mode", ["int64", "tc", "tcpv"])
+def test_segments_equal_separate_launches(mode):
+    """Batched launch over G segments (sequence x KV head) gives, row for row, the bits and flags
+    of one launch per segment, and certified rows match the reference."""
+    import torch
+
+    from exactattn.formats import float_to_bf16_bits
+    from exactattn.triton_kernels import launch, tc_slices, tc_v_slices
+
+    rng = np.random.default_rng(zlib.crc32(f"segments/{mode}".encode()))
+    G, r_seg, n_seg, d, dv = 3, 5, 70, 64, 32
+
+    def compact(shape):
+        return float_to_bf16_bits(rng.choice([-1.0, 1.0], size=shape) * np.exp2(rng.uniform(-6, 1, size=shape)))
+
+    Q, K, V = compact((G, r_seg, d)), compact((G, n_seg, d)), compact((G, n_seg, dv))
+    kv_len = rng.integers(1, n_seg + 1, size=(G, r_seg)).astype(np.int32)
+    alpha = default_alpha(d)
+    dev = torch.device(DEVICE)
+
+    def t16(x):
+        return torch.from_numpy(np.ascontiguousarray(x).view(np.int16)).to(dev)
+
+    def kw(q, k, v):
+        out = {}
+        if mode != "int64":
+            out.update(q_tc=tc_slices(q, 3, dev), k_tc=tc_slices(k, 4, dev))
+        if mode == "tcpv":
+            out.update(v_tc=tc_v_slices(v, 3, dev))
+        return out
+
+    maxlen = int(kv_len.max())
+    OUT, FL, OF = launch(t16(Q), t16(K), t16(V), torch.from_numpy(kv_len).to(dev), maxlen, alpha, splits=2,
+                         block_m=16, block_n=32, block_dv=32,
+                         **kw(Q.reshape(-1, d), K.reshape(-1, d), V.reshape(-1, dv)))
+    got = (OUT.cpu().numpy() & 0xFFFF).astype(np.uint16)
+    flags = np.maximum(FL.amax(dim=(0, 2)).cpu().numpy(), OF.amax(dim=1).cpu().numpy()).reshape(G, r_seg)
+    for g in range(G):
+        o, fl, of = launch(t16(Q[g]), t16(K[g]), t16(V[g]), torch.from_numpy(kv_len[g]).to(dev), maxlen, alpha,
+                           splits=2, block_m=16, block_n=32, block_dv=32, **kw(Q[g], K[g], V[g]))
+        f1 = np.maximum(fl.amax(dim=(0, 2)).cpu().numpy(), of.amax(dim=1).cpu().numpy())
+        assert np.array_equal(flags[g], f1), g
+        assert np.array_equal(got[g], (o.cpu().numpy() & 0xFFFF).astype(np.uint16)), g
+        for r in range(r_seg):
+            if flags[g, r] == 0:
+                L = int(kv_len[g, r])
+                assert np.array_equal(got[g, r], attention_row(Q[g, r], K[g, :L], V[g, :L], alpha)), (g, r)
+    assert (flags == 0).sum() >= G * r_seg - 1, flags
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_device_q_slicing_matches_numpy(kind):
+    """tc_slices_device (per-step q slicing on the GPU) equals the numpy slicer exactly; l1 is a
+    float upper bound whose summation order may differ, so it is compared to a relative 1e-12."""
+    import torch
+
+    from exactattn.triton_kernels import tc_slices, tc_slices_device, tc_v_slices, tc_v_slices_device
+
+    rng = np.random.default_rng(zlib.crc32(f"qslice/{kind}".encode()))
+    x = bf16(rng, (37, 128), kind)
+    x[3] = 0                                     # all-zero row
+    for S in (3, 4):
+        ref = tc_slices(x, S, torch.device("cpu"))
+        got = tc_slices_device(torch.from_numpy(x.view(np.int16)).to(DEVICE), S)
+        assert torch.equal(got[0].cpu(), ref[0]) and torch.equal(got[1].cpu(), ref[1])
+        assert torch.equal(got[3].cpu(), ref[3])
+        assert torch.allclose(got[2].cpu(), ref[2], rtol=1e-12, atol=0)
+        vref = tc_v_slices(x, S, torch.device("cpu"))
+        vgot = tc_v_slices_device(torch.from_numpy(x.view(np.int16)).to(DEVICE), S)
+        for a_, b_ in zip(vgot, vref):
+            assert torch.equal(a_.cpu(), b_)

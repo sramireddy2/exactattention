@@ -286,15 +286,24 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                      PR, PZ, PZE, PNR, PN, PNE, FLAG,
                      SPLIT_LEN, FZ, FN,
                      QX, KX, QLSB, QL1, QLOST, KLSB, KL1, KLOST, NKEYS, VX, VLSB, VLOST,
+                     R_SEG, NK_SEG, NRB,
                      D: tl.constexpr, DV: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                      BLOCK_DV: tl.constexpr, FS: tl.constexpr, EXP2_MARGIN: tl.constexpr,
                      USE_TC: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr, TC_FALLBACK: tl.constexpr,
                      USE_TC_PV: tl.constexpr, SW: tl.constexpr, SV: tl.constexpr, ANCH: tl.constexpr):
+    # Segments: G independent problems (e.g. sequence x KV head), each with R_SEG query rows
+    # attending its own NK_SEG keys. Rows and keys are stored segment after segment, so
+    # ROWS = G * R_SEG and NKEYS = G * NK_SEG. Each program handles one segment's row block.
     pid_m = tl.program_id(0)
     pid_s = tl.program_id(1)
     pid_c = tl.program_id(2)
-    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rmask = rows < ROWS
+    seg = pid_m // NRB
+    lrows = (pid_m % NRB) * BLOCK_M + tl.arange(0, BLOCK_M)
+    rmask = lrows < R_SEG
+    rows = seg * R_SEG + lrows
+    kb0 = seg.to(tl.int64) * NK_SEG                                        # first key of the segment
+    K += kb0 * D
+    V += kb0 * DV
     kvl = tl.load(KVLEN + rows, mask=rmask, other=0).to(tl.int64)
     dd = tl.arange(0, D)
     cc = pid_c * BLOCK_DV + tl.arange(0, BLOCK_DV)
@@ -320,7 +329,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
         if USE_TC:
             # Tensor cores: int8 slice products, certified; windowed recompute only for
             # tiles that contain an uncertified score.
-            t, unc = _tc_logits(QX, KX, rows, rmask, nn, nn < kmax, ROWS, NKEYS, QLSB, QL1, QLOST,
+            t, unc = _tc_logits(QX, KX, rows, rmask, kb0 + nn, nn < kmax, ROWS, NKEYS, QLSB, QL1, QLOST,
                                 KLSB, KL1, KLOST, AM, AE, D, SQ, SK)
             if TC_FALLBACK and tl.max(tl.max((unc & vis).to(tl.int32), axis=1), axis=0) > 0:
                 t_w, unc_w = _windowed_logits(qm, qe, km, ke, AM, AE, FS)
@@ -356,7 +365,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
         vm, ve, vbad = _decode_bf16(vb)                                    # (N, BDV)
         flag = tl.maximum(flag, tl.max((vis & (tl.max(vbad.to(tl.int32), axis=1) != 0)[None, :]).to(tl.int32), axis=1))
         if USE_TC_PV:
-            TNR, TN, TNE = _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nn < kmax, cc, NKEYS, FN, DV, SW, SV, ANCH)
+            TNR, TN, TNE = _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, kb0 + nn, nn < kmax, cc, NKEYS, FN, DV, SW, SV, ANCH)
         else:
             lv = tl.where(vm != 0, ve + _bitlen(tl.abs(vm)) - 1, NEG)
             valid = vis[:, :, None] & (vm != 0)[None, :, :]                # (M, N, BDV)
@@ -474,6 +483,51 @@ def tc_slices(bits: np.ndarray, S: int, dev) -> list:
             torch.from_numpy(lost.any(axis=1).astype(np.int32)).to(dev)]
 
 
+def _slice_rows_device(bits: torch.Tensor, S: int):
+    """slices.slice_rows as torch ops on device-resident rows (int16 view of bf16, (R, d)).
+    Returns X (S, R, d) int8, lsb (R,) int64, l1 (R,) float64, lost (R, d) bool. NaN/inf rows
+    give arbitrary digits, but the kernel flags those rows from the raw bits anyway."""
+    b = bits.to(torch.int32) & 0xFFFF
+    ex = (b >> 7) & 0xFF
+    frac = b & 0x7F
+    normal = ex != 0
+    am = torch.where(normal, frac | 0x80, frac).to(torch.int64)
+    e = torch.where(normal, ex - 134, torch.full_like(ex, -133)).to(torch.int64)
+    neg = (b & 0x8000) != 0
+    nz = am != 0
+    blen = torch.floor(torch.log2(am.clamp(min=1).to(torch.float64))).to(torch.int64)  # exact: am < 2^8
+    lead = torch.where(nz, e + blen, torch.full_like(e, -(1 << 40)))
+    E = lead.amax(dim=1)
+    lsb = E + 1 - 7 * S
+    sh = e - lsb[:, None]
+    up = am << sh.clamp(0, 62)
+    dn = am >> (-sh).clamp(0, 62)
+    fix = torch.where(sh >= 0, up, dn)
+    fix = torch.where(-sh > 62, torch.zeros_like(fix), fix)
+    lost = nz & (sh < 0) & ((fix << (-sh).clamp(0, 62)) != am)
+    X = torch.empty((S,) + tuple(bits.shape), dtype=torch.int8, device=bits.device)
+    rem = fix
+    for s in range(S):
+        dig = rem & 127
+        X[s] = torch.where(neg, -dig, dig).to(torch.int8)
+        rem = rem >> 7
+    l1 = (am.to(torch.float64) * torch.exp2(e.to(torch.float64))).sum(dim=1) * (1 + 2.0 ** -40)
+    return X, lsb, l1, lost
+
+
+def tc_slices_device(bits: torch.Tensor, S: int) -> list:
+    """tc_slices for rows already on the device: the per-step q slicing of a decode step, with
+    no host round trip (and CUDA-graph capturable)."""
+    X, lsb, l1, lost = _slice_rows_device(bits, S)
+    return [X, lsb, l1, lost.any(dim=1).to(torch.int32)]
+
+
+def tc_v_slices_device(v: torch.Tensor, S: int) -> list:
+    """tc_v_slices for V rows already on the device."""
+    X, lsb, _, lost = _slice_rows_device(v, S)
+    return [X, lsb, lost.to(torch.int8).contiguous()]
+
+
 def tc_v_slices(v_bits: np.ndarray, S: int, dev) -> list:
     """int8 slices of V rows for tensor-core P·V: [X (S, n, dv) int8, lsb (n,) int64, lost (n, dv) int8].
     Done once when the KV cache is written."""
@@ -488,10 +542,18 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     """Device-level launch with no host transfers and no sync.
 
     Qt (R, d), Kt (n, d), Vt (n, dv) are int16 views of bf16 on the device; KL (R,) is int32.
-    Pass q_tc/k_tc (from tc_slices) to use tensor-core scores. Returns (OUT int32 (R, dv),
-    split_flags, combine_flags), all on the device."""
-    R, d = Qt.shape
-    n, dv = Vt.shape
+    Batched form: Qt (G, R, d), Kt (G, n, d), Vt (G, n, dv), KL (G, R) for G independent
+    segments (e.g. sequence x KV head, with a GQA group's query heads as the R rows); the
+    tc slices are then made from the flattened (G*R, d) and (G*n, d) rows.
+    Pass q_tc/k_tc (from tc_slices) to use tensor-core scores. Returns (OUT int32 (R, dv) or
+    (G, R, dv), split_flags, combine_flags), all on the device; flags are per flattened row."""
+    batched = Qt.dim() == 3
+    G = Qt.shape[0] if batched else 1
+    r_seg, d = Qt.shape[-2:]
+    n_seg, dv = Vt.shape[-2:]
+    assert Kt.shape[-2] == n_seg and KL.numel() == G * r_seg
+    Qt, Kt, Vt, KL = Qt.reshape(G * r_seg, d), Kt.reshape(G * n_seg, d), Vt.reshape(G * n_seg, dv), KL.reshape(-1)
+    R, n = G * r_seg, G * n_seg
     assert d <= 128 and (d & (d - 1)) == 0, "d must be a power of two <= 128"
     assert dv % block_dv == 0
     dev = Qt.device
@@ -502,7 +564,7 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
         # The CPU interpreter does not enforce this. The tile size cannot change the output
         # (SPEC §5.3), so raising it is free.
         block_n = max(block_n, 32)
-    split_len = max(block_n,-(-max(maxlen, 1) // splits))
+    split_len = max(block_n, -(-max(maxlen, 1) // splits))
     split_len = -(-split_len // block_n) * block_n
     nsplit = max(1, -(-max(maxlen, 1) // split_len))
     am, ae = decode_fp32(np.float32(alpha))
@@ -535,21 +597,22 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     PNE_ = torch.empty((nsplit, R, dv), **i64)
     ncb = dv // block_dv
     FL = torch.zeros((nsplit, R, ncb), dtype=torch.int32, device=dev)
-    grid = (triton.cdiv(R, block_m), nsplit, ncb)
+    nrb = triton.cdiv(r_seg, block_m)
+    grid = (G * nrb, nsplit, ncb)
     _ea_split_kernel[grid](Qt, Kt, Vt, KL, R, am, ae, PR_, PZ_, PZE_, PNR_, PN_, PNE_, FL,
-                           split_len, fz, fn, *tc, n, *vtc, D=d, DV=dv, BLOCK_M=block_m, BLOCK_N=block_n,
+                           split_len, fz, fn, *tc, n, *vtc, r_seg, n_seg, nrb, D=d, DV=dv, BLOCK_M=block_m, BLOCK_N=block_n,
                            BLOCK_DV=block_dv, FS=SCORE_FS, EXP2_MARGIN=exp2_margin,
                            USE_TC=use_tc, SQ=sq, SK=sk, TC_FALLBACK=tc_fallback,
                            USE_TC_PV=use_tc_pv, SW=sw, SV=sv, ANCH=anch)
     if merge_order is None:
-        order = np.arange(nsplit)
+        ORD = torch.arange(nsplit, dtype=torch.int64, device=dev)   # no host copy: graph-capturable
     else:
         # Keep the caller's relative order for splits that exist, then append any missing ones,
         # so the combine kernel always gets a permutation of range(nsplit).
         given = [int(i) for i in merge_order if 0 <= int(i) < nsplit]
         order = np.array(given + [i for i in range(nsplit) if i not in given], dtype=np.int64)
-    assert sorted(order.tolist()) == list(range(nsplit))
-    ORD = torch.from_numpy(order.astype(np.int64)).to(dev)
+        assert sorted(order.tolist()) == list(range(nsplit))
+        ORD = torch.from_numpy(order.astype(np.int64)).to(dev)
     OUT = torch.empty((R, dv), dtype=torch.int32, device=dev)
     OF = torch.zeros((R, ncb), dtype=torch.int32, device=dev)
     p, qmin = (8, -133) if out == "bf16" else (24, -149)
@@ -558,7 +621,7 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
                                                        P=p, QMIN=qmin, N_ITER=96, OUT_FP32=(out == "fp32"))
     _LAST_DEBUG.update(split_flags=FL, combine_flags=OF, PR=PR_, PZ=PZ_, PZE=PZE_, PNR=PNR_, PN=PN_, PNE=PNE_,
                        fz=fz, fn=fn)
-    return OUT, FL, OF
+    return (OUT.view(G, r_seg, dv) if batched else OUT), FL, OF
 
 
 def attention_triton(q_bits, k_bits, v_bits, alpha, kv_len, out: str = "bf16", splits: int = 4,

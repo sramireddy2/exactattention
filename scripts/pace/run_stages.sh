@@ -52,6 +52,23 @@ STAGES=(
   "bench_n16384|1800|python scripts/bench_decode.py --rows 16 --keys 16384 --out $OUT/bench_n16384.md"
 )
 
+# EA_PLAN=flash: ExactAttention vs FlashInfer / FlashAttention at serving shapes
+# (scripts/bench_vs_flashinfer.py). FlashInfer JIT-compiles its kernels on first use into
+# ~/.cache/flashinfer, which persists across jobs, so a preempted warmup is not lost.
+BF="python scripts/bench_vs_flashinfer.py"
+if [ "${EA_PLAN:-gpu_check}" = "flash" ]; then
+  module load cuda 2>/dev/null || true
+  STAGES=(
+    "env|300|nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv && which nvcc; python -c \"import torch, triton, flashinfer; print(torch.__version__, torch.version.cuda, triton.__version__, flashinfer.__version__, torch.cuda.get_device_name(0))\""
+    "tests_segments|1200|EA_TRITON_DEVICE=cuda $PYT tests/test_triton.py -k 'segments or slicing or pv'"
+    "flashinfer_warmup|2400|$BF --batch 1 --keys 1024 --drafts 1,8 --modes int64 --iters 2 --out $OUT/warmup.md"
+    "decode_b1|1500|$BF --batch 1 --keys 1024,4096,16384,65536 --drafts 1 --out $OUT/decode_b1.md"
+    "decode_b8|1500|$BF --batch 8 --keys 1024,4096,16384 --drafts 1 --out $OUT/decode_b8.md"
+    "decode_b32|1500|$BF --batch 32 --keys 1024,4096,16384 --drafts 1 --out $OUT/decode_b32.md"
+    "verify_t8|1500|$BF --batch 1,8 --keys 1024,4096,16384 --drafts 8 --out $OUT/verify_t8.md"
+  )
+fi
+
 stage_name() { echo "${1%%|*}"; }
 count_pending() {
   local n=0 e
@@ -72,13 +89,14 @@ write_summary() {
       echo "| $name | $res | $att | $last |"
     done
     echo; cat "$OUT"/bench_n*.md 2>/dev/null | grep -E '^\| [0-9]' | sed 's/^/bench: /'
+    for f in "$OUT"/decode_*.md "$OUT"/verify_*.md; do [ -f "$f" ] && { echo; tail -n +5 "$f"; }; done
   } > "$OUT/summary.md"
 }
 
 submit_next() {   # $1 = extra sbatch args (e.g. a dependency)
   if [ "$CHAIN" -ge "$MAX_CHAIN" ]; then echo "chain: at EA_MAX_CHAIN=$MAX_CHAIN, no successor"; return; fi
   sbatch --parsable -A "${SLURM_JOB_ACCOUNT:-gts-agarg35}" -q embers $1 \
-    --export=ALL,EA_RUN="$RUN",EA_CHAIN=$((CHAIN + 1)) \
+    --export=ALL,EA_RUN="$RUN",EA_CHAIN=$((CHAIN + 1)),EA_PLAN="${EA_PLAN:-gpu_check}" \
     -o "$HOME/scratch/ea_jobs/exactattn-$RUN-%j.out" "$REPO/scripts/pace/gpu_check.sbatch" 2>/dev/null
 }
 

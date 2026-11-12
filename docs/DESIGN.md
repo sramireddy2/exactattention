@@ -221,6 +221,35 @@ Tests (Triton interpreter, 120 passing in total):
 Not yet done: an in-kernel second tier for uncertified (row, channel-block) pairs. Flagged rows
 currently go to the host reference.
 
+## D11. First NVIDIA run, segments, and serving-shape benchmarks
+
+**First hardware run** (PACE embers, RTX PRO 6000 Blackwell, sm_120, 2026-11-12). The C++,
+torch:cuda, Triton int64 and Triton tensor-core-score paths reproduce both fixture SHA-256
+hashes with 0 fallback rows, so the bits match the Intel laptop's. The P·V tensor-core path
+did not compile: an int8 `tl.dot` needs a contraction size K ≥ 32 (`mma.m16n8k32`), and P·V
+contracts over the key tile, which was 16. The CPU interpreter does not check this. Since the
+tile size cannot change the output (SPEC §5.3), the launcher now raises `block_n` to 32 for
+P·V. ANCH = 7·5 + 7·3 + 5 = 61 still fits int64.
+
+**Segments.** A launch used to cover one KV head. Serving needs B sequences × H_kv heads per
+step, so the split kernel takes a segment axis: grid axis 0 is (segment, row block), each
+segment has its own R rows and n keys, stored one after another. A segment is one
+(sequence, KV head), and its rows are the GQA group's query heads, times T for tree or draft
+verification. The combine kernel already works per row. Batched output equals one launch per
+segment bit for bit, flags included (`test_segments_equal_separate_launches`).
+
+**Per-step q slicing on the GPU.** `tc_slices_device` gives the same digits as the numpy
+slicer, so the per-step q slicing, and K/V slicing at cache write, need no host round trip and
+can be captured in a CUDA graph. The launcher also builds the default merge order on the
+device for the same reason.
+
+**Benchmark** (`scripts/bench_vs_flashinfer.py`). FlashInfer's paged batch decode and prefill
+(causal verify), FlashAttention-2 through PyTorch SDPA and flash-attn (if installed) are
+compared with the three exact paths. Shapes: 16 query heads over 8 KV heads, d = 128, B ∈
+{1, 8, 32}, n up to 64K, T ∈ {1, 8}. Each backend is timed in a CUDA graph. Every exact
+result passes a correctness gate against fp32 attention: a certified row more than 2⁻⁸
+relative off counts as WRONG.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
