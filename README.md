@@ -34,6 +34,7 @@ certified falls back to the exact path.
 | Narrowest window with zero fallbacks on sampled real rows | 44 bits (cliff at 40: 8/150 rows) |
 | **Speculative decoding** (Qwen3-0.6B, 48 greedy tokens, 4-token drafts) vs sequential decoding | standard: tokens diverge at position 4, 47/48 logit rows differ. Row-invariant linears with SDPA: still 47/48. **ExactAttention: identical tokens, 0/48 rows differ** ([details](results/spec_decode_qwen3-0.6b.md)) |
 | Portable fixture: 2 real heads, 4,096 rows | same SHA-256 from the C++ kernel, torch on CPU and torch on the Intel GPU; standard SDPA hashes differ per device |
+| Same fixture on an **NVIDIA RTX PRO 6000 Blackwell** (PACE free tier) | **same SHA-256** from torch:cuda, the fused Triton kernel, and Triton with int8 tensor-core scores, 0 fallback rows |
 
 **Check it on any machine:** `python scripts/fixture.py check --backend cpp` (or `torch:cuda`,
 `torch:xpu`, `triton:cuda`). It prints `ALL MATCH` when the output bits equal the hash recorded in
@@ -86,10 +87,11 @@ out_bits = attention(q, k, v, default_alpha(64))   # bf16 bit patterns, shape (2
 
 ## Roadmap
 
-1. Run the fused Triton kernel on NVIDIA (PACE) and on the Intel iGPU, which needs a newer
-   driver for `triton-xpu`.
-2. ~~Exact scores and P·V on tensor cores (int8 slices)~~: implemented and bit-exact in the interpreter (DESIGN D8, D10).
-   Next: measure on A100/H100 (PACE free tier) against FlashInfer and FlashAttention at decode and prefill.
+1. ~~Run the fused Triton kernel on NVIDIA~~: bit-identical on Blackwell (DESIGN D11). Intel iGPU
+   Triton still needs a newer driver for `triton-xpu`.
+2. ~~Exact scores and P·V on tensor cores (int8 slices)~~: implemented (DESIGN D8, D10); scores
+   verified on NVIDIA. In progress: P·V on NVIDIA, and serving-shape benchmarks against FlashInfer
+   and FlashAttention (`scripts/bench_vs_flashinfer.py`).
 3. Draft-tree verification end to end: bit-identical speculative decoding.
 4. Spec v1: optionally a higher-precision logit, which removes the remaining amplification on
    heavily cancelling outputs (DESIGN D5).
