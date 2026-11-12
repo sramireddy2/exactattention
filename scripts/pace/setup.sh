@@ -12,5 +12,11 @@ pip install -q --upgrade pip
 pip install -q torch            # Linux wheels bundle CUDA and Triton
 pip install -q numpy mpmath pytest hypothesis
 make -C "$(dirname "$0")/../../csrc"
+# Baselines for scripts/bench_vs_flashinfer.py (EA_PLAN=flash). FlashInfer JIT-compiles, so it
+# needs an nvcc matching torch's CUDA; PACE's cuda modules are older, so take nvcc from pip.
+CU=$(python -c "import torch; print(torch.version.cuda)")          # e.g. 13.2
+pip install -q flashinfer-python ninja "nvidia-cuda-nvcc==${CU}.*"
+L=$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')/nvidia/cu${CU%%.*}/lib
+[ -e "$L/libcudart.so" ] || ln -s "libcudart.so.${CU%%.*}" "$L/libcudart.so"   # for -lcudart
 python -c "import torch, triton; print('torch', torch.__version__, 'triton', triton.__version__, 'cuda build', torch.version.cuda)"
 echo "venv ready: $VENV"

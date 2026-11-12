@@ -57,7 +57,12 @@ STAGES=(
 # ~/.cache/flashinfer, which persists across jobs, so a preempted warmup is not lost.
 BF="python scripts/bench_vs_flashinfer.py"
 if [ "${EA_PLAN:-gpu_check}" = "flash" ]; then
-  module load cuda 2>/dev/null || true
+  # FlashInfer JIT needs nvcc matching torch's CUDA (13.2); PACE modules stop at 12.8, so use the
+  # pip nvidia-cuda-nvcc in the venv (pip install "nvidia-cuda-nvcc>=13.2,<13.3").
+  SP=$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
+  if [ -x "$SP/nvidia/cu13/bin/nvcc" ]; then
+    export CUDA_HOME="$SP/nvidia/cu13" PATH="$SP/nvidia/cu13/bin:$PATH"
+  fi
   STAGES=(
     "env|300|nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv && which nvcc; python -c \"import torch, triton, flashinfer; print(torch.__version__, torch.version.cuda, triton.__version__, flashinfer.__version__, torch.cuda.get_device_name(0))\""
     "tests_segments|1200|EA_TRITON_DEVICE=cuda $PYT tests/test_triton.py -k 'segments or slicing or pv'"
