@@ -218,8 +218,7 @@ Tests (Triton interpreter, 120 passing in total):
 - **Adversarial synthetic data:** outlier scores with repeated V values, or "wide" V spanning
   48 bits of exponent. More rows are flagged here, never wrong ones.
 
-Not yet done: an in-kernel second tier for uncertified (row, channel-block) pairs. Flagged rows
-currently go to the host reference.
+The in-kernel second tier for uncertified (row, channel-block) pairs is D12.
 
 ## D11. First NVIDIA run, segments, and serving-shape benchmarks
 
@@ -249,6 +248,52 @@ compared with the three exact paths. Shapes: 16 query heads over 8 KV heads, d =
 {1, 8, 32}, n up to 64K, T ∈ {1, 8}. Each backend is timed in a CUDA graph. Every exact
 result passes a correctness gate against fp32 attention: a certified row more than 2⁻⁸
 relative off counts as WRONG.
+
+## D12. Tier 2 on the device: int64 P·V for the pairs tensor cores cannot certify
+
+Three tiers, each certified:
+
+| tier | where | what | when |
+|---|---|---|---|
+| 1 | split + combine kernels | int8 tensor-core scores and P·V | always |
+| 2 | the same two kernels, `RERUN=True` | int64 P·V (CUDA cores) for one (row, channel block) pair | that pair's final rounding failed and no split flagged the row |
+| 3 | host | exact reference | anything still flagged |
+
+Tier 2 is sound because every path encloses the same exact N, and a certified rounding of an
+enclosure is the unique correctly rounded value. So it cannot change any bits; it only
+certifies more pairs.
+
+How it runs:
+
+1. After tier 1, `NEED = combine_flag & (no split flag)` is formed on the device. Split flags are
+   NaN/inf inputs, uncertified logits or weights, and overflow. int64 P·V fixes none of these,
+   so those rows go straight to tier 3.
+2. The split kernel runs again with int64 P·V over the same grid and splits. A program with no
+   NEED row in its (row block, channel block) walks zero tiles. One that has some recomputes
+   its N partials and overwrites them for the NEED rows only. Z partials are not rewritten:
+   they are the same in both tiers.
+3. The combine kernel runs again and rewrites the output and flags of NEED pairs only.
+
+Both launches have fixed grids and no host sync, so the whole step stays CUDA-graph
+capturable. With nothing flagged, the cost is two near-empty launches. Tier 2 uses the
+caller's key tile, not the 32 that tier 1 needs for int8 MMAs. That keeps the int64
+M×N×DV product in registers. The split boundaries are unchanged because the split length
+is a multiple of both tiles.
+
+Measured on "wide" V (48-bit exponent spread per row), the worst synthetic case
+(`test_pv_tier2_recovers_uncertified_pairs`, Triton interpreter):
+
+| data | rows flagged, tier 1 only | rows flagged, tiers 1 and 2 | int64 P·V alone | pairs rerun |
+|---|---|---|---|---|
+| normal q/k, wide V | 15 / 16 | **0** | 0 | 27 / 32 |
+| outlier q/k, wide V | 16 / 16 | **0** | 0 | 31 / 32 |
+
+Every row certified by tiers 1 and 2 is bit-exact against the reference. On real activations
+tier 1 already certifies every row (D10), so tier 2 is a safety net there, not a hot path.
+
+Not covered: uncertified *scores* after the windowed int64 recompute, and uncertified weights
+(the exp2 margin). Both have been 0 on real rows. A wider-logit spec (v1) would be the next tier
+for them.
 
 ## Open questions
 

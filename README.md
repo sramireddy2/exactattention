@@ -90,8 +90,9 @@ out_bits = attention(q, k, v, default_alpha(64))   # bf16 bit patterns, shape (2
 1. ~~Run the fused Triton kernel on NVIDIA~~: bit-identical on Blackwell (DESIGN D11). Intel iGPU
    Triton still needs a newer driver for `triton-xpu`.
 2. ~~Exact scores and P·V on tensor cores (int8 slices)~~: implemented (DESIGN D8, D10); scores
-   verified on NVIDIA. In progress: P·V on NVIDIA, and serving-shape benchmarks against FlashInfer
-   and FlashAttention (`scripts/bench_vs_flashinfer.py`).
+   verified on NVIDIA. Pairs that tensor-core P·V cannot certify are recomputed on the device
+   with int64 P·V (tier 2, DESIGN D12). In progress: P·V on NVIDIA, and serving-shape
+   benchmarks against FlashInfer and FlashAttention (`scripts/bench_vs_flashinfer.py`).
 3. Draft-tree verification end to end: bit-identical speculative decoding.
 4. Spec v1: optionally a higher-precision logit, which removes the remaining amplification on
    heavily cancelling outputs (DESIGN D5).

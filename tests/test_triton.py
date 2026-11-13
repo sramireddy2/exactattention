@@ -173,6 +173,29 @@ def test_tensor_core_pv_on_real_activations():
         r = int(rows[i])
         assert np.array_equal(got[i], attention_row(q[r], k[: r + 1], v[: r + 1, :32], alpha)), r
 
+@pytest.mark.parametrize("kind", ["normal", "outlier"])
+def test_pv_tier2_recovers_uncertified_pairs(kind):
+    """Tier 2 (DESIGN D12): pairs that tensor-core P·V cannot certify are recomputed on the device
+    with int64 P·V. "wide" V (48-bit exponent spread per row) defeats 3 V digits on most rows, so
+    tier 1 alone flags many; with tier 2 the flags fall to what the int64 path alone leaves, and
+    every certified row is still bit-exact."""
+    rng = np.random.default_rng(zlib.crc32(f"tier2/{kind}".encode()))
+    d, dv, R, n = 64, 64, 16, 100
+    Q, K, V = bf16(rng, (R, d), kind), bf16(rng, (n, d), kind), bf16(rng, (n, dv), "wide")
+    kv_len = rng.integers(1, n + 1, size=R)
+    alpha = default_alpha(d)
+    kw = dict(splits=2, block_m=16, block_n=16, block_dv=32, device=DEVICE, fallback=False, use_tc=True)
+    _, f1 = attention_triton(Q, K, V, alpha, kv_len, use_tc_pv=True, pv_tier2=False, **kw)
+    got, f2 = attention_triton(Q, K, V, alpha, kv_len, use_tc_pv=True, **kw)
+    _, f64 = attention_triton(Q, K, V, alpha, kv_len, **kw)
+    assert f1.sum() >= R // 4, f1            # not vacuous: tier 1 really leaves work for tier 2
+    assert not (f2 & ~f1).any()               # tier 2 never flags a row tier 1 certified
+    assert f2.sum() <= f64.sum() < f1.sum(), (f1, f2, f64)
+    for r in np.flatnonzero(f2 == 0):
+        L = int(kv_len[r])
+        assert np.array_equal(got[r], attention_row(Q[r], K[:L], V[:L], alpha)), r
+
+
 @pytest.mark.parametrize("mode", ["int64", "tc", "tcpv"])
 def test_segments_equal_separate_launches(mode):
     """Batched launch over G segments (sequence x KV head) gives, row for row, the bits and flags
