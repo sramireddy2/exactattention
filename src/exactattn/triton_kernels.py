@@ -531,16 +531,33 @@ def _slice_rows_device(bits: torch.Tensor, S: int):
     return X, lsb, l1, lost
 
 
+def _slice_rows_chunked(bits: torch.Tensor, S: int, chunk_elems: int = 1 << 26):
+    """_slice_rows_device in row chunks. Rows are sliced independently, so this is exact; it
+    bounds the int64 temporaries (about 10 live, 8 bytes each per element) for whole KV caches.
+    A 32 x 8-head x 16K-key cache in one piece needed over 40 GB."""
+    R = bits.shape[0]
+    step = max(1, chunk_elems // max(1, bits.shape[1]))
+    if R <= step:
+        return _slice_rows_device(bits, S)
+    X = torch.empty((S,) + tuple(bits.shape), dtype=torch.int8, device=bits.device)
+    lsb = torch.empty(R, dtype=torch.int64, device=bits.device)
+    l1 = torch.empty(R, dtype=torch.float64, device=bits.device)
+    lost = torch.empty(tuple(bits.shape), dtype=torch.bool, device=bits.device)
+    for a in range(0, R, step):
+        X[:, a:a + step], lsb[a:a + step], l1[a:a + step], lost[a:a + step] = _slice_rows_device(bits[a:a + step], S)
+    return X, lsb, l1, lost
+
+
 def tc_slices_device(bits: torch.Tensor, S: int) -> list:
     """tc_slices for rows already on the device: the per-step q slicing of a decode step, with
-    no host round trip (and CUDA-graph capturable)."""
-    X, lsb, l1, lost = _slice_rows_device(bits, S)
+    no host round trip (and CUDA-graph capturable), or K at cache write."""
+    X, lsb, l1, lost = _slice_rows_chunked(bits, S)
     return [X, lsb, l1, lost.any(dim=1).to(torch.int32)]
 
 
 def tc_v_slices_device(v: torch.Tensor, S: int) -> list:
     """tc_v_slices for V rows already on the device."""
-    X, lsb, _, lost = _slice_rows_device(v, S)
+    X, lsb, _, lost = _slice_rows_chunked(v, S)
     return [X, lsb, lost.to(torch.int8).contiguous()]
 
 

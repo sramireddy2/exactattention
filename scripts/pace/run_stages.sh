@@ -10,6 +10,9 @@
 #     chain continues even if this job is killed outright with no chance to react. When every
 #     stage is done, the spare successor is cancelled;
 #   * on SIGTERM it stops the running stage (left not-done), writes the summary and exits;
+#   * each stage runs in its own process group, and a timeout kills the whole group. Killing only
+#     the stage's shell left its python running, still holding the (exclusive-mode) GPU, so every
+#     later stage of that job failed with "CUDA-capable device(s) is/are busy or unavailable";
 #   * a stage that hits its cap EA_MAX_TIMEOUTS times is recorded as TIMEOUT, so the chain cannot
 #     loop forever. The chain is at most EA_MAX_CHAIN jobs long.
 #
@@ -32,7 +35,7 @@ PYT="python -m pytest -q -p no:cacheprovider"
 
 # name | per-stage cap in seconds | command
 STAGES=(
-  "env|120|nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv && python -c \"import torch, triton; print(torch.__version__, torch.version.cuda, triton.__version__, torch.cuda.get_device_name(0))\""
+  "env|600|nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv && python -c \"import torch, triton; print(torch.__version__, torch.version.cuda, triton.__version__, torch.cuda.get_device_name(0))\""
   "fixture_cpp|600|$FIX --backend cpp"
   "fixture_torch_cuda_0_0|900|$FIX --backend torch:cuda --only 0_0"
   "fixture_torch_cuda_27_11|900|$FIX --backend torch:cuda --only 27_11"
@@ -64,8 +67,9 @@ if [ "${EA_PLAN:-gpu_check}" = "flash" ]; then
     export CUDA_HOME="$SP/nvidia/cu13" PATH="$SP/nvidia/cu13/bin:$PATH"
   fi
   STAGES=(
-    "env|300|nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv && which nvcc; python -c \"import torch, triton, flashinfer; print(torch.__version__, torch.version.cuda, triton.__version__, flashinfer.__version__, torch.cuda.get_device_name(0))\""
+    "env|600|nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv && which nvcc; python -c \"import torch, triton, flashinfer; print(torch.__version__, torch.version.cuda, triton.__version__, flashinfer.__version__, torch.cuda.get_device_name(0))\""
     "tests_segments|1200|EA_TRITON_DEVICE=cuda $PYT tests/test_triton.py -k 'segments or slicing or pv'"
+    "fixture_tritontcpv_27_11|1500|$FIX --backend tritontcpv:cuda --only 27_11"
     "flashinfer_warmup|2400|$BF --batch 1 --keys 1024 --drafts 1,8 --modes int64 --iters 2 --out $OUT/warmup.md"
     "decode_b1|1500|$BF --batch 1 --keys 1024,4096,16384,65536 --drafts 1 --out $OUT/decode_b1.md"
     "decode_b8|1500|$BF --batch 8 --keys 1024,4096,16384 --drafts 1 --out $OUT/decode_b8.md"
@@ -119,7 +123,7 @@ fi
 CHILD=0
 on_term() {
   echo "SIGTERM at $(date) - stopping stage (left not-done)"
-  [ "$CHILD" -ne 0 ] && kill -TERM "$CHILD" 2>/dev/null
+  [ "$CHILD" -ne 0 ] && kill -TERM -- -"$CHILD" 2>/dev/null
   write_summary
   if [ -z "$NEXT" ] && [ -n "${SLURM_JOB_ID:-}" ]; then NEXT=$(submit_next ""); echo "chain: submitted $NEXT"; fi
   exit 143
@@ -136,10 +140,17 @@ for e in "${STAGES[@]}"; do
   t=$(( cap < left ? cap : left ))
   echo $(( $(cat "$OUT/$name.attempts" 2>/dev/null || echo 0) + 1 )) > "$OUT/$name.attempts"
   echo "== $name (cap ${t}s) $(date +%T) on $(hostname) job ${SLURM_JOB_ID:-local} chain $CHAIN"
-  timeout --signal=TERM --kill-after=20 "$t" bash -c "$cmd" > "$OUT/$name.log" 2>&1 &
+  rm -f "$OUT/$name.killed"
+  setsid bash -c "$cmd" > "$OUT/$name.log" 2>&1 &        # new session: pgid = pid
   CHILD=$!
-  wait "$CHILD"; rc=$?; CHILD=0
-  if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+  ( sleep "$t"; touch "$OUT/$name.killed"; kill -TERM -- -"$CHILD" 2>/dev/null
+    sleep 20; kill -KILL -- -"$CHILD" 2>/dev/null ) &
+  WD=$!
+  wait "$CHILD"; rc=$?
+  kill "$WD" 2>/dev/null; wait "$WD" 2>/dev/null
+  kill -KILL -- -"$CHILD" 2>/dev/null                     # reap anything the stage left behind
+  CHILD=0
+  if [ -f "$OUT/$name.killed" ]; then
     n=$(( $(cat "$OUT/$name.timeouts" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$OUT/$name.timeouts"
     echo "   timeout #$n"
     [ "$n" -ge "$MAX_TIMEOUTS" ] && echo "TIMEOUT" > "$OUT/$name.done"

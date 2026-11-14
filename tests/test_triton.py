@@ -267,3 +267,15 @@ def test_device_q_slicing_matches_numpy(kind):
         vgot = tc_v_slices_device(torch.from_numpy(x.view(np.int16)).to(DEVICE), S)
         for a_, b_ in zip(vgot, vref):
             assert torch.equal(a_.cpu(), b_)
+
+
+def test_chunked_slicing_equals_one_piece():
+    """Whole-cache slicing runs in row chunks to bound memory; the digits must not change."""
+    import torch
+
+    from exactattn.triton_kernels import _slice_rows_chunked, _slice_rows_device
+
+    rng = np.random.default_rng(5)
+    x = torch.from_numpy(bf16(rng, (53, 64), "outlier").view(np.int16)).to(DEVICE)
+    for a_, b_ in zip(_slice_rows_chunked(x, 4, chunk_elems=7 * 64), _slice_rows_device(x, 4)):
+        assert torch.equal(a_, b_)
