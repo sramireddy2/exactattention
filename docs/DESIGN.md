@@ -425,6 +425,32 @@ What float64 is left is per row or per key: q's L1 norm, and `_l1_ceil` on (N,) 
 that both paths give the same bits, and that the integer path flags no row the float64 path
 certifies. The benchmark keeps an f64 config as the GPU A/B.
 
+## D16. A step is its kernels: fused tier-2 work list, no fills
+
+FA2's whole decode step is about 11 µs at B = 1. In a CUDA graph each extra node costs a
+microsecond or two, so the small torch ops around the exact kernels add up:
+
+- tier 2's work list `(OF != 0) & (FL.amax(0) == 0)` took five ops;
+- zero-filled flag buffers and 1-element placeholder arguments took up to nine;
+- the merge-order `arange` took one.
+
+That is up to about fifteen tiny kernels per step.
+
+- The tier-1 combine kernel now writes NEED itself. It already visits every split of each
+  (row, channel block) pair, so it takes the maximum of their split flags on the way
+  (`WRITE_NEED`) and stores `(flag != 0) & (split flags == 0)`.
+- FL and OF are `torch.empty`: the split and combine grids write every entry.
+- Placeholder arguments and the default merge order are made once per device and cached. They
+  are never written.
+
+A tcpv step is now four launches (split, combine, tier-2 split, tier-2 combine) plus buffer
+allocation; int64 and tc steps are two. Two tests cover this:
+
+- `test_fused_need_equals_torch_formula` checks NEED against the old formula, on data that has
+  both NEED pairs and split-flagged pairs.
+- `test_step_runs_no_fill_or_reduction_ops` profiles a step and fails on any fill, reduction,
+  comparison or cast op. It fails on the previous code.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model

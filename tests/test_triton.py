@@ -388,3 +388,61 @@ def test_integer_exp2_equals_float64_exp2(mode):
     for r in np.flatnonzero(fa == 0):
         L = int(kv_len[r])
         assert np.array_equal(a[r], attention_row(Q[r], K[:L], V[:L], alpha)), r
+
+
+def test_fused_need_equals_torch_formula():
+    """The tier-1 combine kernel writes tier 2's work list (DESIGN D16). It must equal the torch
+    formula it replaced, (combine flag != 0) & (no split flag), computed from a tier-1-only run."""
+    from exactattn.triton_kernels import _LAST_DEBUG
+
+    rng = np.random.default_rng(zlib.crc32(b"fused-need"))
+    d, dv, R, n = 64, 64, 16, 100
+    Q, K, V = bf16(rng, (R, d), "normal"), bf16(rng, (n, d), "normal"), bf16(rng, (n, dv), "wide")
+    K[30, 5] = 0x7FC0                                          # a NaN key: split-flagged, not NEED
+    kv_len = rng.integers(1, n + 1, size=R)
+    alpha = default_alpha(d)
+    kw = dict(splits=2, block_n=16, block_dv=32, device=DEVICE, fallback=False, use_tc=True, use_tc_pv=True)
+    attention_triton(Q, K, V, alpha, kv_len, pv_tier2=False, **kw)
+    FL, OF = _LAST_DEBUG["split_flags"].clone(), _LAST_DEBUG["combine_flags"].clone()
+    want = ((OF != 0) & (FL.amax(dim=0) == 0)).to(FL.dtype)
+    attention_triton(Q, K, V, alpha, kv_len, **kw)
+    got = _LAST_DEBUG["tier2_need"]
+    assert want.sum() > 0 and (FL.amax(dim=0) != 0).any()    # both cases present
+    assert torch_equal(got, want)
+
+
+def torch_equal(a, b):
+    import torch
+
+    return torch.equal(a.cpu(), b.cpu())
+
+
+@pytest.mark.parametrize("mode", ["int64", "tcpv"])
+def test_step_runs_no_fill_or_reduction_ops(mode):
+    """A decode step is the split and combine kernels (plus tier 2's two) and buffer allocation:
+    no zero fills, reductions or elementwise torch ops between them (DESIGN D16)."""
+    import torch
+    from torch.profiler import ProfilerActivity, profile
+
+    from exactattn.triton_kernels import launch, tc_slices, tc_v_slices
+
+    rng = np.random.default_rng(3)
+    d, R, n = 64, 4, 64
+    Q, K, V = bf16(rng, (R, d), "normal"), bf16(rng, (n, d), "normal"), bf16(rng, (n, d), "normal")
+    dev = torch.device(DEVICE)
+
+    def t16(x):
+        return torch.from_numpy(np.ascontiguousarray(x).view(np.int16)).to(dev)
+
+    args = (t16(Q), t16(K), t16(V), torch.full((R,), n, dtype=torch.int32, device=dev), n, default_alpha(d))
+    kw = dict(splits=2, block_n=32, block_dv=32)
+    if mode == "tcpv":
+        kw.update(k_tc=tc_slices(K, 4, dev), v_tc=tc_v_slices(V, 3, dev))
+    launch(*args, **kw)                                         # warm: caches, compiles
+    with profile(activities=[ProfilerActivity.CPU]) as prof:
+        launch(*args, **kw)
+    names = {e.name for e in prof.events()}
+    banned = {"aten::zeros", "aten::zero_", "aten::fill_", "aten::amax", "aten::ne", "aten::eq",
+              "aten::bitwise_and", "aten::logical_and", "aten::arange", "aten::_to_copy"}
+    assert "aten::empty" in names                              # the profiler saw the step
+    assert not (names & banned), sorted(names & banned)

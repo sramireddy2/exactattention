@@ -613,10 +613,12 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
 
 
 @triton.jit
-def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, OUT, OFLAG, NEED,
+def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, OUT, OFLAG, NEED, FLAG,
                        DV: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_DV: tl.constexpr,
                        P: tl.constexpr, QMIN: tl.constexpr, N_ITER: tl.constexpr, OUT_FP32: tl.constexpr,
-                       RERUN: tl.constexpr):
+                       RERUN: tl.constexpr, WRITE_NEED: tl.constexpr):
+    # Tier 1 with WRITE_NEED also writes tier 2's work list (DESIGN D12, D16): NEED = this
+    # combine's flag set and no split flagged the pair (FLAG), fused here instead of torch ops.
     pid_m = tl.program_id(0)
     pid_c = tl.program_id(1)
     rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -629,6 +631,7 @@ def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, O
     N = tl.zeros((BLOCK_M, BLOCK_DV), tl.int64)
     NE = tl.zeros((BLOCK_M, BLOCK_DV), tl.int64)
     flag = tl.zeros((BLOCK_M,), tl.int32)
+    sflag = tl.zeros((BLOCK_M,), tl.int32)
     nloop = NSPLIT
     wmask = rmask
     if RERUN:
@@ -637,6 +640,8 @@ def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, O
     for i in range(nloop):
         s = tl.load(ORDER + i)
         off = s * ROWS + rows
+        if WRITE_NEED:
+            sflag = tl.maximum(sflag, tl.load(FLAG + off * tl.num_programs(1) + pid_c, mask=rmask, other=0))
         sR = tl.load(PR + off, mask=rmask, other=NEG)
         sZ = tl.load(PZ + off, mask=rmask, other=0)
         sZE = tl.load(PZE + off, mask=rmask, other=0)
@@ -686,6 +691,8 @@ def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, O
         bits = (bits >> 16) & 0xFFFF
     tl.store(OUT + rows[:, None] * DV + cc[None, :], bits, mask=wmask[:, None])
     tl.store(OFLAG + rows * tl.num_programs(1) + pid_c, flag, mask=wmask)
+    if WRITE_NEED:
+        tl.store(NEED + rows * tl.num_programs(1) + pid_c, ((flag != 0) & (sflag == 0)).to(tl.int32), mask=rmask)
 
 
 # ---------------------------------------------------------------------------
@@ -795,6 +802,24 @@ def tc_v_slices(v_bits: np.ndarray, S: int, dev) -> list:
 
 
 _EXP2_TABLES: dict = {}
+_DEV_CACHE: dict = {}
+
+
+def _dummies(dev) -> dict:
+    """1-element placeholders for kernel arguments a mode does not read, made once per device so
+    a step allocates and fills nothing it does not need. Never written."""
+    key = ("dummy", str(dev))
+    if key not in _DEV_CACHE:
+        _DEV_CACHE[key] = {dt: torch.zeros(1, dtype=dt, device=dev)
+                           for dt in (torch.int8, torch.int32, torch.int64, torch.float64)}
+    return _DEV_CACHE[key]
+
+
+def _arange_dev(n: int, dev) -> torch.Tensor:
+    key = ("arange", str(dev), n)
+    if key not in _DEV_CACHE:
+        _DEV_CACHE[key] = torch.arange(n, dtype=torch.int64, device=dev)
+    return _DEV_CACHE[key]
 
 
 def _exp2_table_dev(dev):
@@ -853,6 +878,7 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     split_len = -(-split_len // block_n) * block_n
     nsplit = max(1, -(-max(maxlen, 1) // split_len))
     am, ae = decode_fp32(np.float32(alpha))
+    dz = _dummies(dev)
     use_tc = k_tc is not None
     if use_tc:
         tc = list(k_tc)
@@ -860,15 +886,13 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
         sq = q_tc[0].shape[0] if q_tc is not None else sq
         assert 1 <= sq <= 4
     else:
-        tc = [torch.zeros(1, dtype=torch.int8, device=dev), torch.zeros(1, dtype=torch.int64, device=dev),
-              torch.zeros(1, dtype=torch.float64, device=dev), torch.zeros(1, dtype=torch.int32, device=dev)]
+        tc = [dz[torch.int8], dz[torch.int64], dz[torch.float64], dz[torch.int32]]
         sq, sk = 1, 1
     use_tc_pv = v_tc is not None
     if use_tc_pv:
         vtc, sv = list(v_tc), v_tc[0].shape[0]
     else:
-        z8 = torch.zeros(1, dtype=torch.int8, device=dev)
-        vtc, sv, sw = [z8, torch.zeros(1, dtype=torch.int64, device=dev), z8], 1, 1
+        vtc, sv, sw = [dz[torch.int8], dz[torch.int64], dz[torch.int8]], 1, 1
     anch = 7 * sw + 7 * sv + int(np.ceil(np.log2(block_n)))
     if use_tc_pv:
         # Largest tile partial: block_n * 127 * 127 * 2^(7(sw+sv-2)) (all digit pairs combined) must fit int64.
@@ -881,10 +905,10 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     PN_ = torch.empty((nsplit, R, dv), **i64)
     PNE_ = torch.empty((nsplit, R, dv), **i64)
     ncb = dv // block_dv
-    FL = torch.zeros((nsplit, R, ncb), dtype=torch.int32, device=dev)
+    FL = torch.empty((nsplit, R, ncb), dtype=torch.int32, device=dev)   # every entry is written
     nrb = triton.cdiv(r_seg, block_m)
     grid = (G * nrb, nsplit, ncb)
-    z32 = torch.zeros(1, dtype=torch.int32, device=dev)
+    z32 = dz[torch.int32]
 
     def split(need, rerun, bn, pv, v_args, sw_, sv_, anch_):
         return _ea_split_kernel[grid](Qt, Kt, Vt, KL, R, am, ae, PR_, PZ_, PZE_, PNR_, PN_, PNE_, FL,
@@ -898,7 +922,7 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     # Registers and spills of the compiled split kernel (None under the CPU interpreter).
     _LAST_DEBUG.update(n_regs=getattr(ck, "n_regs", None), n_spills=getattr(ck, "n_spills", None))
     if merge_order is None:
-        ORD = torch.arange(nsplit, dtype=torch.int64, device=dev)   # no host copy: graph-capturable
+        ORD = _arange_dev(nsplit, dev)   # cached: no host copy and no launch per step
     else:
         # Keep the caller's relative order for splits that exist, then append any missing ones,
         # so the combine kernel always gets a permutation of range(nsplit).
@@ -907,30 +931,30 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
         assert sorted(order.tolist()) == list(range(nsplit))
         ORD = torch.from_numpy(order.astype(np.int64)).to(dev)
     OUT = torch.empty((R, dv), dtype=torch.int32, device=dev)
-    OF = torch.zeros((R, ncb), dtype=torch.int32, device=dev)
+    OF = torch.empty((R, ncb), dtype=torch.int32, device=dev)   # every entry is written
     p, qmin = (8, -133) if out == "bf16" else (24, -149)
 
     cbm = 16   # combine rows per program: it works on flattened rows, not segments
 
-    def combine(need, rerun):
+    def combine(need, rerun, write_need):
         _ea_combine_kernel[(triton.cdiv(R, cbm), ncb)](PR_, PZ_, PZE_, PNR_, PN_, PNE_, ORD, nsplit, R, fz, fn,
-                                                           OUT, OF, need, DV=dv, BLOCK_M=cbm, BLOCK_DV=block_dv,
+                                                           OUT, OF, need, FL, DV=dv, BLOCK_M=cbm, BLOCK_DV=block_dv,
                                                            P=p, QMIN=qmin, N_ITER=96, OUT_FP32=(out == "fp32"),
-                                                           RERUN=rerun, num_warps=num_warps)
+                                                           RERUN=rerun, WRITE_NEED=write_need, num_warps=num_warps)
 
-    combine(z32, False)
-    NEED = None
-    if use_tc_pv and pv_tier2:
+    tier2 = use_tc_pv and pv_tier2
+    NEED = torch.empty((R, ncb), dtype=torch.int32, device=dev) if tier2 else None
+    combine(NEED if tier2 else z32, False, tier2)
+    if tier2:
         # Tier 2 (DESIGN D12): a pair whose final rounding failed, with no split-level flag (bad
         # input, uncertified logit or weight, overflow: int64 P·V cannot fix those), gets its N
         # recomputed with int64 P·V and is combined again. Every path encloses the same exact N,
         # so a certified result is the same bits whichever tier produced it. Fixed grids and no
-        # host sync: it costs two near-empty launches when nothing is flagged.
+        # host sync: it costs two near-empty launches when nothing is flagged. The tier-1 combine
+        # wrote NEED = (combine flag) & (no split flag), so tier 2 adds no other device work.
         assert split_len % block_n_t2 == 0
-        NEED = ((OF != 0) & (FL.amax(dim=0) == 0)).to(torch.int32)
-        z8 = torch.zeros(1, dtype=torch.int8, device=dev)
-        split(NEED, True, block_n_t2, False, [z8, torch.zeros(1, dtype=torch.int64, device=dev), z8], 1, 1, 0)
-        combine(NEED, True)
+        split(NEED, True, block_n_t2, False, [dz[torch.int8], dz[torch.int64], dz[torch.int8]], 1, 1, 0)
+        combine(NEED, True, False)
     _LAST_DEBUG.update(block_m=block_m, pack=pack, split_flags=FL, combine_flags=OF, tier2_need=NEED, PR=PR_, PZ=PZ_, PZE=PZE_, PNR=PNR_, PN=PN_, PNE=PNE_,
                        fz=fz, fn=fn)
     return (OUT.view(G, r_seg, dv) if batched else OUT), FL, OF
