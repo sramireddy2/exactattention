@@ -21,8 +21,8 @@ from concurrent.futures import ProcessPoolExecutor
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-BASE = dict(D=128, DV=128, BLOCK_M=16, BLOCK_N=32, BLOCK_DV=32, EXP2_MARGIN=2.0 ** -26, USE_TC=True,
-            SQ=3, SK=4, TC_FALLBACK=True, USE_TC_PV=True, SW=5, SV=3, ANCH=61, RERUN=False, PACK=1,
+BASE = dict(D=128, DV=128, BLOCK_M=16, BLOCK_N=64, BLOCK_DV=32, EXP2_MARGIN=2.0 ** -26, USE_TC=True,
+            SQ=4, SK=4, TC_FALLBACK=True, USE_TC_PV=True, SW=5, SV=3, RERUN=False, PACK=1,
             EXP2_INT=True, num_warps=4)
 INT64 = dict(USE_TC=False, USE_TC_PV=False, BLOCK_N=16)
 TC = dict(USE_TC_PV=False, BLOCK_N=16)
@@ -35,7 +35,10 @@ CONFIGS = {
     "tcpv m2 32/4": DECODE,
     "tcpv m2 64/8": {**DECODE, "BLOCK_DV": 64, "num_warps": 8},
     "tcpv m2 128/8": {**DECODE, "BLOCK_DV": 128, "num_warps": 8},
+    "tcpv m2 128/8 n32": {**DECODE, "BLOCK_DV": 128, "num_warps": 8, "BLOCK_N": 32},
     "tcpv m16 32/4": {},
+    "tcpv m16 128/8": {"BLOCK_DV": 128, "num_warps": 8},     # verify steps (T = 8: 16 rows)
+    "tcpv m16 128/8 q3": {"BLOCK_DV": 128, "num_warps": 8, "SQ": 3},
     "tcpv tier2 m2": {**DECODE, "USE_TC_PV": False, "BLOCK_N": 16, "RERUN": True},
 }
 PTR = {"Q": "*i16", "K": "*i16", "V": "*i16", "KVLEN": "*i32", "PR": "*i64", "PZ": "*i64", "PZE": "*i64",
@@ -44,21 +47,29 @@ PTR = {"Q": "*i16", "K": "*i16", "V": "*i16", "KVLEN": "*i32", "PR": "*i64", "PZ
        "EXP2T": "*i64"}
 
 
-def compile_one(item):
-    name, over = item
-    import triton
+def kernel_config(over):
+    """The split kernel's constexprs and num_warps for a config, as launch computes them."""
+    from exactattn.triton_kernels import SCORE_FS
+
+    cfg = {**BASE, **over, "FS": SCORE_FS}
+    nw = cfg.pop("num_warps")
+    if not cfg["USE_TC_PV"]:
+        cfg.update(SW=1, SV=1)
+    cfg["ANCH"] = 7 * cfg["SW"] + 7 * cfg["SV"] + (cfg["BLOCK_N"] - 1).bit_length()
+    cfg["WDC"] = max(1, min(cfg["D"], (512 * nw) // (cfg["BLOCK_M"] * cfg["BLOCK_N"])))
+    return cfg, nw
+
+
+def build_ptx(over, ttgir_out=None):
+    """Lower the split kernel to sm_120 PTX with Triton's own pipeline (no GPU needed)."""
     from triton.backends.compiler import GPUTarget
     from triton.backends.nvidia.compiler import CUDABackend
     from triton.compiler import ASTSource
     from triton._C.libtriton import ir
 
-    from exactattn.triton_kernels import SCORE_FS, _ea_split_kernel
+    from exactattn.triton_kernels import _ea_split_kernel
 
-    cfg = {**BASE, **over, "FS": SCORE_FS}
-    nw = cfg.pop("num_warps")
-    if not cfg["USE_TC_PV"]:
-        cfg.update(SW=1, SV=1, ANCH=14 + (cfg["BLOCK_N"] - 1).bit_length())   # as launch computes it
-    cfg["WDC"] = max(1, min(cfg["D"], (512 * nw) // (cfg["BLOCK_M"] * cfg["BLOCK_N"])))
+    cfg, nw = kernel_config(over)
     sig = {a: ("constexpr" if a in cfg else PTR.get(a, "i32")) for a in _ea_split_kernel.arg_names}
     src = ASTSource(_ea_split_kernel, sig, {a: cfg[a] for a in _ea_split_kernel.arg_names if a in cfg})
     target = GPUTarget("cuda", 120, 32)
@@ -69,24 +80,41 @@ def compile_one(item):
     be.load_dialects(ctx)
     stages = {}
     be.add_stages(stages, opts, src.language)
-    t0 = time.time()
     cur = src.make_ir(target, opts, be.get_codegen_implementation(opts), be.get_module_map(), ctx)
     meta = {}
     for st, fn in stages.items():
         if st == "cubin":
             break
         cur = fn(cur, meta)
+        if st == "ttgir" and ttgir_out:
+            open(ttgir_out, "w").write(str(cur))
+    return cur
+
+
+def tool(name):
+    import triton
+    return os.path.join(os.path.dirname(triton.__file__), "backends", "nvidia", "bin", name)
+
+
+def ptxas(ptx, cubin, *flags):
+    """Assemble with Triton's bundled ptxas-blackwell. Returns its -v output."""
+    pf = cubin + ".ptx"
+    open(pf, "w").write(ptx)
+    r = subprocess.run([tool("ptxas-blackwell"), "-v", *flags, "--gpu-name=sm_120a", "-O3", pf, "-o", cubin],
+                       capture_output=True, text=True)
+    return r.stderr + r.stdout
+
+
+def compile_one(item):
+    name, over = item
+    t0 = time.time()
+    ptx = build_ptx(over)
     with tempfile.TemporaryDirectory() as td:
-        pf = os.path.join(td, "k.ptx")
-        open(pf, "w").write(cur)
-        ptxas = os.path.join(os.path.dirname(triton.__file__), "backends", "nvidia", "bin", "ptxas-blackwell")
-        r = subprocess.run([ptxas, "-v", "--gpu-name=sm_120a", "-O3", pf, "-o", os.path.join(td, "k.cubin")],
-                           capture_output=True, text=True)
-    out = r.stderr + r.stdout
+        out = ptxas(ptx, os.path.join(td, "k.cubin"))
     regs = re.findall(r"Used (\d+) registers", out)
     spill = re.findall(r"(\d+) bytes spill stores", out)
-    return name, time.time() - t0, int(regs[0]) if regs else None, int(spill[0]) if spill else None, \
-        "" if regs else out[-400:]
+    return (name, time.time() - t0, int(regs[0]) if regs else None, int(spill[0]) if spill else None,
+            "" if regs else out[-400:])
 
 
 def main():

@@ -309,7 +309,7 @@ def _l1_ceil(l1s):
 
 
 @triton.jit
-def _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nmask, NKEYS, KLSB, KL1S, KLOST,
+def _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nmask, KST, KLSB, KL1S, KLOST,
                AM, AE, D: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr, PACK: tl.constexpr,
                BM: tl.constexpr):
     """Certified t = RN32(alpha * q.k) from int8 slices (slices.py) on tensor cores.
@@ -317,20 +317,69 @@ def _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nmask, NKEYS, KL
     q.k = 2^(qlsb + klsb) * (sum_{s,t} 2^(7(s+t)) Q[s].K[t] + truncation), where each Q[s].K[t] is
     an exact int8 x int8 -> int32 MMA (PACK q digits share one MMA, _q_group). The truncation
     bound comes from per-row L1 norms, stored pre-scaled (l1 * 2^-lsb); q's arrives as an
-    integer ceiling (qerr, qbig from _l1_ceil). Returns (t, uncertified,
-    key has NaN/inf)."""
+    integer ceiling (qerr, qbig from _l1_ceil). KX and the per-key pointers start at the segment,
+    nn is int32 within it and KST is the digit-plane stride (int64 scalar), so the per-element
+    address math is 32-bit. Returns (t, uncertified, key has NaN/inf)."""
     NG: tl.constexpr = (SQ + PACK - 1) // PACK
     dd = tl.arange(0, D)
-    acc = tl.zeros((BM, nn.shape[0]), tl.int64)
-    for t_ in tl.static_range(SK):
-        kt = tl.trans(tl.load(KX + (t_ * NKEYS + nn[:, None]) * D + dd[None, :], mask=nmask[:, None], other=0))
-        acc += _slot_sum(tl.dot(q0, kt, out_dtype=tl.int32), 0, PACK, BM, 0, SQ, 7 * t_)
-        if NG > 1:
-            acc += _slot_sum(tl.dot(q1, kt, out_dtype=tl.int32), 1, PACK, BM, 0, SQ, 7 * t_)
-        if NG > 2:
-            acc += _slot_sum(tl.dot(q2, kt, out_dtype=tl.int32), 2, PACK, BM, 0, SQ, 7 * t_)
-        if NG > 3:
-            acc += _slot_sum(tl.dot(q3, kt, out_dtype=tl.int32), 3, PACK, BM, 0, SQ, 7 * t_)
+    if PACK == 1:
+        # One digit per MMA: products of equal weight u = s + t accumulate inside the int32 MMA
+        # (|Q[s].K[t]| < d * 127^2 < 2^21, at most 4 per weight: < 2^23), and adjacent weights
+        # pair up in int32 (S_u + S_(u+1) << 7 < 2^30) before widening. Exact, and 4 int64
+        # terms instead of SQ * SK.
+        tl.static_assert(SQ + SK - 1 <= 8)
+        S0 = tl.zeros((BM, nn.shape[0]), tl.int32)
+        S1 = S0
+        S2 = S0
+        S3 = S0
+        S4 = S0
+        S5 = S0
+        S6 = S0
+        S7 = S0
+        for t_ in tl.static_range(SK):
+            kt = tl.trans(tl.load((KX + t_ * KST) + (nn[:, None] * D + dd[None, :]), mask=nmask[:, None], other=0))
+            for s in tl.static_range(SQ):
+                qs = q0
+                if s == 1:
+                    qs = q1
+                if s == 2:
+                    qs = q2
+                if s == 3:
+                    qs = q3
+                if s + t_ == 0:
+                    S0 = tl.dot(qs, kt, S0, out_dtype=tl.int32)
+                if s + t_ == 1:
+                    S1 = tl.dot(qs, kt, S1, out_dtype=tl.int32)
+                if s + t_ == 2:
+                    S2 = tl.dot(qs, kt, S2, out_dtype=tl.int32)
+                if s + t_ == 3:
+                    S3 = tl.dot(qs, kt, S3, out_dtype=tl.int32)
+                if s + t_ == 4:
+                    S4 = tl.dot(qs, kt, S4, out_dtype=tl.int32)
+                if s + t_ == 5:
+                    S5 = tl.dot(qs, kt, S5, out_dtype=tl.int32)
+                if s + t_ == 6:
+                    S6 = tl.dot(qs, kt, S6, out_dtype=tl.int32)
+                if s + t_ == 7:
+                    S7 = tl.dot(qs, kt, S7, out_dtype=tl.int32)
+        acc = (S0 + (S1 << 7)).to(tl.int64)
+        if SQ + SK > 3:
+            acc += (S2 + (S3 << 7)).to(tl.int64) << 14
+        if SQ + SK > 5:
+            acc += (S4 + (S5 << 7)).to(tl.int64) << 28
+        if SQ + SK > 7:
+            acc += (S6 + (S7 << 7)).to(tl.int64) << 42
+    else:
+        acc = tl.zeros((BM, nn.shape[0]), tl.int64)
+        for t_ in tl.static_range(SK):
+            kt = tl.trans(tl.load((KX + t_ * KST) + (nn[:, None] * D + dd[None, :]), mask=nmask[:, None], other=0))
+            acc += _slot_sum(tl.dot(q0, kt, out_dtype=tl.int32), 0, PACK, BM, 0, SQ, 7 * t_)
+            if NG > 1:
+                acc += _slot_sum(tl.dot(q1, kt, out_dtype=tl.int32), 1, PACK, BM, 0, SQ, 7 * t_)
+            if NG > 2:
+                acc += _slot_sum(tl.dot(q2, kt, out_dtype=tl.int32), 2, PACK, BM, 0, SQ, 7 * t_)
+            if NG > 3:
+                acc += _slot_sum(tl.dot(q3, kt, out_dtype=tl.int32), 3, PACK, BM, 0, SQ, 7 * t_)
     klsb = tl.load(KLSB + nn, mask=nmask, other=0)
     kl1s = tl.load(KL1S + nn, mask=nmask, other=0.0)
     kw = tl.load(KLOST + nn, mask=nmask, other=0)
@@ -342,7 +391,7 @@ def _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nmask, NKEYS, KL
     err = tl.where(qlost[:, None], kerr[None, :], 0) + tl.where(klost[None, :], qerr[:, None], 0)
     base = qlsb[:, None] + klsb[None, :]
     big = (qlost[:, None] & kbig[None, :]) | (klost[None, :] & qbig[:, None])
-    big = big | ((tl.abs(acc) + err) >= (1 << 62))
+    big = big | (tl.abs(acc) >= (1 << 62) - err)              # err <= 2^60 + 2: no overflow
     t_lo, ov1 = _rn32_product(AM, AE, acc - err, base)
     t_hi, ov2 = _rn32_product(AM, AE, acc + err, base)
     unc = (t_lo != t_hi) | ov1 | ov2 | big
@@ -350,29 +399,34 @@ def _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nmask, NKEYS, KL
 
 
 @triton.jit
-def _pv_group(Wf, lw, vis, g: tl.constexpr, PACK: tl.constexpr, BM: tl.constexpr, SW: tl.constexpr):
+def _pv_group(Wlo, Whi, lw, vis, g: tl.constexpr, PACK: tl.constexpr, BM: tl.constexpr, SW: tl.constexpr):
     """Packed weight operand for slot group g (rows jl*BM + r for slot j = g*PACK + jl): slot j < SW
     is weight digit j, slot SW the lost-weight mask, slot SW + 1 the visibility mask, later slots
-    zero. One MMA per V operand then covers PACK slots."""
+    zero. One MMA per V operand then covers PACK slots. The weight comes as two int32 halves,
+    Wlo = digits 0-3 and Whi = digits 4 and up, so the digit cuts are 32-bit shifts."""
     if PACK == 1:
-        if g < SW:
-            a = (Wf >> (7 * g)) & 127
+        if g < 4:
+            a = (Wlo >> (7 * g)) & 127
+        elif g < SW:
+            a = (Whi >> (7 * (g - 4))) & 127
         elif g == SW:
-            a = lw.to(tl.int64)
+            a = lw.to(tl.int32)
         else:
-            a = vis.to(tl.int64)
+            a = vis.to(tl.int32)
     else:
         tl.static_assert(PACK * BM >= 16)
         j = g * PACK + tl.arange(0, PACK)[:, None, None]
-        dig = (Wf[None, :, :] >> (7 * tl.minimum(j, SW - 1))) & 127
-        a = tl.where(j < SW, dig, tl.where(j == SW, lw[None, :, :].to(tl.int64),
-                                            tl.where(j == SW + 1, vis[None, :, :].to(tl.int64), 0)))
-        a = tl.reshape(a, (PACK * BM, Wf.shape[1]))
+        dlo = (Wlo[None, :, :] >> (7 * tl.minimum(j, 3))) & 127
+        dhi = (Whi[None, :, :] >> (7 * tl.minimum(tl.maximum(j - 4, 0), 3))) & 127
+        dig = tl.where(j < 4, dlo, dhi)
+        a = tl.where(j < SW, dig, tl.where(j == SW, lw[None, :, :].to(tl.int32),
+                                            tl.where(j == SW + 1, vis[None, :, :].to(tl.int32), 0)))
+        a = tl.reshape(a, (PACK * BM, Wlo.shape[1]))
     return a.to(tl.int8)
 
 
 @triton.jit
-def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nmask, cc, NKEYS, FN, DV: tl.constexpr, SW: tl.constexpr,
+def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nmask, cc, VST, FN, DV: tl.constexpr, SW: tl.constexpr,
            SV: tl.constexpr, ANCH: tl.constexpr, PACK: tl.constexpr, BM: tl.constexpr):
     """One tile's P·V on tensor cores (DESIGN D9/D10). Returns (TNR, TN, TNE) in the partial format:
     value N_c lies in [TN, TN + TNE] * 2^(TNR - FN).
@@ -392,16 +446,19 @@ def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nmask, cc, NKEYS, FN, DV: tl.conste
     Wf, lw = _floor_shift(Mw, G - base[:, None])                           # Wf < 2^(7*SW)
     Wf = tl.where(vis, Wf, 0)
     lw = lw & vis
+    tl.static_assert(SW <= 8)
+    Wlo = (Wf & 0xFFFFFFF).to(tl.int32)                                    # digits 0-3
+    Whi = (Wf >> 28).to(tl.int32)                                          # digits 4 .. SW-1
     NGW: tl.constexpr = (SW + 2 + PACK - 1) // PACK     # slots: SW weight digits, lost mask, vis mask
     acc = tl.zeros((BM, cc.shape[0]), tl.int64)
     e = tl.zeros((BM, cc.shape[0]), tl.int64)
     nz = tl.zeros((nn.shape[0], cc.shape[0]), tl.int32)
     for b in tl.static_range(SV):
-        vb = tl.load(VX + (b * NKEYS + nn[:, None]) * DV + cc[None, :], mask=nmask[:, None], other=0)
+        vb = tl.load((VX + b * VST) + (nn[:, None] * DV + cc[None, :]), mask=nmask[:, None], other=0)
         nz = nz | (vb != 0).to(tl.int32)
         for g in tl.static_range(NGW):
             if g * PACK <= SW:
-                a = _pv_group(Wf, lw, vis, g, PACK, BM, SW)
+                a = _pv_group(Wlo, Whi, lw, vis, g, PACK, BM, SW)
                 if g * PACK < SW:                                          # weight digits x V digit b
                     acc += _slot_sum(tl.dot(a, vb, out_dtype=tl.int32), g, PACK, BM, 0, SW, 7 * b)
                 if g * PACK + PACK > SW:                                   # lost weight x |V digit b|
@@ -411,7 +468,7 @@ def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nmask, cc, NKEYS, FN, DV: tl.conste
     vbad = tl.max((vw >> 1).to(tl.int32), axis=1) != 0                    # (N,) NaN/inf in this channel block
     chan = tl.zeros((BM, cc.shape[0]), tl.int64)
     for g in tl.static_range(NGW):
-        a = _pv_group(Wf, lw, vis, g, PACK, BM, SW)
+        a = _pv_group(Wlo, Whi, lw, vis, g, PACK, BM, SW)
         if g * PACK < SW or g * PACK + PACK > SW + 1:
             rv = tl.dot(a, vl, out_dtype=tl.int32)
             if g * PACK < SW:                                              # weight digits x lost V
@@ -519,10 +576,21 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
     lrows = (pid_m % NRB) * BLOCK_M + tl.arange(0, BLOCK_M)
     rmask = lrows < R_SEG
     rows = seg * R_SEG + lrows
-    kb0 = seg.to(tl.int64) * NK_SEG                                        # first key of the segment
+    # Pointers start at the segment's first key, and key indices are int32 within it, so the
+    # per-element address math is 32-bit (int64 offsets cost several instructions per element).
+    kb0 = seg.to(tl.int64) * NK_SEG
     K += kb0 * D
     V += kb0 * DV
-    kvl = tl.load(KVLEN + rows, mask=rmask, other=0).to(tl.int64)
+    KX += kb0 * D
+    KLSB += kb0
+    KL1S += kb0
+    KLOST += kb0
+    VX += kb0 * DV
+    VLSB += kb0
+    VLOST += kb0 * DV
+    KST = (kb0 * 0 + NKEYS) * D                                            # digit-plane strides
+    VST = (kb0 * 0 + NKEYS) * DV
+    kvl = tl.load(KVLEN + rows, mask=rmask, other=0)
     dd = tl.arange(0, D)
     cc = pid_c * BLOCK_DV + tl.arange(0, BLOCK_DV)
     qb = tl.load(Q + rows[:, None] * D + dd[None, :], mask=rmask[:, None], other=0)
@@ -544,7 +612,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
         # Tier 2 (DESIGN D12): recompute only the (row, channel block) pairs in NEED. A program
         # with none walks zero tiles, so the launch is cheap and its grid is fixed (graph-safe).
         need = (tl.load(NEED + rows * tl.num_programs(2) + pid_c, mask=rmask, other=0) != 0) & rmask
-        k1 = k0 + (k1 - k0) * (tl.max(need.to(tl.int32), axis=0) > 0).to(tl.int64)
+        k1 = k0 + (k1 - k0) * (tl.max(need.to(tl.int32), axis=0) > 0).to(tl.int32)
     for n0 in range(k0, k1, BLOCK_N):
         nn = n0 + tl.arange(0, BLOCK_N)
         vis = (nn[None, :] < kvl[:, None]) & rmask[:, None]              # (M, N)
@@ -553,7 +621,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
             # Tensor cores: int8 slice products, certified. The bf16 K tile is read and decoded
             # only for tiles that contain an uncertified score (windowed recompute); NaN/inf
             # keys come from a flag made at cache write.
-            t, unc, kbad = _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, kb0 + nn, nn < kmax, NKEYS,
+            t, unc, kbad = _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nn < kmax, KST,
                                       KLSB, KL1S, KLOST, AM, AE, D, SQ, SK, PACK, BLOCK_M)
             flag = tl.maximum(flag, tl.max((vis & kbad[None, :]).to(tl.int32), axis=1))
             if TC_FALLBACK and tl.max(tl.max((unc & vis).to(tl.int32), axis=1), axis=0) > 0:
@@ -585,7 +653,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
         TZ = tl.sum(tl.where(vis, zt, 0), axis=1)
         TZE = tl.sum((zl & vis).to(tl.int64), axis=1)
         if USE_TC_PV:
-            TNR, TN, TNE, vbad = _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, kb0 + nn, nn < kmax, cc, NKEYS, FN, DV,
+            TNR, TN, TNE, vbad = _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nn < kmax, cc, VST, FN, DV,
                                         SW, SV, ANCH, PACK, BLOCK_M)
             flag = tl.maximum(flag, tl.max((vis & vbad[None, :]).to(tl.int32), axis=1))
         else:
@@ -852,7 +920,7 @@ def _exp2_table_dev(dev):
 def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int = 4, block_m: int | None = None,
            block_n: int = 16, block_dv: int = 32, merge_order=None, exp2_margin: float = 2.0 ** -26,
            q_tc=None, k_tc=None, tc_fallback: bool = True, v_tc=None, sw: int = 5, pv_tier2: bool = True,
-           sq: int = 3, num_warps: int = 4, exp2: str = "int"):
+           sq: int = 4, num_warps: int = 4, exp2: str = "int"):
     """Device-level launch with no host transfers and no sync.
 
     Qt (R, d), Kt (n, d), Vt (n, dv) are int16 views of bf16 on the device; KL (R,) is int32.
@@ -887,7 +955,9 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     dev = Qt.device
     key_log2 = max(1, int(np.ceil(np.log2(max(2, maxlen)))))
     fz = fn = 64 - 3 - key_log2
-    block_n_t2 = block_n   # tier 2 runs int64 P·V, which has no MMA shape limit
+    # Tier 2 runs int64 P·V, which has no MMA shape limit; its (rows, keys, channels) int64
+    # products stay small at 16 keys. Any tile size gives the same bits (SPEC §5.3).
+    block_n_t2 = min(block_n, 16)
     if v_tc is not None:
         # P·V contracts over the key tile, and int8 MMAs on NVIDIA need K >= 32 (mma.m16n8k32).
         # The CPU interpreter does not enforce this. The tile size cannot change the output
@@ -904,6 +974,10 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
         sk = k_tc[0].shape[0]
         sq = q_tc[0].shape[0] if q_tc is not None else sq
         assert 1 <= sq <= 4
+        # Each fixed-point element is below 2^(7 sq) or 2^(7 sk), so |acc| < d * 2^(7(sq + sk))
+        # must fit int64. sq = 4 keeps 28 bits of q below each row's largest element: with 21,
+        # 1.6% of normal q rows lost bits, which leaves their scores uncertified (DESIGN D18).
+        assert 7 * (sq + sk) + int(np.ceil(np.log2(d))) <= 63, f"q/k slices too wide for int64: sq={sq}, sk={sk}"
     else:
         tc = [dz[torch.int8], dz[torch.int64], dz[torch.float64], dz[torch.int32]]
         sq, sk = 1, 1
@@ -914,8 +988,11 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
         vtc, sv, sw = [dz[torch.int8], dz[torch.int64], dz[torch.int8]], 1, 1
     anch = 7 * sw + 7 * sv + int(np.ceil(np.log2(block_n)))
     if use_tc_pv:
-        # Largest tile partial: block_n * 127 * 127 * 2^(7(sw+sv-2)) (all digit pairs combined) must fit int64.
-        assert anch + 1 < 63, f"P·V slices too wide for int64: sw={sw}, sv={sv}, block_n={block_n}"
+        # The digit pairs of a tile combine to sum_keys Wf * Vfix with Wf < 2^(7 sw) and
+        # |Vfix| < 2^(7 sv), so |acc| < block_n * 2^(7(sw + sv)) <= 2^anch. The error count is
+        # e < block_n * (2^(7 sw) + 2^(7 sv) + 1) < 2^(anch - 5), so acc +- e and 2e fit int64 when
+        # anch <= 62 (DESIGN D18). That allows 64-key tiles at sw = 5, sv = 3.
+        assert anch <= 62, f"P·V slices too wide for int64: sw={sw}, sv={sv}, block_n={block_n}"
     i64 = dict(dtype=torch.int64, device=dev)
     PR_ = torch.empty((nsplit, R), **i64)
     PZ_ = torch.empty((nsplit, R), **i64)
@@ -986,7 +1063,7 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
 def attention_triton(q_bits, k_bits, v_bits, alpha, kv_len, out: str = "bf16", splits: int = 4,
                      block_m: int | None = None, block_n: int = 16, block_dv: int | None = None,
                      merge_order=None, device: str = "cpu", fallback: bool = True,
-                     exp2_margin: float = 2.0 ** -26, use_tc: bool = False, sq: int = 3, sk: int = 4,
+                     exp2_margin: float = 2.0 ** -26, use_tc: bool = False, sq: int = 4, sk: int = 4,
                      k_slices=None, tc_fallback: bool = True, use_tc_pv: bool = False, sw: int = 5,
                      sv: int = 3, pv_tier2: bool = True, exp2: str = "int"):
     """numpy-level API. q: (R, d), k: (n, d), v: (n, dv) bf16 bits (uint16). Row r attends keys

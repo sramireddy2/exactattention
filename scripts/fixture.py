@@ -54,7 +54,7 @@ def run_backend(backend, q, k, v, alpha):
         from exactattn.triton_kernels import attention_triton
 
         return attention_triton(q, k, v, alpha, kv_len, splits=8, block_m=16, block_n=16, block_dv=32,
-                                device=dev or "cpu", use_tc=kind != "triton", sq=3, sk=4,
+                                device=dev or "cpu", use_tc=kind != "triton", sq=4, sk=4,
                                 use_tc_pv=(kind == "tritontcpv"))
     raise ValueError(backend)
 

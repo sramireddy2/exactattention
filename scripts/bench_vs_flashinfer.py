@@ -49,15 +49,18 @@ from exactattn.triton_kernels import _LAST_DEBUG, launch, tc_slices_device, tc_v
 HQ, HKV, D = 16, 8, 128
 DEV = os.environ.get("EA_BENCH_DEVICE", "cuda")   # "cpu" + TRITON_INTERPRET=1 for a smoke test
 PAGE = 16
-# (block_dv, num_warps, block_m, exp2) per exact mode. block_dv = 128 computes each score once per
-# row block instead of once per channel block, at the price of larger P·V accumulators. block_m
-# None is launch's default (the segment's rows, at most 16: digit-packed MMAs, DESIGN D14); 16 is
-# the old padded layout. exp2 "int" is integer exp2 (DESIGN D15), "f64" the old float64 one. The
-# last configs are A/Bs, and cross-checks that neither choice can change bits.
-CONFIGS = {"int64": [(32, 4, None, "int"), (32, 4, None, "f64")],
-           "tc": [(32, 4, None, "int"), (64, 8, None, "int"), (32, 4, 16, "int"), (32, 4, None, "f64")],
-           "tcpv": [(32, 4, None, "int"), (64, 4, None, "int"), (64, 8, None, "int"), (128, 8, None, "int"),
-                    (32, 4, 16, "int"), (32, 4, None, "f64")]}
+# (block_dv, num_warps, block_m, exp2, block_n, sq) per exact mode. block_dv = 128 computes each
+# score once per row block instead of once per channel block, at the price of larger P·V
+# accumulators. block_m None is launch's default (the segment's rows, at most 16: digit-packed
+# MMAs, DESIGN D14); 16 is the old padded layout. exp2 "int" is integer exp2 (DESIGN D15), "f64"
+# the old float64 one. block_n is the key tile: tensor-core P·V takes 64 (DESIGN D18), 32 is the
+# old one. sq is q's digit count: 4 (D18), 3 the old one. The last configs are A/Bs, and
+# cross-checks that none of these choices can change bits.
+CONFIGS = {"int64": [(32, 4, None, "int", 16, 4), (32, 4, None, "f64", 16, 4)],
+           "tc": [(32, 4, None, "int", 16, 4), (64, 8, None, "int", 16, 4), (64, 8, None, "int", 16, 3),
+                  (32, 4, 16, "int", 16, 4), (32, 4, None, "f64", 16, 4)],
+           "tcpv": [(64, 8, None, "int", 64, 4), (128, 8, None, "int", 64, 4), (32, 4, None, "int", 64, 4),
+                    (128, 8, None, "int", 64, 3), (128, 8, None, "int", 32, 4), (32, 4, 16, "int", 32, 4)]}
 
 
 def time_step(fn, iters: int, warmup: int = 3):
@@ -185,7 +188,8 @@ class Case:
         return self._ref
 
     # ---------------- ExactAttention ----------------
-    def exact(self, mode: str, sms: int, block_dv: int = 32, num_warps: int = 4, block_m=None, exp2="int"):
+    def exact(self, mode: str, sms: int, block_dv: int = 32, num_warps: int = 4, block_m=None, exp2="int",
+              block_n: int = 16, sq: int = 4):
         B, n, T = self.B, self.n, self.T
         grp = HQ // HKV
         G, r_seg = B * HKV, T * grp
@@ -202,12 +206,12 @@ class Case:
         ncb = D // block_dv
         progs = G * -(-r_seg // bm) * ncb
         splits = int(max(1, min(n // 256, -(-4 * sms // progs))))
-        kw = dict(splits=splits, block_m=block_m, block_n=32 if mode == "tcpv" else 16, block_dv=block_dv,
+        kw = dict(splits=splits, block_m=block_m, block_n=block_n, block_dv=block_dv,
                   num_warps=num_warps, exp2=exp2)
         if mode != "int64":
             if getattr(self, "_k_tc", None) is None:
                 self._k_tc = tc_slices_device(Kt.reshape(G * n, D), 4)      # once, at cache write
-            kw["k_tc"], kw["sq"] = self._k_tc, 3                            # q is sliced in the kernel
+            kw["k_tc"], kw["sq"] = self._k_tc, sq                           # q is sliced in the kernel
         if mode == "tcpv":
             if getattr(self, "_v_tc", None) is None:
                 self._v_tc = tc_v_slices_device(Vt.reshape(G * n, D), 3)
@@ -280,12 +284,12 @@ def main():
                 record("flash_attn", lambda: (case.flash_attn(), ""))
                 for m in modes:
                     best, first, note_u = None, None, ""
-                    for bdv, nw, bm, x2 in CONFIGS[m]:
+                    for bdv, nw, bm, x2, bn, sq in CONFIGS[m]:
                         try:
-                            fn, u, bad, out, flg, (nr, ns, bmr) = case.exact(m, sms, bdv, nw, bm, x2)
+                            fn, u, bad, out, flg, (nr, ns, bmr) = case.exact(m, sms, bdv, nw, bm, x2, bn, sq)
                             ms, gmode = time_step(fn, args.iters)
                         except Exception as ex:  # noqa: BLE001
-                            errors.append((f"exact-{m}", f"{type(ex).__name__}: {ex} (T={T} B={B} n={n} cfg={bdv}/{nw}/{bm}/{x2})"))
+                            errors.append((f"exact-{m}", f"{type(ex).__name__}: {ex} (T={T} B={B} n={n} cfg={bdv}/{nw}/{bm}/{x2}/n{bn}/q{sq})"))
                             if os.environ.get("EA_BENCH_TRACE"):
                                 traceback.print_exc()
                             continue
@@ -296,11 +300,11 @@ def main():
                             both = ~(first[1] | flg)                     # rows certified by both
                             o1 = first[0].reshape(-1, D)[both]
                             if not torch.equal(o1, out.reshape(-1, D)[both]):
-                                note_u += f" **{m} config {bdv}/{nw}/m{bmr}/{x2} changed bits**"
+                                note_u += f" **{m} config {bdv}/{nw}/m{bmr}/{x2}/n{bn}/q{sq} changed bits**"
                         if best is None or ms < best[0]:
                             sp = f" r{nr}" + (f" spill{ns}" if ns else "") if nr is not None else ""
-                            best = (ms, f"{ms:.3f} {gmode[0]} [{bdv}/{nw}/m{bmr}/{x2}{sp}]")
-                        all_cfg.append(f"T={T} B={B} n={n} {m} {bdv}/{nw}/m{bmr}/{x2}: {ms:.3f} ms, {u} uncertified")
+                            best = (ms, f"{ms:.3f} {gmode[0]} [{bdv}/{nw}/m{bmr}/{x2}/n{bn}/q{sq}{sp}]")
+                        all_cfg.append(f"T={T} B={B} n={n} {m} {bdv}/{nw}/m{bmr}/{x2}/n{bn}/q{sq}: {ms:.3f} ms, {u} uncertified")
                         del fn, out, flg
                     res[f"exact-{m}"] = best if best else (None, "n/a")
                     if note_u:
@@ -314,10 +318,10 @@ def main():
                 print(lines[-1], flush=True)
                 del case
                 torch.cuda.empty_cache()
-    lines.insert(4, "Exact cells: `ms mode [block_dv/num_warps/mBLOCK_M/exp2 rREGS spillBYTES]` for the fastest tile config.")
+    lines.insert(4, "Exact cells: `ms mode [block_dv/num_warps/mBLOCK_M/exp2/nBLOCK_N/qSQ rREGS spillBYTES]` for the fastest tile config.")
     lines.insert(5, "")
     if all_cfg:
-        lines += ["", "All exact configs (the A/Bs: block_m 16 = padded rows, f64 = float64 exp2):", ""]
+        lines += ["", "All exact configs (the A/Bs: m16 = padded rows, f64 = float64 exp2, n32 = 32-key tiles, q3 = 3 q digits):", ""]
         lines += [f"- {c}" for c in all_cfg]
     if errors:
         lines += ["", "Backend errors (first per backend and error type):", ""]

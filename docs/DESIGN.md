@@ -528,6 +528,109 @@ Best exact time against FlashInfer and against the pre-D13 code (run 1112-flash)
 Decode is now 7–35× FlashInfer. Verify steps (T = 8, 16 rows, PACK = 1) are the weak spot at
 57–311×: they take about 12× the T = 1 time for 8× the rows, and spill 170–518 B.
 
+## D18. Verify steps: four q digits, 32-bit addressing, 64-key tiles
+
+A verify step has 16 real query rows per segment (8 draft tokens × GQA group 2), so it has no
+padding for D14 to remove. Run 1114 put it at 57–311× FlashInfer.
+
+**Tools.** `scripts/sm120_sass_profile.py` compiles one config for sm_120 with line info, using
+Triton's pipeline, ptxas-blackwell and nvdisasm (no GPU). It finds the key loop, and counts one
+iteration's SASS (one key tile) by kernel line. It reports these counts:
+
+- instructions per warp per tile;
+- spill loads and stores (LDL/STL) inside the loop;
+- the rare branches (windowed recompute, float64 exp2), counted apart.
+
+`scripts/profile_step.py` (a PACE stage) gives the device time of each launch in a step, and
+the share of programs that tier 2 reruns.
+
+**Diagnosis.** The time is not in the hot loop. For the best run-1114 verify config (tcpv,
+block_m 16, block_dv 128, 8 warps), one 32-key tile was 10.2K instructions per warp. At one
+program per SM, that is about 8 µs per tile at full issue. The measured time is 120–345 µs per
+tile, 15–45× more. Decode tiles come within about 4× of their count. Three observations point
+to the windowed score recompute (D17) running on most verify tiles:
+
+- at T = 8, B = 1, n = 1K, the int64 mode, which always takes the windowed path, matches tcpv
+  (1.09 against 1.07 ms);
+- tc and tcpv take about the same time for verify (6.4 and 6.9 ms at B = 1, n = 16K), even though
+  tcpv executes a quarter of tc's instructions;
+- tier 2 is not the cause: on the benchmark's data no (row, channel block) pair needs it.
+
+The cause is q's digit count. With SQ = 3, q keeps 21 bits below each row's largest element.
+1.6% of the benchmark's standard-normal q rows (d = 128) have an element more than 2^13 below
+the row maximum, and lose bits. A lost bit costs that row the bound qlost·|K|₁, and relative to
+a score this is about 2^-15. That is far wider than an fp32 logit's 2^-24, so nearly every score
+of that row is uncertified, and every tile of every program holding the row is recomputed in
+int64. A 2-row decode block holds such a row 3.3% of the time; a 16-row verify block holds one
+23% of the time. Each wave of programs then waits on its slowest ones.
+
+**1. SQ = 4 (default).** q keeps 28 bits. Rows with lost bits fall to 0.012% (decode blocks
+0.02%, verify blocks 0.18%). The fixed-point elements are below 2^28, so
+
+  |acc| ≤ d · (2^28 − 1)² < 2^63 at d = 128.
+
+`launch` asserts 7(sq + sk) + log2 d ≤ 63. The overflow check now reads |acc| ≥ 2^62 − err, so
+it cannot wrap near that bound. The cost:
+- decode: none, because PACK = 8 already holds 4 digits in one MMA group;
+- verify (PACK = 1): 16 score MMAs per tile instead of 12.
+
+**2. int64 addressing.** The loop's largest item was the K digit loads: 2.3K instructions per
+warp, issued as single-byte loads (`LDG.E.U8`) with 64-bit address math, and the address
+registers spilled. The cause was one cast. `kvl` was int64, so the loop variable, `nn` and
+every per-key offset were int64 too. Now:
+
+- key indices are int32 within a segment;
+- each program moves the K, V, slice and metadata pointers to its segment's first key once;
+- the digit-plane strides are int64 scalars.
+
+Per-element address math is 32-bit and the loads vectorize. Nothing computed changes.
+
+**3. Equal-weight digit products accumulate in the MMA (PACK = 1).**
+- Q[s]·K[t] products with the same s + t share one int32 accumulator. Each product is below
+  2^21, and at most four share a weight, so the sum stays below 2^23.
+- Adjacent weights pair in int32: S_u + (S_(u+1) << 7) < 2^30.
+- A tile then widens 4 int64 terms instead of SQ·SK.
+
+The P·V weight digits are cut from two int32 halves of Wf, digits 0–3 and 4+.
+
+**4. 64-key tiles for tensor-core P·V.** The int8 MMA output layout spreads 8 warps along the
+key axis in 8-key steps. A 16 × 32 score tile has only 4 such slices, so warps 4–7 recomputed
+warps 0–3: every score, logit and weight was computed twice. The per-tile merge into the running
+(row, channel) partial also costs the same whatever the tile size, so a bigger tile pays it less
+often per key.
+
+The old `anch + 1 < 63` limit is now an exact bound:
+- The digit pairs of a tile combine to Σ_keys Wf·Vfix, with Wf < 2^(7·SW) and |Vfix| < 2^(7·SV)
+  (digits in [-127, 127]). So |acc| < block_n · 2^(7(SW+SV)) ≤ 2^ANCH.
+- The error count is e < block_n · (2^(7·SW) + 2^(7·SV) + 1) < 2^(ANCH−5).
+- acc ± e and 2e fit int64 when ANCH ≤ 62.
+- That allows block_n = 64 at SW = 5, SV = 3. The int32 MMA partials stay below 64 · 127² < 2^20.
+
+`test_pv_key_tile_size_does_not_change_bits` checks 64 against 32 for bits and flags. It
+includes the bound's worst case: equal weights over values that all have the largest bf16
+significand, with each channel's sign fixed so its sum grows with the tile. Tier 2 keeps 16-key
+tiles, so its int64 (rows, keys, channels) products stay small.
+
+**Static counts.** Offline sm_120 key-loop counts per program: before is 51bb44b (32-key
+tiles, SQ = 3), after is this section's code. "Per 32 keys" means warps × count per warp ×
+32 / block_n.
+
+| config (rows, block_dv / warps) | instructions per 32 keys, before → after | loop spill ops per 32 keys | stack |
+|---|---|---|---|
+| tcpv verify, m16, 128/8 | 81.4K → 36.6K | 6280 → 3028 | 2240 → 1960 B |
+| tcpv verify, m16, 64/8 | 61.2K → 24.3K | 2072 → 872 | 704 → 984 B |
+| tcpv decode, m2, 128/8 | 41.0K → 25.4K | 2840 → 708 | 1464 → 424 B |
+| tcpv decode, m2, 64/8 | 28.5K → 17.2K | 560 → 76 | 312 → 96 B |
+| tc verify, m16, 64/8 | 169K → 166K | 8704 → 8384 | 2064 → 1808 B |
+| tc decode, m2, 32/4 | 30.6K → 31.0K | 0 → 0 | 0 B |
+
+The new rows include SQ = 4's extra MMAs. The tc path changes little, because its P·V is int64
+on CUDA cores. These counts leave out the windowed recompute, which was the main cost (above).
+The GPU decides between 128/8 and 64/8 for verify: a 64-channel block computes each score twice,
+but spills a quarter as much.
+
+The benchmark adds A/Bs: `n32` (32-key tiles) and `q3` (three q digits).
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model

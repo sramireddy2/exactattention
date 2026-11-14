@@ -326,6 +326,30 @@ def test_row_block_size_does_not_change_bits(mode):
         assert np.array_equal(ref[r], attention_row(Q[r], K[:L], V[:L], alpha)), r
 
 
+def test_pv_key_tile_size_does_not_change_bits():
+    """Tensor-core P·V on 64-key tiles (DESIGN D18) gives the same bits and flags as 32-key tiles,
+    including at the int64 bound: equal weights (q = 0) on values that all have the largest bf16
+    significand at one exponent, so every tile partial is close to block_n * 2^(7(sw + sv))."""
+    rng = np.random.default_rng(zlib.crc32(b"keytile/tcpv"))
+    d, dv, R, n = 64, 64, 8, 200
+    alpha = default_alpha(d)
+    kw = dict(splits=2, block_m=8, block_dv=32, device=DEVICE, fallback=False, use_tc=True, use_tc_pv=True)
+    cases = [(bf16(rng, (R, d), "outlier"), bf16(rng, (n, d), "normal"), bf16(rng, (n, dv), "wide")),
+             (np.zeros((R, d), np.uint16), bf16(rng, (n, d), "normal"),
+              np.broadcast_to(np.where(np.arange(dv) % 2 == 0, 0x437F, 0xC37F), (n, dv)).astype(np.uint16))]  # +-255
+    for Q, K, V in cases:
+        kv_len = rng.integers(1, n + 1, size=R)
+        kv_len[0] = n
+        ref, f_ref = attention_triton(Q, K, V, alpha, kv_len, block_n=32, **kw)
+        got, f = attention_triton(Q, K, V, alpha, kv_len, block_n=64, **kw)
+        assert np.array_equal(f, f_ref), (f, f_ref)
+        assert np.array_equal(got[f == 0], ref[f == 0])
+        for r in np.flatnonzero(f == 0):
+            L = int(kv_len[r])
+            assert np.array_equal(got[r], attention_row(Q[r], K[:L], V[:L], alpha)), r
+        assert (f == 0).sum() >= R // 2, f
+
+
 @triton.jit
 def _helper_probe(T, X, Q, QE, OM, OE, OR, OB, OF, NB: tl.constexpr):
     i = tl.arange(0, NB)

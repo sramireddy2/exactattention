@@ -75,6 +75,7 @@ if [ "${EA_PLAN:-gpu_check}" = "flash" ]; then
     "decode_b8|1500|$BF --batch 8 --keys 1024,4096,16384 --drafts 1 --modes tc,tcpv --out $OUT/decode_b8.md"
     "decode_b32|1500|$BF --batch 32 --keys 1024,4096,16384 --drafts 1 --modes tc,tcpv --out $OUT/decode_b32.md"
     "verify_t8|1500|$BF --batch 1,8 --keys 1024,4096,16384 --drafts 8 --modes tc,tcpv --out $OUT/verify_t8.md"
+    "profile_steps|1200|python scripts/profile_step.py --out $OUT/profile_steps.md"
   )
 fi
 
@@ -99,6 +100,7 @@ write_summary() {
     done
     echo; cat "$OUT"/bench_n*.md 2>/dev/null | grep -E '^\| [0-9]' | sed 's/^/bench: /'
     for f in "$OUT"/decode_*.md "$OUT"/verify_*.md; do [ -f "$f" ] && { echo; tail -n +5 "$f"; }; done
+    [ -f "$OUT/profile_steps.md" ] && { echo; tail -n +5 "$OUT/profile_steps.md"; }
   } > "$OUT/summary.md"
 }
 
