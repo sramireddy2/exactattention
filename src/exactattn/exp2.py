@@ -18,7 +18,7 @@ import math
 from functools import lru_cache
 
 import numpy as np
-from mpmath import iv
+from mpmath import iv, mp, mpf
 
 P = 24  # weight precision (FP24inf)
 
@@ -115,3 +115,81 @@ def exp2_weight_fast_np(t: np.ndarray, p: int = P) -> tuple[np.ndarray, np.ndarr
             qi, ei = exp2_weight_oracle(float(tf[i]), p)
             qf[i], ef[i] = qi, ei
     return q, e
+
+
+# ---------------------------------------------------------------------------
+# Integer exp2 for the GPU kernels (DESIGN D15)
+# ---------------------------------------------------------------------------
+#
+# The kernels compute w = RN24(2^t) without float64, which runs at 1/64 rate on consumer GPUs.
+# t = n + f with n = floor(t), and f is exact as F = f * 2^50 (an fp32 t with |t| >= 2^-27 is a
+# multiple of 2^-50; smaller |t| give w = 1). Then
+#     2^f = 2^(j/1024) * 2^r,   j = F >> 40,   r = (F mod 2^40) * 2^-50 < 2^-10,
+# with 2^(j/1024) from a 1024-entry table and 2^r = 1 + x + x^2/2 + x^3/6 + O(x^4), x = r ln 2,
+# in fixed point with int64 products of 32-bit factors (exact). Y approximates 2^f * 2^61 with
+# |Y - 2^f * 2^61| <= 13 * 2^19 (error analysis in DESIGN D15); EXP2_ERR rounds that up. The
+# 24-bit weight is round(Y / 2^38), certified when Y mod 2^38 is more than EXP2_ERR from 2^37.
+
+EXP2_TBITS = 10
+EXP2_ERR = 1 << 23
+
+
+def _ln2_scaled(shift: int) -> int:
+    with mp.workprec(200):
+        return int(mp.nint(mp.log(2) * (mpf(2) ** shift)))
+
+
+
+EXP2_L31 = _ln2_scaled(31)          # round(ln2 * 2^31) < 2^31
+
+
+@lru_cache(maxsize=1)
+def exp2_table() -> np.ndarray:
+    """T[j] = round(2^(j/1024) * 2^61), int64."""
+    with mp.workprec(200):
+        vals = [int(mp.nint(mp.power(2, mpf(j) / (1 << EXP2_TBITS)) * (mpf(2) ** 61)))
+                for j in range(1 << EXP2_TBITS)]
+    return np.array(vals, dtype=np.int64)
+
+
+def exp2_fix_np(F: np.ndarray) -> np.ndarray:
+    """Y ~ 2^(F / 2^50) * 2^61 for int64 0 <= F < 2^50: the kernels' integer arithmetic, op for op."""
+    F = np.asarray(F, dtype=np.int64)
+    T = exp2_table()
+    j = F >> 40
+    R = (F & ((1 << 40) - 1)) >> 8
+    X = (R * EXP2_L31) >> 31
+    X2 = (X * X) >> 42
+    X3 = (X2 * X) >> 42
+    P = X + (X2 >> 1) + X3 // 6
+    Tj = T[j]
+    return Tj + (((Tj >> 31) * P) >> 11)
+
+
+def exp2_split_np(t: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(n, F) with t = n + F * 2^-50 for fp32 t, using integer ops on its bits (|t| < 2^-27 maps to
+    (0, 0), whose weight 1 is RN24(2^t))."""
+    b = np.asarray(t, dtype=np.float32).view(np.int32).astype(np.int64)
+    ex = (b >> 23) & 0xFF
+    m = (b & 0x7FFFFF) | np.where(ex != 0, 0x800000, 0)
+    e = np.where(ex != 0, ex - 150, -149)
+    ms = np.where(b < 0, -m, m)
+    tiny = e < -50
+    sr = np.clip(-e, 0, 50)
+    n_neg = ms >> sr
+    F = (ms - (n_neg << sr)) << np.clip(50 + e, 0, 50)
+    n_pos = ms << np.clip(e, 0, 8)
+    n = np.where(e >= 0, n_pos, np.where(tiny, 0, n_neg))
+    F = np.where((e >= 0) | tiny, 0, F)
+    return n, F
+
+
+def exp2_weight_int_np(t: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Integer-only weights (M, E, risky) as the kernels compute them; risky entries are not
+    certified (the kernels recompute those tiles another way)."""
+    n, F = exp2_split_np(t)
+    Y = exp2_fix_np(F)
+    M = (Y + (1 << 37)) >> 38
+    risky = np.abs((Y & ((1 << 38) - 1)) - (1 << 37)) <= EXP2_ERR
+    carry = M == (1 << 24)
+    return np.where(carry, M >> 1, M), n - 23 + carry, risky

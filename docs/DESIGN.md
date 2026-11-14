@@ -371,6 +371,60 @@ bit. `test_row_block_size_does_not_change_bits` checks bits and flags at block_m
 against 16 in all three modes. The benchmark keeps a block_m = 16 config for tc and tcpv, both as
 an A/B on the GPU and as the same check at serving shapes.
 
+## D15. Weights without float64: integer exp2 with a proven bound (Q4)
+
+The per-key loop used float64 in three places: exp2 for every weight, the int64 → fp64
+conversion inside `_bitlen` (several per score), and `q · 2^qe` to build each fp32 logit. The
+RTX PRO 6000 runs fp64 at 1/64 of the fp32 rate, and libdevice's exp2 alone is about 20 fp64
+operations per weight.
+
+**Weights.** w = RN24(2^t) for fp32 t, in int64 arithmetic whose products all have 32-bit
+factors (`_exp2_weight`; `exp2.exp2_weight_int_np` is the same computation in numpy):
+
+1. Split t = n + f from its bits. An fp32 t with |t| ≥ 2^-27 is a multiple of 2^-50, so
+   F = f · 2^50 is an exact integer. For smaller |t|, RN24(2^t) = 1.
+2. 2^f = 2^(j/1024) · 2^r, with j = F >> 40 and r < 2^-10. A 1024-entry table holds
+   round(2^(j/1024) · 2^61). `test_exp2_table_is_correctly_rounded` checks every entry with
+   exact integers: (2T − 1)^1024 < 2^(1024·62 + j) < (2T + 1)^1024.
+3. 2^r − 1 = x + x²/2 + x³/6 + ρ, with x = r ln 2 < 2^-10.5 and ρ < 2^-46.7, in fixed point with
+   unit 2^-42.
+4. Y = T_j + T_j · P approximates 2^f · 2^61. M = round(Y / 2^38) is the 24-bit significand.
+
+**Error bound.** Absolute error on 2^f, in units of 2^-42:
+
+| Source | Bound |
+|---|---|
+| truncating r to 42 bits, ln 2 rounded to 31 bits, the floor in x | 2.70 |
+| floors in x², x³, /2, /6 | 2.01 |
+| dropped x⁴ term | 0.04 |
+| × T_j ≤ 2 | ×2 |
+| T_j's own rounding, T_j truncated to 31 bits for the product, last floor | 2.8 |
+
+The total is under 13 · 2^-42, i.e. 13 · 2^19 units of Y. `EXP2_ERR` = 2^23 (1.26× margin). A
+weight is certified when Y mod 2^38 is farther than that from 2^37: a half-integer of
+2^f · 2^23 can then not lie between Y and the true value, and 2^f is irrational for f ≠ 0, so
+there are no ties. Over random f plus every table boundary, the worst measured error is
+2^21.9 units, below the bound of 2^22.7 (`test_exp2_fix_error_bound`). This is a proof, not an
+assumption about a libm, unlike the old path (D7).
+
+About 2^-14 of weights fall within the margin. Their tile is recomputed with the old float64
+exp2, and a weight that path cannot certify flags its row as before. At 2 × 32 weights per
+tile, about 0.4% of tiles take that branch.
+
+**Other float64 removed from the per-key loop:**
+
+- `_bitlen` converts the nonzero 32-bit half through uint32 → fp32, which runs at full rate.
+  The fp32 exponent is the bit length, or one too many after a round-up, which is detected and
+  corrected. `test_kernel_integer_helpers_match_numpy` checks every 2^k and 2^k − 1.
+- fp32 logits and the combine kernel's outputs are built from their bits (`_f32_bits`).
+- The score truncation bound adds per-key and per-row integer ceilings instead of rounding a
+  float64 sum per element. The new bound is at most one unit looser, still an upper bound.
+
+What float64 is left is per row or per key: q's L1 norm, and `_l1_ceil` on (N,) per tile.
+`launch(exp2="f64")` keeps the old weight path. `test_integer_exp2_equals_float64_exp2` checks
+that both paths give the same bits, and that the integer path flags no row the float64 path
+certifies. The benchmark keeps an f64 config as the GPU A/B.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
@@ -385,5 +439,6 @@ an A/B on the GPU and as the same check at serving shapes.
   exponents vary per key and per element. Converting a V tile to block fixed point loses
   bits for small elements; that loss is counted as truncation error and certified. How many
   slices does it take at a given fallback rate?
-- **Q4. Fast certified exp2 in fp32-only arithmetic,** for GPUs with slow fp64. There are
-  about 1.07e9 fp32 inputs in [0, 1), so the implementation can be tested exhaustively on CPU.
+- **Q4. Fast certified exp2 without fp64.** Answered in D15 with integer fixed point and a
+  proven bound, not fp32. Open: whether the tile fallback rate (about 2^-14 of weights) matters
+  at long context, and whether a 4096-entry table (4× tighter bound) is worth its cache space.

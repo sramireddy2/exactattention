@@ -18,7 +18,9 @@ import pytest  # noqa: E402
 triton = pytest.importorskip("triton")
 
 from exactattn import attention_row, default_alpha  # noqa: E402
-from exactattn.triton_kernels import attention_triton  # noqa: E402
+import triton.language as tl  # noqa: E402
+
+from exactattn.triton_kernels import _bitlen, _exp2_weight, _f32_bits, attention_triton  # noqa: E402
 from gen import KINDS, bf16  # noqa: E402
 
 
@@ -322,3 +324,67 @@ def test_row_block_size_does_not_change_bits(mode):
     for r in np.flatnonzero(f_ref == 0):
         L = int(kv_len[r])
         assert np.array_equal(ref[r], attention_row(Q[r], K[:L], V[:L], alpha)), r
+
+
+@triton.jit
+def _helper_probe(T, X, Q, QE, OM, OE, OR, OB, OF, NB: tl.constexpr):
+    i = tl.arange(0, NB)
+    m, e, r = _exp2_weight(tl.load(T + i), X)
+    tl.store(OM + i, m)
+    tl.store(OE + i, e)
+    tl.store(OR + i, r.to(tl.int32))
+    q = tl.load(Q + i)
+    tl.store(OB + i, _bitlen(q))
+    qe = tl.load(QE + i)
+    tl.store(OF + i, _f32_bits(q & 0xFFFFFF, qe, (q & 1) != 0, qe > 104))
+
+
+def test_kernel_integer_helpers_match_numpy():
+    """_exp2_weight equals exp2.exp2_weight_int_np (M, E and risky, bit for bit), _bitlen is exact,
+    and _f32_bits builds the same fp32 as numpy."""
+    import torch
+
+    from exactattn.exp2 import exp2_weight_int_np
+    from exactattn.triton_kernels import _exp2_table_dev
+
+    rng = np.random.default_rng(11)
+    NB = 4096
+    ts = np.float32(np.concatenate([rng.uniform(-60, 60, NB - 96), rng.uniform(-1e-6, 1e-6, 64),
+                                    np.float32(2.0) ** -np.arange(20, 52)]))
+    pw = np.concatenate([np.int64(1) << np.arange(63), (np.int64(1) << np.arange(1, 63)) - 1])
+    qs = np.concatenate([pw, rng.integers(0, 1 << 62, NB - len(pw) - 1), [0]]).astype(np.int64)
+    q24 = qs & 0xFFFFFF
+    qes = np.where(q24 >= 1 << 23, rng.integers(-149, 106, NB), -149).astype(np.int64)
+    dev = torch.device(DEVICE)
+    outs = [torch.empty(NB, dtype=dt, device=dev) for dt in (torch.int64, torch.int64, torch.int32, torch.int64, torch.int32)]
+    _helper_probe[(1,)](torch.from_numpy(ts).to(dev), _exp2_table_dev(dev), torch.from_numpy(qs).to(dev),
+                torch.from_numpy(qes).to(dev), *outs, NB=NB)
+    M, E, R, B, Fb = [o.cpu().numpy() for o in outs]
+    m_ref, e_ref, r_ref = exp2_weight_int_np(ts)
+    assert np.array_equal(M, m_ref) and np.array_equal(E, e_ref) and np.array_equal(R != 0, r_ref)
+    assert np.array_equal(B, np.array([int(q).bit_length() for q in qs]))
+    with np.errstate(over="ignore"):
+        ref = (q24.astype(np.float64) * np.exp2(qes.astype(np.float64))).astype(np.float32)
+    ref = np.where((qs & 1) != 0, -ref, ref)
+    assert np.array_equal(Fb, ref.view(np.int32))
+
+
+@pytest.mark.parametrize("mode", ["int64", "tc", "tcpv"])
+def test_integer_exp2_equals_float64_exp2(mode):
+    """Integer exp2 (default) and float64 exp2 give the same bits; integer exp2 certifies at
+    least as many rows (its uncertain weights fall back to float64)."""
+    rng = np.random.default_rng(zlib.crc32(f"exp2/{mode}".encode()))
+    d, dv, R, n = 64, 32, 16, 120
+    Q, K, V = bf16(rng, (R, d), "outlier"), bf16(rng, (n, d), "normal"), bf16(rng, (n, dv), "normal")
+    kv_len = rng.integers(1, n + 1, size=R)
+    alpha = default_alpha(d)
+    kw = dict(splits=2, block_n=16, block_dv=16, device=DEVICE, fallback=False,
+              use_tc=mode != "int64", use_tc_pv=mode == "tcpv")
+    a, fa = attention_triton(Q, K, V, alpha, kv_len, exp2="int", **kw)
+    b, fb = attention_triton(Q, K, V, alpha, kv_len, exp2="f64", **kw)
+    assert not (fa & ~fb).any()
+    ok = (fa == 0) & (fb == 0)
+    assert np.array_equal(a[ok], b[ok])
+    for r in np.flatnonzero(fa == 0):
+        L = int(kv_len[r])
+        assert np.array_equal(a[r], attention_row(Q[r], K[:L], V[:L], alpha)), r

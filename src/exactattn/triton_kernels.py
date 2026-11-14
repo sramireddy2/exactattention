@@ -14,10 +14,11 @@ Two kernels, in the FlashDecoding shape:
 Rows the kernel cannot certify are flagged, and the host recomputes them exactly.
 
 Tested on CPU through TRITON_INTERPRET=1 against the exact reference. Same algorithm as
-torch_impl.py (DESIGN.md), with one change: the exp2 margin check is tighter (2^-26) and
-assumes the device's float64 exp2 has relative error below 2^-50. That holds for CUDA
-libdevice (1 ulp), Intel SYCL (<= 4 ulp) and numpy. DESIGN Q4 tracks replacing it with our
-own exp2.
+torch_impl.py (DESIGN.md). The weights w = RN24(2^t) use integer fixed-point exp2 with a proven
+error bound (exp2.py, DESIGN D15), so the per-key loop needs no float64, which consumer GPUs run
+at 1/64 rate. A tile with a weight that integer exp2 cannot certify is recomputed with float64
+exp2 (margin 2^-26, assuming relative error below 2^-50: CUDA libdevice is within 1 ulp, Intel
+SYCL within 4 ulp, numpy too); exp2="f64" uses that path for every tile.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ import torch
 import triton
 import triton.language as tl
 
+from .exp2 import EXP2_ERR, EXP2_L31, exp2_table
 from .formats import decode_fp32
 from .reference import attention_row
 from .slices import slice_rows
@@ -34,6 +36,8 @@ from .slices import slice_rows
 NEG = tl.constexpr(-(1 << 60))  # "empty" sentinel for reference exponents
 _LAST_DEBUG: dict = {}  # last call's intermediate buffers, for debugging
 SCORE_FS = 63 - 1 - 7  # d <= 128
+_L31 = tl.constexpr(EXP2_L31)
+_EXP2_ERR = tl.constexpr(EXP2_ERR)
 
 
 # ---------------------------------------------------------------------------
@@ -42,13 +46,26 @@ SCORE_FS = 63 - 1 - 7  # d <= 128
 
 @triton.jit
 def _bitlen(x):
-    """Exact bit length of int64 x >= 0 (0 -> 0)."""
-    f = x.to(tl.float64)
-    e = ((f.to(tl.int64, bitcast=True) >> 52) & 0x7FF) - 1022
-    b = tl.where(x > 0, e, 0)
-    sb = tl.minimum(tl.maximum(b - 1, 0), 62)
-    b = tl.where((x > 0) & ((x >> sb) == 0), b - 1, b)
-    return b
+    """Exact bit length of int64 x >= 0 (0 -> 0). Uses a uint32 -> fp32 conversion of the
+    nonzero 32-bit half (full rate; no float64): its exponent is the bit length, or one more if
+    rounding to 24 bits carried into the next power of two, which the last step undoes."""
+    hi = x >> 32
+    v = tl.where(hi > 0, hi, x & 0xFFFFFFFF)                           # < 2^32
+    f = v.to(tl.uint32).to(tl.float32)
+    e = ((f.to(tl.int32, bitcast=True) >> 23) & 0xFF) - 126
+    b = tl.where(v > 0, e, 0).to(tl.int64)
+    sb = tl.minimum(tl.maximum(b - 1, 0), 32)                         # v < 2^32 may round up to 2^32
+    b = tl.where((v > 0) & ((v >> sb) == 0), b - 1, b)
+    return b + tl.where(hi > 0, 32, 0)
+
+
+@triton.jit
+def _f32_bits(q, qe, neg, ovf):
+    """int32 bits of the fp32 (-1)^neg * q * 2^qe, with q < 2^24 and q >= 2^23 unless qe == -149
+    or q == 0 (the form RN32 produces). ovf gives inf. Exact, no float64."""
+    mag = tl.where(q == 0, 0, ((qe + 149) << 23) + q)
+    mag = tl.where(ovf & (q != 0), 0x7F800000, mag)
+    return (mag | (neg.to(tl.int64) << 31)).to(tl.int32)
 
 
 @triton.jit
@@ -122,7 +139,7 @@ def _rn32_product(am, ae, acc, base):
     qe = tl.where(carry, qe + 1, qe)
     q = tl.where(bl == 0, 0, q)
     overflow = (bl != 0) & (qe + _bitlen(q) - 1 > 127)
-    t = (q.to(tl.float64) * tl.exp2(qe.to(tl.float64))).to(tl.float32) * sgn.to(tl.float32)
+    t = _f32_bits(q, qe, sgn < 0, overflow).to(tl.float32, bitcast=True)
     return t, overflow
 
 
@@ -264,14 +281,23 @@ def _slice_q(qm, qe, SQ: tl.constexpr, PACK: tl.constexpr, BM: tl.constexpr, D: 
 
 
 @triton.jit
-def _tc_logits(q0, q1, q2, q3, qlsb, ql1s, qlost, KX, nn, nmask, NKEYS, KLSB, KL1S, KLOST,
+def _l1_ceil(l1s):
+    """(ceil(l1s * (1 + 2^-40)) + 1 or 0, too big): an integer upper bound on a scaled L1 norm."""
+    big = l1s > 2.0 ** 59
+    e = tl.where(l1s > 0, tl.ceil(tl.minimum(l1s, 2.0 ** 59) * (1.0 + 2.0 ** -40)) + 1.0, 0.0).to(tl.int64)
+    return e, big
+
+
+@triton.jit
+def _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nmask, NKEYS, KLSB, KL1S, KLOST,
                AM, AE, D: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr, PACK: tl.constexpr,
                BM: tl.constexpr):
     """Certified t = RN32(alpha * q.k) from int8 slices (slices.py) on tensor cores.
 
     q.k = 2^(qlsb + klsb) * (sum_{s,t} 2^(7(s+t)) Q[s].K[t] + truncation), where each Q[s].K[t] is
     an exact int8 x int8 -> int32 MMA (PACK q digits share one MMA, _q_group). The truncation
-    bound comes from per-row L1 norms, stored pre-scaled (l1 * 2^-lsb). Returns (t, uncertified,
+    bound comes from per-row L1 norms, stored pre-scaled (l1 * 2^-lsb); q's arrives as an
+    integer ceiling (qerr, qbig from _l1_ceil). Returns (t, uncertified,
     key has NaN/inf)."""
     NG: tl.constexpr = (SQ + PACK - 1) // PACK
     dd = tl.arange(0, D)
@@ -290,10 +316,12 @@ def _tc_logits(q0, q1, q2, q3, qlsb, ql1s, qlost, KX, nn, nmask, NKEYS, KLSB, KL
     kw = tl.load(KLOST + nn, mask=nmask, other=0)
     klost = (kw & 1) != 0
     kbad = (kw & 2) != 0
-    errf = tl.where(qlost[:, None], kl1s[None, :], 0.0) + tl.where(klost[None, :], ql1s[:, None], 0.0)
-    big = errf > 2.0 ** 60
-    err = tl.where(errf > 0, tl.ceil(tl.minimum(errf, 2.0 ** 60) * (1.0 + 2.0 ** -40)) + 1.0, 0.0).to(tl.int64)
+    # Truncation bound qlost*|K|_1 + klost*|q|_1 (pre-scaled), as the sum of per-key and per-row
+    # integer ceilings, so the (row, key) work is integer: float64 only on (N,) per tile.
+    kerr, kbig = _l1_ceil(kl1s)
+    err = tl.where(qlost[:, None], kerr[None, :], 0) + tl.where(klost[None, :], qerr[:, None], 0)
     base = qlsb[:, None] + klsb[None, :]
+    big = (qlost[:, None] & kbig[None, :]) | (klost[None, :] & qbig[:, None])
     big = big | ((tl.abs(acc) + err) >= (1 << 62))
     t_lo, ov1 = _rn32_product(AM, AE, acc - err, base)
     t_hi, ov2 = _rn32_product(AM, AE, acc + err, base)
@@ -389,6 +417,63 @@ def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nmask, cc, NKEYS, FN, DV: tl.conste
 
 
 # ---------------------------------------------------------------------------
+# Weights w = RN24(2^t)
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _exp2_weight(t, EXP2T):
+    """(M, E, risky): w = M * 2^E = RN24(2^t), M in [2^23, 2^24), in integer arithmetic
+    (exp2.exp2_weight_int_np is the same computation in numpy; DESIGN D15 has the error bound).
+    risky marks weights it cannot certify."""
+    b = t.to(tl.int32, bitcast=True)
+    ex = (b >> 23) & 0xFF
+    m = (b & 0x7FFFFF) | tl.where(ex != 0, 0x800000, 0)
+    e = tl.where(ex != 0, ex - 150, -149).to(tl.int64)
+    ms = tl.where(b < 0, -m, m).to(tl.int64)                           # t = ms * 2^e
+    tiny = e < -50                                                     # |t| < 2^-27: w = 1
+    sr = tl.minimum(tl.maximum(-e, 0), 50)
+    n_neg = ms >> sr                                                   # floor(t)
+    F = (ms - (n_neg << sr)) << tl.minimum(tl.maximum(50 + e, 0), 50)  # frac(t) * 2^50, exact
+    n_pos = ms << tl.minimum(tl.maximum(e, 0), 8)
+    n = tl.where(e >= 0, n_pos, tl.where(tiny, 0, n_neg))
+    F = tl.where((e >= 0) | tiny, 0, F)
+    j = F >> 40
+    R = (F & 0xFFFFFFFFFF) >> 8                                        # r * 2^42, r < 2^-10
+    X = (R * _L31) >> 31                                               # x = r ln2, * 2^42
+    X2 = (X * X) >> 42
+    X3 = (X2 * X) >> 42
+    P = X + (X2 >> 1) + X3 // 6                                        # (2^r - 1) * 2^42
+    Tj = tl.load(EXP2T + j)                                            # 2^(j/1024) * 2^61
+    Y = Tj + (((Tj >> 31) * P) >> 11)                                  # 2^f * 2^61
+    M = (Y + (1 << 37)) >> 38
+    risky = tl.abs((Y & ((1 << 38) - 1)) - (1 << 37)) <= _EXP2_ERR
+    carry = M == (1 << 24)
+    M = tl.where(carry, M >> 1, M)
+    return M, n - 23 + carry.to(tl.int64), risky
+
+
+@triton.jit
+def _exp2_weight_f64(t, EXP2_MARGIN: tl.constexpr):
+    """The same weights from float64 exp2 (assumes relative error below 2^-50)."""
+    td = t.to(tl.float64)
+    nfl = tl.floor(td)
+    f = td - nfl
+    scaled = tl.exp2(f) * 8388608.0
+    fl = tl.floor(scaled)
+    frac = scaled - fl
+    Mw = fl.to(tl.int64) + (frac >= 0.5).to(tl.int64)
+    Ew = nfl.to(tl.int64) - 23
+    carry = Mw == (1 << 24)
+    Mw = tl.where(carry, Mw >> 1, Mw)
+    Ew = tl.where(carry, Ew + 1, Ew)
+    exact = f == 0.0
+    Mw = tl.where(exact, 1 << 23, Mw)
+    Ew = tl.where(exact, nfl.to(tl.int64) - 23, Ew)
+    risky = (~exact) & (tl.abs(frac - 0.5) < EXP2_MARGIN)
+    return Mw, Ew, risky
+
+
+# ---------------------------------------------------------------------------
 # Kernels
 # ---------------------------------------------------------------------------
 
@@ -402,7 +487,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                      BLOCK_DV: tl.constexpr, FS: tl.constexpr, EXP2_MARGIN: tl.constexpr,
                      USE_TC: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr, TC_FALLBACK: tl.constexpr,
                      USE_TC_PV: tl.constexpr, SW: tl.constexpr, SV: tl.constexpr, ANCH: tl.constexpr,
-                     RERUN: tl.constexpr, PACK: tl.constexpr):
+                     RERUN: tl.constexpr, PACK: tl.constexpr, EXP2T, EXP2_INT: tl.constexpr):
     # Segments: G independent problems (e.g. sequence x KV head), each with R_SEG query rows
     # attending its own NK_SEG keys. Rows and keys are stored segment after segment, so
     # ROWS = G * R_SEG and NKEYS = G * NK_SEG. Each program handles one segment's row block.
@@ -424,6 +509,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
     flag = tl.max(qbad.to(tl.int32), axis=1)
     if USE_TC:
         q0, q1, q2, q3, qlsb, ql1s, qlost = _slice_q(qm, qe, SQ, PACK, BLOCK_M, D)
+        qerr, qbig = _l1_ceil(ql1s)
     PRr = tl.full((BLOCK_M,), NEG, tl.int64)
     PZr = tl.zeros((BLOCK_M,), tl.int64)
     PZEr = tl.zeros((BLOCK_M,), tl.int64)
@@ -446,7 +532,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
             # Tensor cores: int8 slice products, certified. The bf16 K tile is read and decoded
             # only for tiles that contain an uncertified score (windowed recompute); NaN/inf
             # keys come from a flag made at cache write.
-            t, unc, kbad = _tc_logits(q0, q1, q2, q3, qlsb, ql1s, qlost, KX, kb0 + nn, nn < kmax, NKEYS,
+            t, unc, kbad = _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, kb0 + nn, nn < kmax, NKEYS,
                                       KLSB, KL1S, KLOST, AM, AE, D, SQ, SK, PACK, BLOCK_M)
             flag = tl.maximum(flag, tl.max((vis & kbad[None, :]).to(tl.int32), axis=1))
             if TC_FALLBACK and tl.max(tl.max((unc & vis).to(tl.int32), axis=1), axis=0) > 0:
@@ -461,22 +547,17 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
             flag = tl.maximum(flag, tl.max((vis & (tl.max(kbad.to(tl.int32), axis=1) != 0)[None, :]).to(tl.int32), axis=1))
             t, unc = _windowed_logits(qm, qe, km, ke, AM, AE, FS)
         # ---- weights ----
-        td = t.to(tl.float64)
-        nfl = tl.floor(td)
-        f = td - nfl
-        scaled = tl.exp2(f) * 8388608.0
-        fl = tl.floor(scaled)
-        frac = scaled - fl
-        Mw = fl.to(tl.int64) + (frac >= 0.5).to(tl.int64)
-        Ew = nfl.to(tl.int64) - 23
-        carry = Mw == (1 << 24)
-        Mw = tl.where(carry, Mw >> 1, Mw)
-        Ew = tl.where(carry, Ew + 1, Ew)
-        exact = f == 0.0
-        Mw = tl.where(exact, 1 << 23, Mw)
-        Ew = tl.where(exact, nfl.to(tl.int64) - 23, Ew)
-        risky = (~exact) & (tl.abs(frac - 0.5) < EXP2_MARGIN)
-        unc = unc | risky | (tl.abs(td) >= 1073741824.0)
+        if EXP2_INT:
+            Mw, Ew, risky = _exp2_weight(t, EXP2T)
+            if tl.max(tl.max((risky & vis).to(tl.int32), axis=1), axis=0) > 0:
+                # Rare (about 2^-14 of weights): float64 exp2 for this tile.
+                Mw2, Ew2, risky2 = _exp2_weight_f64(t, EXP2_MARGIN)
+                Mw = tl.where(risky, Mw2, Mw)
+                Ew = tl.where(risky, Ew2, Ew)
+                risky = risky & risky2
+        else:
+            Mw, Ew, risky = _exp2_weight_f64(t, EXP2_MARGIN)
+        unc = unc | risky | (tl.abs(t) >= 1073741824.0)
         flag = tl.maximum(flag, tl.max((vis & unc).to(tl.int32), axis=1))
         # ---- tile partial ----
         top = tl.where(vis, Ew + 23, NEG)
@@ -596,9 +677,11 @@ def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, O
     same = ((ql == 0) & (qh == 0)) | ((ql == qh) & (qel == qeh) & (sl == shh)) | (~chan)
     flag = tl.maximum(flag, (has & (tl.min(same.to(tl.int32), axis=1) == 0)).to(tl.int32))
     flag = tl.maximum(flag, (has & (Zlo <= 0)).to(tl.int32))
-    val = (ql.to(tl.float64) * tl.exp2(qel.to(tl.float64))) * sl.to(tl.float64)
-    val = tl.where(chan & has[:, None] & (ql != 0), val, 0.0).to(tl.float32)
-    bits = val.to(tl.int32, bitcast=True)
+    # fp32 bits of sl * ql * 2^qel (ql < 2^P, normalized unless qel == QMIN), built exactly.
+    q24 = ql << (24 - P)
+    qe24 = qel - (24 - P)
+    bits = _f32_bits(q24, qe24, Nlo < 0, qe24 > 104)
+    bits = tl.where(chan & has[:, None] & (ql != 0), bits, 0)
     if not OUT_FP32:
         bits = (bits >> 16) & 0xFFFF
     tl.store(OUT + rows[:, None] * DV + cc[None, :], bits, mask=wmask[:, None])
@@ -711,10 +794,21 @@ def tc_v_slices(v_bits: np.ndarray, S: int, dev) -> list:
             torch.from_numpy(np.ascontiguousarray(w)).to(dev)]
 
 
+_EXP2_TABLES: dict = {}
+
+
+def _exp2_table_dev(dev):
+    """exp2.exp2_table() on the device, made once per device (outside any graph capture)."""
+    key = str(dev)
+    if key not in _EXP2_TABLES:
+        _EXP2_TABLES[key] = torch.from_numpy(exp2_table()).to(dev)
+    return _EXP2_TABLES[key]
+
+
 def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int = 4, block_m: int | None = None,
            block_n: int = 16, block_dv: int = 32, merge_order=None, exp2_margin: float = 2.0 ** -26,
            q_tc=None, k_tc=None, tc_fallback: bool = True, v_tc=None, sw: int = 5, pv_tier2: bool = True,
-           sq: int = 3, num_warps: int = 4):
+           sq: int = 3, num_warps: int = 4, exp2: str = "int"):
     """Device-level launch with no host transfers and no sync.
 
     Qt (R, d), Kt (n, d), Vt (n, dv) are int16 views of bf16 on the device; KL (R,) is int32.
@@ -727,7 +821,9 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     uncertified are recomputed on the device with int64 P·V (DESIGN D12). block_m (query rows per
     program, a power of two) defaults to the segment's row count, capped at 16: a decode step with
     2 query heads per KV head then runs 2-row blocks, and the tensor-core paths fill the 16 MMA rows
-    with digit slices instead of padding (DESIGN D14). Returns (OUT int32 (R, dv) or
+    with digit slices instead of padding (DESIGN D14). exp2="int" computes weights with integer
+    exp2 and float64 only for tiles it cannot certify (DESIGN D15); "f64" uses float64 throughout.
+    Returns (OUT int32 (R, dv) or
     (G, R, dv), split_flags, combine_flags), all on the device; flags are per flattened row."""
     batched = Qt.dim() == 3
     G = Qt.shape[0] if batched else 1
@@ -742,6 +838,8 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
         block_m = min(16, triton.next_power_of_2(max(1, r_seg)))
     assert block_m >= 1 and (block_m & (block_m - 1)) == 0, "block_m must be a power of two"
     pack = max(1, 16 // block_m)   # digit slots per MMA: PACK * block_m >= 16 rows
+    assert exp2 in ("int", "f64")
+    exp2t = _exp2_table_dev(Qt.device)
     dev = Qt.device
     key_log2 = max(1, int(np.ceil(np.log2(max(2, maxlen)))))
     fz = fn = 64 - 3 - key_log2
@@ -794,7 +892,7 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
                                BLOCK_M=block_m, BLOCK_N=bn, BLOCK_DV=block_dv, FS=SCORE_FS,
                                EXP2_MARGIN=exp2_margin, USE_TC=use_tc, SQ=sq, SK=sk, TC_FALLBACK=tc_fallback,
                                USE_TC_PV=pv, SW=sw_, SV=sv_, ANCH=anch_, RERUN=rerun, PACK=pack,
-                               num_warps=num_warps)
+                               EXP2T=exp2t, EXP2_INT=(exp2 == "int"), num_warps=num_warps)
 
     ck = split(z32, False, block_n, use_tc_pv, vtc, sw, sv, anch)
     # Registers and spills of the compiled split kernel (None under the CPU interpreter).
@@ -843,7 +941,7 @@ def attention_triton(q_bits, k_bits, v_bits, alpha, kv_len, out: str = "bf16", s
                      merge_order=None, device: str = "cpu", fallback: bool = True,
                      exp2_margin: float = 2.0 ** -26, use_tc: bool = False, sq: int = 3, sk: int = 4,
                      k_slices=None, tc_fallback: bool = True, use_tc_pv: bool = False, sw: int = 5,
-                     sv: int = 3, pv_tier2: bool = True):
+                     sv: int = 3, pv_tier2: bool = True, exp2: str = "int"):
     """numpy-level API. q: (R, d), k: (n, d), v: (n, dv) bf16 bits (uint16). Row r attends keys
     [0, kv_len[r]): causal, decode, prefill and chunked prefill all have this shape.
     Returns (out, flags); flagged rows are recomputed exactly when fallback=True."""
@@ -866,7 +964,8 @@ def attention_triton(q_bits, k_bits, v_bits, alpha, kv_len, out: str = "bf16", s
                          int(kv_len.max(initial=0)), alpha, out=out, splits=splits, block_m=block_m,
                          block_n=block_n, block_dv=block_dv, merge_order=merge_order, exp2_margin=exp2_margin,
                          sq=sq, k_tc=k_tc, tc_fallback=tc_fallback,
-                         v_tc=tc_v_slices(v_bits, sv, dev) if use_tc_pv else None, sw=sw, pv_tier2=pv_tier2)
+                         v_tc=tc_v_slices(v_bits, sv, dev) if use_tc_pv else None, sw=sw, pv_tier2=pv_tier2,
+                         exp2=exp2)
     flags = np.maximum(FL.amax(dim=(0, 2)).cpu().numpy(), OF.amax(dim=1).cpu().numpy()).astype(np.uint8)
     o = OUT.cpu().numpy()
     res = (o.astype(np.uint32).view(np.float32) if out == "fp32" else (o & 0xFFFF).astype(np.uint16)).copy()
