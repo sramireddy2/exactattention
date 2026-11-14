@@ -295,6 +295,54 @@ Not covered: uncertified *scores* after the windowed int64 recompute, and uncert
 (the exp2 margin). Both have been 0 on real rows. A wider-logit spec (v1) would be the next tier
 for them.
 
+## D13. First speed numbers, and the first optimization pass
+
+**Baseline.** Run 1112-flash: RTX PRO 6000 Blackwell, 16 query heads over 8 KV heads, d = 128,
+CUDA graphs. FlashInfer's JIT build failed in that run (fixed since), so FlashAttention-2
+through PyTorch SDPA is the reference.
+
+| B | n | FA2 (SDPA) | exact int64 | exact tc | exact tcpv |
+|---|---|---|---|---|---|
+| 1 | 1K | 0.011 ms | 20.4 ms | 2.71 ms | 2.78 ms |
+| 1 | 16K | 0.035 ms | 322 ms | 32.8 ms | 10.1 ms |
+| 1 | 64K | 0.193 ms | 1268 ms | 128 ms | 24.8 ms |
+| 8 | 16K | 0.363 ms | 2507 ms | 490 ms | 440 ms |
+| 32 | 4K | 0.361 ms | 2470 ms | 425 ms | 339 ms |
+
+Every row certified by these runs was correct (the fp32 gate never fired). The exact kernels are
+100–900× slower, which is far too slow to be memory-bound. The B = 1, n = 16K tcpv step, for
+example, works out to hundreds of microseconds per 32-key tile per program. Suspects, from the
+code:
+
+1. **A full bf16 decode of every K tile, on every path.** That is a (32, 128) int64 mantissa
+   and exponent pair, about 64 KB live per program, far beyond the register file, so it likely
+   spills. The tensor-core paths only needed it for NaN/inf checks and for the rare windowed
+   recompute. The same applies to V on the P·V tensor-core path.
+2. **Per-step q slicing as about 40 small torch kernels.** At a few µs each in a graph, that
+   alone is a floor above FA2's whole step.
+3. **Every channel block recomputes every score.** With block_dv = 32 and d_v = 128 the score
+   path runs 4 times.
+4. **Per-element fp64 in the score error bound** (`l1 * 2^-lsb` per element).
+5. **Padded rows.** Decode has only 2 rows per segment (GQA group 2), but `tl.dot` needs
+   M ≥ 16, so 7/8 of the elementwise (row, key) work is padding. Not addressed yet.
+
+**This pass:**
+
+- K slices carry a per-key NaN/inf bit (bit 1 of `KLOST`), and V slices carry a per-element one
+  (bit 1 of `VLOST`). The tensor-core paths no longer load or decode bf16 K or V. bf16 K is read
+  only inside the windowed recompute, for tiles that have an uncertified score. The slicers
+  zero NaN/inf elements before slicing, since those rows are flagged anyway.
+- q is sliced inside the split kernel, once per program, from the bf16 rows it already loads
+  (`_slice_q`, same digits as the numpy slicer). A decode step is now the layout copy, the split
+  kernel, the combine kernel and tier 2's small ops.
+- K slices store `l1 * 2^-lsb` (an exact power-of-two scaling), and q's is computed once per
+  program, so the per-element bound is two selects and an add.
+- `launch` takes `num_warps`. The benchmark times each exact mode over (block_dv, num_warps)
+  configs, including block_dv = 128, which computes each score once. It reports the fastest
+  config with the split kernel's register and spill counts. It also checks that every config
+  gives the same bits on rows both certify, which SPEC §5.3 requires.
+- `test_nan_inf_inputs_are_flagged` covers the new NaN/inf path in all three modes.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model

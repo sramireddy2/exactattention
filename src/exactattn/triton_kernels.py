@@ -193,28 +193,66 @@ def _windowed_logits(qm, qe, km, ke, AM, AE, FS: tl.constexpr):
 
 
 @triton.jit
-def _tc_logits(QX, KX, rows, rmask, nn, nmask, ROWS, NKEYS, QLSB, QL1, QLOST, KLSB, KL1, KLOST,
+def _q_digit(fix, neg, s: tl.constexpr):
+    d = (fix >> (7 * s)) & 127
+    return tl.where(neg, -d, d).to(tl.int8)
+
+
+@triton.jit
+def _slice_q(qm, qe, SQ: tl.constexpr):
+    """slices.slice_rows for the program's q rows, in registers (same digits as the numpy and
+    torch slicers). Done once per program, so a decode step needs no separate slicing launches.
+    Returns 4 digit tensors (unused ones are zeros), lsb, l1 * 2^-lsb, lost."""
+    am = tl.abs(qm)
+    nz = am != 0
+    lead = tl.where(nz, qe + _bitlen(am) - 1, NEG)
+    E = tl.max(lead, axis=1)
+    lsb = E + 1 - 7 * SQ
+    fix, lost = _floor_shift(am, qe - lsb[:, None])
+    lost = lost & nz
+    neg = qm < 0
+    z = tl.zeros(qm.shape, tl.int8)
+    q0 = _q_digit(fix, neg, 0)
+    q1 = z
+    q2 = z
+    q3 = z
+    if SQ > 1:
+        q1 = _q_digit(fix, neg, 1)
+    if SQ > 2:
+        q2 = _q_digit(fix, neg, 2)
+    if SQ > 3:
+        q3 = _q_digit(fix, neg, 3)
+    l1 = tl.sum(am.to(tl.float64) * tl.exp2(qe.to(tl.float64)), axis=1) * (1.0 + 2.0 ** -40)
+    l1s = tl.where(l1 > 0, l1 * tl.exp2(-tl.minimum(tl.maximum(lsb, -2000), 2000).to(tl.float64)), 0.0)
+    qlost = tl.max(lost.to(tl.int32), axis=1) != 0
+    return q0, q1, q2, q3, lsb, l1s, qlost
+
+
+@triton.jit
+def _tc_logits(q0, q1, q2, q3, qlsb, ql1s, qlost, KX, nn, nmask, NKEYS, KLSB, KL1S, KLOST,
                AM, AE, D: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr):
     """Certified t = RN32(alpha * q.k) from int8 slices (slices.py) on tensor cores.
 
     q.k = 2^(qlsb + klsb) * (sum_{s,t} 2^(7(s+t)) Q[s].K[t] + truncation), where each Q[s].K[t] is
-    an exact int8 x int8 -> int32 MMA. The truncation bound comes from per-row L1 norms."""
+    an exact int8 x int8 -> int32 MMA. The truncation bound comes from per-row L1 norms, stored
+    pre-scaled (l1 * 2^-lsb). Returns (t, uncertified, key has NaN/inf)."""
     dd = tl.arange(0, D)
-    acc = tl.zeros((rows.shape[0], nn.shape[0]), tl.int64)
+    acc = tl.zeros((q0.shape[0], nn.shape[0]), tl.int64)
     for t_ in tl.static_range(SK):
-        kt = tl.load(KX + (t_ * NKEYS + nn[:, None]) * D + dd[None, :], mask=nmask[:, None], other=0)
-        for s_ in tl.static_range(SQ):
-            qs = tl.load(QX + (s_ * ROWS + rows[:, None]) * D + dd[None, :], mask=rmask[:, None], other=0)
-            dot = tl.dot(qs, tl.trans(kt), out_dtype=tl.int32)            # (M, N), exact
-            acc += dot.to(tl.int64) << (7 * (s_ + t_))
-    qlsb = tl.load(QLSB + rows, mask=rmask, other=0)
-    ql1 = tl.load(QL1 + rows, mask=rmask, other=0.0)
-    qlost = tl.load(QLOST + rows, mask=rmask, other=0) != 0
+        kt = tl.trans(tl.load(KX + (t_ * NKEYS + nn[:, None]) * D + dd[None, :], mask=nmask[:, None], other=0))
+        acc += tl.dot(q0, kt, out_dtype=tl.int32).to(tl.int64) << (7 * t_)
+        if SQ > 1:
+            acc += tl.dot(q1, kt, out_dtype=tl.int32).to(tl.int64) << (7 * (t_ + 1))
+        if SQ > 2:
+            acc += tl.dot(q2, kt, out_dtype=tl.int32).to(tl.int64) << (7 * (t_ + 2))
+        if SQ > 3:
+            acc += tl.dot(q3, kt, out_dtype=tl.int32).to(tl.int64) << (7 * (t_ + 3))
     klsb = tl.load(KLSB + nn, mask=nmask, other=0)
-    kl1 = tl.load(KL1 + nn, mask=nmask, other=0.0)
-    klost = tl.load(KLOST + nn, mask=nmask, other=0) != 0
-    errf = tl.where(qlost[:, None], kl1[None, :] * tl.exp2(-klsb[None, :].to(tl.float64)), 0.0) \
-        + tl.where(klost[None, :], ql1[:, None] * tl.exp2(-qlsb[:, None].to(tl.float64)), 0.0)
+    kl1s = tl.load(KL1S + nn, mask=nmask, other=0.0)
+    kw = tl.load(KLOST + nn, mask=nmask, other=0)
+    klost = (kw & 1) != 0
+    kbad = (kw & 2) != 0
+    errf = tl.where(qlost[:, None], kl1s[None, :], 0.0) + tl.where(klost[None, :], ql1s[:, None], 0.0)
     big = errf > 2.0 ** 60
     err = tl.where(errf > 0, tl.ceil(tl.minimum(errf, 2.0 ** 60) * (1.0 + 2.0 ** -40)) + 1.0, 0.0).to(tl.int64)
     base = qlsb[:, None] + klsb[None, :]
@@ -222,7 +260,7 @@ def _tc_logits(QX, KX, rows, rmask, nn, nmask, ROWS, NKEYS, QLSB, QL1, QLOST, KL
     t_lo, ov1 = _rn32_product(AM, AE, acc - err, base)
     t_hi, ov2 = _rn32_product(AM, AE, acc + err, base)
     unc = (t_lo != t_hi) | ov1 | ov2 | big
-    return t_lo, unc
+    return t_lo, unc, kbad
 
 
 @triton.jit
@@ -254,7 +292,9 @@ def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nmask, cc, NKEYS, FN, DV: tl.conste
         for s in tl.static_range(SW):
             ws = ((Wf >> (7 * s)) & 127).to(tl.int8)
             acc += tl.dot(ws, vb, out_dtype=tl.int32).to(tl.int64) << (7 * (s + b))
-    vl = tl.load(VLOST + nn[:, None] * DV + cc[None, :], mask=nmask[:, None], other=0)
+    vw = tl.load(VLOST + nn[:, None] * DV + cc[None, :], mask=nmask[:, None], other=0)
+    vl = vw & 1
+    vbad = tl.max((vw >> 1).to(tl.int32), axis=1) != 0                    # (N,) NaN/inf in this channel block
     for s in tl.static_range(SW):
         ws = ((Wf >> (7 * s)) & 127).to(tl.int8)
         e += tl.dot(ws, vl, out_dtype=tl.int32).to(tl.int64) << (7 * s)
@@ -274,7 +314,7 @@ def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nmask, cc, NKEYS, FN, DV: tl.conste
     TNR = tl.where(chan, base[:, None] + ANCH, NEG)
     TN = tl.where(chan, TN, 0)
     TNE = tl.where(chan, TNE, 0)
-    return TNR, TN, TNE
+    return TNR, TN, TNE, vbad
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +325,7 @@ def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nmask, cc, NKEYS, FN, DV: tl.conste
 def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                      PR, PZ, PZE, PNR, PN, PNE, FLAG,
                      SPLIT_LEN, FZ, FN,
-                     QX, KX, QLSB, QL1, QLOST, KLSB, KL1, KLOST, NKEYS, VX, VLSB, VLOST,
+                     KX, KLSB, KL1S, KLOST, NKEYS, VX, VLSB, VLOST,
                      R_SEG, NK_SEG, NRB, NEED,
                      D: tl.constexpr, DV: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                      BLOCK_DV: tl.constexpr, FS: tl.constexpr, EXP2_MARGIN: tl.constexpr,
@@ -311,6 +351,8 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
     qb = tl.load(Q + rows[:, None] * D + dd[None, :], mask=rmask[:, None], other=0)
     qm, qe, qbad = _decode_bf16(qb)
     flag = tl.max(qbad.to(tl.int32), axis=1)
+    if USE_TC:
+        q0, q1, q2, q3, qlsb, ql1s, qlost = _slice_q(qm, qe, SQ)
     PRr = tl.full((BLOCK_M,), NEG, tl.int64)
     PZr = tl.zeros((BLOCK_M,), tl.int64)
     PZEr = tl.zeros((BLOCK_M,), tl.int64)
@@ -328,20 +370,24 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
     for n0 in range(k0, k1, BLOCK_N):
         nn = n0 + tl.arange(0, BLOCK_N)
         vis = (nn[None, :] < kvl[:, None]) & rmask[:, None]              # (M, N)
-        kb = tl.load(K + nn[:, None] * D + dd[None, :], mask=(nn < kmax)[:, None], other=0)
-        km, ke, kbad = _decode_bf16(kb)                                    # (N, D)
-        flag = tl.maximum(flag, tl.max((vis & (tl.max(kbad.to(tl.int32), axis=1) != 0)[None, :]).to(tl.int32), axis=1))
         # ---- scores ----
         if USE_TC:
-            # Tensor cores: int8 slice products, certified; windowed recompute only for
-            # tiles that contain an uncertified score.
-            t, unc = _tc_logits(QX, KX, rows, rmask, kb0 + nn, nn < kmax, ROWS, NKEYS, QLSB, QL1, QLOST,
-                                KLSB, KL1, KLOST, AM, AE, D, SQ, SK)
+            # Tensor cores: int8 slice products, certified. The bf16 K tile is read and decoded
+            # only for tiles that contain an uncertified score (windowed recompute); NaN/inf
+            # keys come from a flag made at cache write.
+            t, unc, kbad = _tc_logits(q0, q1, q2, q3, qlsb, ql1s, qlost, KX, kb0 + nn, nn < kmax, NKEYS,
+                                      KLSB, KL1S, KLOST, AM, AE, D, SQ, SK)
+            flag = tl.maximum(flag, tl.max((vis & kbad[None, :]).to(tl.int32), axis=1))
             if TC_FALLBACK and tl.max(tl.max((unc & vis).to(tl.int32), axis=1), axis=0) > 0:
+                kb = tl.load(K + nn[:, None] * D + dd[None, :], mask=(nn < kmax)[:, None], other=0)
+                km, ke, _kb = _decode_bf16(kb)
                 t_w, unc_w = _windowed_logits(qm, qe, km, ke, AM, AE, FS)
                 t = tl.where(unc, t_w, t)
                 unc = unc & unc_w
         else:
+            kb = tl.load(K + nn[:, None] * D + dd[None, :], mask=(nn < kmax)[:, None], other=0)
+            km, ke, kbad = _decode_bf16(kb)                                # (N, D)
+            flag = tl.maximum(flag, tl.max((vis & (tl.max(kbad.to(tl.int32), axis=1) != 0)[None, :]).to(tl.int32), axis=1))
             t, unc = _windowed_logits(qm, qe, km, ke, AM, AE, FS)
         # ---- weights ----
         td = t.to(tl.float64)
@@ -367,12 +413,14 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
         zt, zl = _floor_shift(Mw, Ew - (TR[:, None] - FZ))
         TZ = tl.sum(tl.where(vis, zt, 0), axis=1)
         TZE = tl.sum((zl & vis).to(tl.int64), axis=1)
-        vb = tl.load(V + nn[:, None] * DV + cc[None, :], mask=(nn < kmax)[:, None], other=0)
-        vm, ve, vbad = _decode_bf16(vb)                                    # (N, BDV)
-        flag = tl.maximum(flag, tl.max((vis & (tl.max(vbad.to(tl.int32), axis=1) != 0)[None, :]).to(tl.int32), axis=1))
         if USE_TC_PV:
-            TNR, TN, TNE = _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, kb0 + nn, nn < kmax, cc, NKEYS, FN, DV, SW, SV, ANCH)
+            TNR, TN, TNE, vbad = _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, kb0 + nn, nn < kmax, cc, NKEYS, FN, DV,
+                                        SW, SV, ANCH)
+            flag = tl.maximum(flag, tl.max((vis & vbad[None, :]).to(tl.int32), axis=1))
         else:
+            vb = tl.load(V + nn[:, None] * DV + cc[None, :], mask=(nn < kmax)[:, None], other=0)
+            vm, ve, vbad = _decode_bf16(vb)                                # (N, BDV)
+            flag = tl.maximum(flag, tl.max((vis & (tl.max(vbad.to(tl.int32), axis=1) != 0)[None, :]).to(tl.int32), axis=1))
             lv = tl.where(vm != 0, ve + _bitlen(tl.abs(vm)) - 1, NEG)
             valid = vis[:, :, None] & (vm != 0)[None, :, :]                # (M, N, BDV)
             L = tl.where(valid, top[:, :, None] + 1 + lv[None, :, :], NEG)
@@ -490,13 +538,27 @@ def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, O
 # Host wrapper
 # ---------------------------------------------------------------------------
 
+def _bad_np(bits: np.ndarray) -> np.ndarray:
+    return ((np.asarray(bits, dtype=np.uint16) >> 7) & 0xFF) == 0xFF          # NaN or inf
+
+
+def _k_meta_np(X, lsb, l1, lost, bad, dev) -> list:
+    """Kernel format for sliced K rows: [X, lsb, l1 * 2^-lsb, lost | bad << 1]. The scaled L1 is
+    what the score error bound uses, and the NaN/inf bit spares the kernel a bf16 decode of K."""
+    lsb = lsb.astype(np.int64)
+    with np.errstate(over="ignore", invalid="ignore"):
+        l1s = np.where(l1 > 0, l1 * np.exp2(-lsb.astype(np.float64)), 0.0)
+    w = lost.any(axis=1).astype(np.int32) | (bad.any(axis=1).astype(np.int32) << 1)
+    return [torch.from_numpy(np.ascontiguousarray(X)).to(dev), torch.from_numpy(lsb).to(dev),
+            torch.from_numpy(l1s.astype(np.float64)).to(dev), torch.from_numpy(w).to(dev)]
+
+
 def tc_slices(bits: np.ndarray, S: int, dev) -> list:
-    """int8 slices of q or K rows, as device tensors: [X, lsb, l1, lost]. For K, do this once when
-    the KV cache is written."""
-    X, lsb, l1, lost = slice_rows(bits, S)
-    return [torch.from_numpy(np.ascontiguousarray(X)).to(dev), torch.from_numpy(lsb.astype(np.int64)).to(dev),
-            torch.from_numpy(l1.astype(np.float64)).to(dev),
-            torch.from_numpy(lost.any(axis=1).astype(np.int32)).to(dev)]
+    """int8 slices of K rows, as device tensors: [X, lsb, l1 * 2^-lsb, lost | NaN/inf << 1].
+    Done once when the KV cache is written. (q is sliced inside the kernel.)"""
+    bad = _bad_np(bits)
+    X, lsb, l1, lost = slice_rows(np.where(bad, 0, bits).astype(np.uint16), S)   # bad rows are flagged anyway
+    return _k_meta_np(X, lsb, l1, lost, bad, dev)
 
 
 def _slice_rows_device(bits: torch.Tensor, S: int):
@@ -548,38 +610,49 @@ def _slice_rows_chunked(bits: torch.Tensor, S: int, chunk_elems: int = 1 << 26):
     return X, lsb, l1, lost
 
 
+def _bad_dev(bits: torch.Tensor) -> torch.Tensor:
+    return ((bits.to(torch.int32) >> 7) & 0xFF) == 0xFF
+
+
 def tc_slices_device(bits: torch.Tensor, S: int) -> list:
-    """tc_slices for rows already on the device: the per-step q slicing of a decode step, with
-    no host round trip (and CUDA-graph capturable), or K at cache write."""
-    X, lsb, l1, lost = _slice_rows_chunked(bits, S)
-    return [X, lsb, l1, lost.any(dim=1).to(torch.int32)]
+    """tc_slices for K rows already on the device (cache write without a host round trip)."""
+    bad = _bad_dev(bits)
+    X, lsb, l1, lost = _slice_rows_chunked(torch.where(bad, torch.zeros_like(bits), bits), S)
+    l1s = torch.where(l1 > 0, l1 * torch.exp2(-lsb.clamp(-2000, 2000).to(torch.float64)), torch.zeros_like(l1))
+    w = lost.any(dim=1).to(torch.int32) | (bad.any(dim=1).to(torch.int32) << 1)
+    return [X, lsb, l1s, w]
 
 
 def tc_v_slices_device(v: torch.Tensor, S: int) -> list:
     """tc_v_slices for V rows already on the device."""
-    X, lsb, _, lost = _slice_rows_chunked(v, S)
-    return [X, lsb, lost.to(torch.int8).contiguous()]
+    bad = _bad_dev(v)
+    X, lsb, _, lost = _slice_rows_chunked(torch.where(bad, torch.zeros_like(v), v), S)
+    return [X, lsb, (lost.to(torch.int8) | (bad.to(torch.int8) << 1)).contiguous()]
 
 
 def tc_v_slices(v_bits: np.ndarray, S: int, dev) -> list:
-    """int8 slices of V rows for tensor-core P·V: [X (S, n, dv) int8, lsb (n,) int64, lost (n, dv) int8].
-    Done once when the KV cache is written."""
-    X, lsb, _, lost = slice_rows(v_bits, S)
+    """int8 slices of V rows for tensor-core P·V: [X (S, n, dv) int8, lsb (n,) int64,
+    lost | NaN/inf << 1 (n, dv) int8]. Done once when the KV cache is written."""
+    bad = _bad_np(v_bits)
+    X, lsb, _, lost = slice_rows(np.where(bad, 0, v_bits).astype(np.uint16), S)
+    w = lost.astype(np.int8) | (bad.astype(np.int8) << 1)
     return [torch.from_numpy(np.ascontiguousarray(X)).to(dev), torch.from_numpy(lsb.astype(np.int64)).to(dev),
-            torch.from_numpy(np.ascontiguousarray(lost.astype(np.int8))).to(dev)]
+            torch.from_numpy(np.ascontiguousarray(w)).to(dev)]
 
 
 def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int = 4, block_m: int = 16,
            block_n: int = 16, block_dv: int = 32, merge_order=None, exp2_margin: float = 2.0 ** -26,
-           q_tc=None, k_tc=None, tc_fallback: bool = True, v_tc=None, sw: int = 5, pv_tier2: bool = True):
+           q_tc=None, k_tc=None, tc_fallback: bool = True, v_tc=None, sw: int = 5, pv_tier2: bool = True,
+           sq: int = 3, num_warps: int = 4):
     """Device-level launch with no host transfers and no sync.
 
     Qt (R, d), Kt (n, d), Vt (n, dv) are int16 views of bf16 on the device; KL (R,) is int32.
     Batched form: Qt (G, R, d), Kt (G, n, d), Vt (G, n, dv), KL (G, R) for G independent
     segments (e.g. sequence x KV head, with a GQA group's query heads as the R rows); the
     tc slices are then made from the flattened (G*R, d) and (G*n, d) rows.
-    Pass q_tc/k_tc (from tc_slices) to use tensor-core scores, v_tc (from tc_v_slices) for
-    tensor-core P·V. With pv_tier2, (row, channel block) pairs that tensor-core P·V leaves
+    Pass k_tc (from tc_slices) to use tensor-core scores, with q cut into sq digits inside the
+    kernel (q_tc is accepted for compatibility; only its digit count is used), and v_tc (from
+    tc_v_slices) for tensor-core P·V. With pv_tier2, (row, channel block) pairs that tensor-core P·V leaves
     uncertified are recomputed on the device with int64 P·V (DESIGN D12). Returns (OUT int32 (R, dv) or
     (G, R, dv), split_flags, combine_flags), all on the device; flags are per flattened row."""
     batched = Qt.dim() == 3
@@ -604,16 +677,16 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     split_len = -(-split_len // block_n) * block_n
     nsplit = max(1, -(-max(maxlen, 1) // split_len))
     am, ae = decode_fp32(np.float32(alpha))
-    use_tc = q_tc is not None
+    use_tc = k_tc is not None
     if use_tc:
-        tc = [q_tc[0], k_tc[0], q_tc[1], q_tc[2], q_tc[3], k_tc[1], k_tc[2], k_tc[3]]
-        sq, sk = q_tc[0].shape[0], k_tc[0].shape[0]
+        tc = list(k_tc)
+        sk = k_tc[0].shape[0]
+        sq = q_tc[0].shape[0] if q_tc is not None else sq
+        assert 1 <= sq <= 4
     else:
-        z8 = torch.zeros(1, dtype=torch.int8, device=dev)
-        z64 = torch.zeros(1, dtype=torch.int64, device=dev)
-        zf = torch.zeros(1, dtype=torch.float64, device=dev)
-        z32 = torch.zeros(1, dtype=torch.int32, device=dev)
-        tc, sq, sk = [z8, z8, z64, zf, z32, z64, zf, z32], 1, 1
+        tc = [torch.zeros(1, dtype=torch.int8, device=dev), torch.zeros(1, dtype=torch.int64, device=dev),
+              torch.zeros(1, dtype=torch.float64, device=dev), torch.zeros(1, dtype=torch.int32, device=dev)]
+        sq, sk = 1, 1
     use_tc_pv = v_tc is not None
     if use_tc_pv:
         vtc, sv = list(v_tc), v_tc[0].shape[0]
@@ -638,13 +711,15 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     z32 = torch.zeros(1, dtype=torch.int32, device=dev)
 
     def split(need, rerun, bn, pv, v_args, sw_, sv_, anch_):
-        _ea_split_kernel[grid](Qt, Kt, Vt, KL, R, am, ae, PR_, PZ_, PZE_, PNR_, PN_, PNE_, FL,
+        return _ea_split_kernel[grid](Qt, Kt, Vt, KL, R, am, ae, PR_, PZ_, PZE_, PNR_, PN_, PNE_, FL,
                                split_len, fz, fn, *tc, n, *v_args, r_seg, n_seg, nrb, need, D=d, DV=dv,
                                BLOCK_M=block_m, BLOCK_N=bn, BLOCK_DV=block_dv, FS=SCORE_FS,
                                EXP2_MARGIN=exp2_margin, USE_TC=use_tc, SQ=sq, SK=sk, TC_FALLBACK=tc_fallback,
-                               USE_TC_PV=pv, SW=sw_, SV=sv_, ANCH=anch_, RERUN=rerun)
+                               USE_TC_PV=pv, SW=sw_, SV=sv_, ANCH=anch_, RERUN=rerun, num_warps=num_warps)
 
-    split(z32, False, block_n, use_tc_pv, vtc, sw, sv, anch)
+    ck = split(z32, False, block_n, use_tc_pv, vtc, sw, sv, anch)
+    # Registers and spills of the compiled split kernel (None under the CPU interpreter).
+    _LAST_DEBUG.update(n_regs=getattr(ck, "n_regs", None), n_spills=getattr(ck, "n_spills", None))
     if merge_order is None:
         ORD = torch.arange(nsplit, dtype=torch.int64, device=dev)   # no host copy: graph-capturable
     else:
@@ -662,7 +737,7 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
         _ea_combine_kernel[(triton.cdiv(R, block_m), ncb)](PR_, PZ_, PZE_, PNR_, PN_, PNE_, ORD, nsplit, R, fz, fn,
                                                            OUT, OF, need, DV=dv, BLOCK_M=block_m, BLOCK_DV=block_dv,
                                                            P=p, QMIN=qmin, N_ITER=96, OUT_FP32=(out == "fp32"),
-                                                           RERUN=rerun)
+                                                           RERUN=rerun, num_warps=num_warps)
 
     combine(z32, False)
     NEED = None
@@ -699,20 +774,17 @@ def attention_triton(q_bits, k_bits, v_bits, alpha, kv_len, out: str = "bf16", s
     def t16(x):
         return torch.from_numpy(np.ascontiguousarray(x, dtype=np.uint16).view(np.int16)).to(dev)
 
-    q_tc = k_tc = None
+    k_tc = None
     if use_tc:
-        q_tc = tc_slices(q_bits, sq, dev)
         if k_slices is not None:
             kX, klsb, kl1, klost = k_slices
-            k_tc = [torch.from_numpy(np.ascontiguousarray(kX)).to(dev), torch.from_numpy(klsb.astype(np.int64)).to(dev),
-                    torch.from_numpy(kl1.astype(np.float64)).to(dev),
-                    torch.from_numpy(klost.any(axis=1).astype(np.int32)).to(dev)]
+            k_tc = _k_meta_np(kX, klsb, kl1, klost, _bad_np(k_bits), dev)   # caller-made slices
         else:
             k_tc = tc_slices(k_bits, sk, dev)
     OUT, FL, OF = launch(t16(q_bits), t16(k_bits), t16(v_bits), torch.from_numpy(kv_len).to(dev),
                          int(kv_len.max(initial=0)), alpha, out=out, splits=splits, block_m=block_m,
                          block_n=block_n, block_dv=block_dv, merge_order=merge_order, exp2_margin=exp2_margin,
-                         q_tc=q_tc, k_tc=k_tc, tc_fallback=tc_fallback,
+                         sq=sq, k_tc=k_tc, tc_fallback=tc_fallback,
                          v_tc=tc_v_slices(v_bits, sv, dev) if use_tc_pv else None, sw=sw, pv_tier2=pv_tier2)
     flags = np.maximum(FL.amax(dim=(0, 2)).cpu().numpy(), OF.amax(dim=1).cpu().numpy()).astype(np.uint8)
     o = OUT.cpu().numpy()

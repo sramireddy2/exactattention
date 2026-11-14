@@ -72,9 +72,9 @@ if [ "${EA_PLAN:-gpu_check}" = "flash" ]; then
     "fixture_tritontcpv_27_11|1500|$FIX --backend tritontcpv:cuda --only 27_11"
     "flashinfer_warmup|2400|$BF --batch 1 --keys 1024 --drafts 1,8 --modes int64 --iters 2 --out $OUT/warmup.md"
     "decode_b1|1500|$BF --batch 1 --keys 1024,4096,16384,65536 --drafts 1 --out $OUT/decode_b1.md"
-    "decode_b8|1500|$BF --batch 8 --keys 1024,4096,16384 --drafts 1 --out $OUT/decode_b8.md"
-    "decode_b32|1500|$BF --batch 32 --keys 1024,4096,16384 --drafts 1 --out $OUT/decode_b32.md"
-    "verify_t8|1500|$BF --batch 1,8 --keys 1024,4096,16384 --drafts 8 --out $OUT/verify_t8.md"
+    "decode_b8|1500|$BF --batch 8 --keys 1024,4096,16384 --drafts 1 --modes tc,tcpv --out $OUT/decode_b8.md"
+    "decode_b32|1500|$BF --batch 32 --keys 1024,4096,16384 --drafts 1 --modes tc,tcpv --out $OUT/decode_b32.md"
+    "verify_t8|1500|$BF --batch 1,8 --keys 1024,4096,16384 --drafts 8 --modes tc,tcpv --out $OUT/verify_t8.md"
   )
 fi
 

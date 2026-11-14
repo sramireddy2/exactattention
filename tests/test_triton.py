@@ -279,3 +279,24 @@ def test_chunked_slicing_equals_one_piece():
     x = torch.from_numpy(bf16(rng, (53, 64), "outlier").view(np.int16)).to(DEVICE)
     for a_, b_ in zip(_slice_rows_chunked(x, 4, chunk_elems=7 * 64), _slice_rows_device(x, 4)):
         assert torch.equal(a_, b_)
+
+
+@pytest.mark.parametrize("mode", ["int64", "tc", "tcpv"])
+def test_nan_inf_inputs_are_flagged(mode):
+    """A NaN key or an inf value must flag exactly the rows that can see it, in every mode. The
+    tensor-core paths take this from flags made at cache write, not from decoding K and V."""
+    rng = np.random.default_rng(17)
+    d, dv, R, n = 64, 32, 16, 80
+    Q, K, V = bf16(rng, (R, d), "normal"), bf16(rng, (n, d), "normal"), bf16(rng, (n, dv), "normal")
+    kv_len = np.arange(R) * 5 + 3                              # 3 .. 78
+    alpha = default_alpha(d)
+    kw = dict(splits=2, block_m=16, block_n=16, block_dv=16, device=DEVICE, fallback=False,
+              use_tc=mode != "int64", use_tc_pv=mode == "tcpv")
+    _, clean = attention_triton(Q, K, V, alpha, kv_len, **kw)
+    Kb, Vb = K.copy(), V.copy()
+    Kb[40, 7] = 0x7FC0                                         # NaN in key 40
+    Vb[60, 3] = 0x7F80                                         # +inf in value 60
+    _, f = attention_triton(Q, Kb, Vb, alpha, kv_len, **kw)
+    sees = kv_len > 40
+    assert f[sees].all(), (f, kv_len)
+    assert np.array_equal(f[~sees], clean[~sees])
