@@ -199,10 +199,44 @@ def _q_digit(fix, neg, s: tl.constexpr):
 
 
 @triton.jit
-def _slice_q(qm, qe, SQ: tl.constexpr):
+def _q_group(fix, neg, g: tl.constexpr, PACK: tl.constexpr, BM: tl.constexpr, D: tl.constexpr,
+             SQ: tl.constexpr):
+    """MMA operand for q digit group g: digits j = g*PACK .. g*PACK + PACK-1 stacked along the rows
+    (row jl*BM + r is digit g*PACK + jl of row r; digits past SQ are zero). With PACK = 16 // BM a
+    decode block of 2 real rows still fills the 16 rows int8 MMA needs, with digits instead of
+    padding."""
+    if PACK == 1:
+        a = _q_digit(fix, neg, g)
+    else:
+        tl.static_assert(PACK * BM >= 16)
+        j = g * PACK + tl.arange(0, PACK)[:, None, None]
+        d = (fix[None, :, :] >> (7 * tl.minimum(j, 8))) & 127
+        d = tl.where(j < SQ, tl.where(neg[None, :, :], -d, d), 0)
+        a = tl.reshape(d, (PACK * BM, D)).to(tl.int8)
+    return a
+
+
+@triton.jit
+def _slot_sum(R, g: tl.constexpr, PACK: tl.constexpr, BM: tl.constexpr, LO: tl.constexpr, HI: tl.constexpr,
+              SH0: tl.constexpr):
+    """Unpack an MMA result over a packed operand: sum over slots j in [LO, HI) of group g of
+    R_j << (7 (j - LO) + SH0), as int64 (BM, X). Exact."""
+    if PACK == 1:
+        out = R.to(tl.int64) << (7 * (g - LO) + SH0)
+    else:
+        R3 = tl.reshape(R, (PACK, BM, R.shape[1])).to(tl.int64)
+        j = g * PACK + tl.arange(0, PACK)
+        m = (j >= LO) & (j < HI)
+        sh = tl.where(m, 7 * (j - LO) + SH0, 0).to(tl.int64)
+        out = tl.sum(tl.where(m[:, None, None], R3 << sh[:, None, None], 0), axis=0)
+    return out
+
+
+@triton.jit
+def _slice_q(qm, qe, SQ: tl.constexpr, PACK: tl.constexpr, BM: tl.constexpr, D: tl.constexpr):
     """slices.slice_rows for the program's q rows, in registers (same digits as the numpy and
     torch slicers). Done once per program, so a decode step needs no separate slicing launches.
-    Returns 4 digit tensors (unused ones are zeros), lsb, l1 * 2^-lsb, lost."""
+    Returns up to 4 packed digit groups (_q_group; unused ones are zeros), lsb, l1 * 2^-lsb, lost."""
     am = tl.abs(qm)
     nz = am != 0
     lead = tl.where(nz, qe + _bitlen(am) - 1, NEG)
@@ -211,42 +245,46 @@ def _slice_q(qm, qe, SQ: tl.constexpr):
     fix, lost = _floor_shift(am, qe - lsb[:, None])
     lost = lost & nz
     neg = qm < 0
-    z = tl.zeros(qm.shape, tl.int8)
-    q0 = _q_digit(fix, neg, 0)
+    NG: tl.constexpr = (SQ + PACK - 1) // PACK
+    z = tl.zeros((PACK * BM, D), tl.int8)
+    q0 = _q_group(fix, neg, 0, PACK, BM, D, SQ)
     q1 = z
     q2 = z
     q3 = z
-    if SQ > 1:
-        q1 = _q_digit(fix, neg, 1)
-    if SQ > 2:
-        q2 = _q_digit(fix, neg, 2)
-    if SQ > 3:
-        q3 = _q_digit(fix, neg, 3)
+    if NG > 1:
+        q1 = _q_group(fix, neg, 1, PACK, BM, D, SQ)
+    if NG > 2:
+        q2 = _q_group(fix, neg, 2, PACK, BM, D, SQ)
+    if NG > 3:
+        q3 = _q_group(fix, neg, 3, PACK, BM, D, SQ)
     l1 = tl.sum(am.to(tl.float64) * tl.exp2(qe.to(tl.float64)), axis=1) * (1.0 + 2.0 ** -40)
-    l1s = tl.where(l1 > 0, l1 * tl.exp2(-tl.minimum(tl.maximum(lsb, -2000), 2000).to(tl.float64)), 0.0)
+    l1s = tl.where(l1 > 0, l1 * tl.exp2(-tl.minimum(tl.maximum(lsb, -1000), 1000).to(tl.float64)), 0.0)
     qlost = tl.max(lost.to(tl.int32), axis=1) != 0
     return q0, q1, q2, q3, lsb, l1s, qlost
 
 
 @triton.jit
 def _tc_logits(q0, q1, q2, q3, qlsb, ql1s, qlost, KX, nn, nmask, NKEYS, KLSB, KL1S, KLOST,
-               AM, AE, D: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr):
+               AM, AE, D: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr, PACK: tl.constexpr,
+               BM: tl.constexpr):
     """Certified t = RN32(alpha * q.k) from int8 slices (slices.py) on tensor cores.
 
     q.k = 2^(qlsb + klsb) * (sum_{s,t} 2^(7(s+t)) Q[s].K[t] + truncation), where each Q[s].K[t] is
-    an exact int8 x int8 -> int32 MMA. The truncation bound comes from per-row L1 norms, stored
-    pre-scaled (l1 * 2^-lsb). Returns (t, uncertified, key has NaN/inf)."""
+    an exact int8 x int8 -> int32 MMA (PACK q digits share one MMA, _q_group). The truncation
+    bound comes from per-row L1 norms, stored pre-scaled (l1 * 2^-lsb). Returns (t, uncertified,
+    key has NaN/inf)."""
+    NG: tl.constexpr = (SQ + PACK - 1) // PACK
     dd = tl.arange(0, D)
-    acc = tl.zeros((q0.shape[0], nn.shape[0]), tl.int64)
+    acc = tl.zeros((BM, nn.shape[0]), tl.int64)
     for t_ in tl.static_range(SK):
         kt = tl.trans(tl.load(KX + (t_ * NKEYS + nn[:, None]) * D + dd[None, :], mask=nmask[:, None], other=0))
-        acc += tl.dot(q0, kt, out_dtype=tl.int32).to(tl.int64) << (7 * t_)
-        if SQ > 1:
-            acc += tl.dot(q1, kt, out_dtype=tl.int32).to(tl.int64) << (7 * (t_ + 1))
-        if SQ > 2:
-            acc += tl.dot(q2, kt, out_dtype=tl.int32).to(tl.int64) << (7 * (t_ + 2))
-        if SQ > 3:
-            acc += tl.dot(q3, kt, out_dtype=tl.int32).to(tl.int64) << (7 * (t_ + 3))
+        acc += _slot_sum(tl.dot(q0, kt, out_dtype=tl.int32), 0, PACK, BM, 0, SQ, 7 * t_)
+        if NG > 1:
+            acc += _slot_sum(tl.dot(q1, kt, out_dtype=tl.int32), 1, PACK, BM, 0, SQ, 7 * t_)
+        if NG > 2:
+            acc += _slot_sum(tl.dot(q2, kt, out_dtype=tl.int32), 2, PACK, BM, 0, SQ, 7 * t_)
+        if NG > 3:
+            acc += _slot_sum(tl.dot(q3, kt, out_dtype=tl.int32), 3, PACK, BM, 0, SQ, 7 * t_)
     klsb = tl.load(KLSB + nn, mask=nmask, other=0)
     kl1s = tl.load(KL1S + nn, mask=nmask, other=0.0)
     kw = tl.load(KLOST + nn, mask=nmask, other=0)
@@ -264,8 +302,30 @@ def _tc_logits(q0, q1, q2, q3, qlsb, ql1s, qlost, KX, nn, nmask, NKEYS, KLSB, KL
 
 
 @triton.jit
+def _pv_group(Wf, lw, vis, g: tl.constexpr, PACK: tl.constexpr, BM: tl.constexpr, SW: tl.constexpr):
+    """Packed weight operand for slot group g (rows jl*BM + r for slot j = g*PACK + jl): slot j < SW
+    is weight digit j, slot SW the lost-weight mask, slot SW + 1 the visibility mask, later slots
+    zero. One MMA per V operand then covers PACK slots."""
+    if PACK == 1:
+        if g < SW:
+            a = (Wf >> (7 * g)) & 127
+        elif g == SW:
+            a = lw.to(tl.int64)
+        else:
+            a = vis.to(tl.int64)
+    else:
+        tl.static_assert(PACK * BM >= 16)
+        j = g * PACK + tl.arange(0, PACK)[:, None, None]
+        dig = (Wf[None, :, :] >> (7 * tl.minimum(j, SW - 1))) & 127
+        a = tl.where(j < SW, dig, tl.where(j == SW, lw[None, :, :].to(tl.int64),
+                                            tl.where(j == SW + 1, vis[None, :, :].to(tl.int64), 0)))
+        a = tl.reshape(a, (PACK * BM, Wf.shape[1]))
+    return a.to(tl.int8)
+
+
+@triton.jit
 def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nmask, cc, NKEYS, FN, DV: tl.constexpr, SW: tl.constexpr,
-           SV: tl.constexpr, ANCH: tl.constexpr):
+           SV: tl.constexpr, ANCH: tl.constexpr, PACK: tl.constexpr, BM: tl.constexpr):
     """One tile's P·V on tensor cores (DESIGN D9/D10). Returns (TNR, TN, TNE) in the partial format:
     value N_c lies in [TN, TN + TNE] * 2^(TNR - FN).
 
@@ -274,7 +334,9 @@ def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nmask, cc, NKEYS, FN, DV: tl.conste
     tile's largest term and truncated to SW unsigned 7-bit digits. Each digit pair is an exact
     int8 MMA, and two more small MMAs bound the truncation per element:
       weight loss  sum_j lostW_mj * |Vfix_jc|       (lost-weight mask x |V| digits)
-      V loss       sum_j (W_mj + 1) * vlost_jc      (weight digits x lost-V mask)."""
+      V loss       sum_j (W_mj + 1) * vlost_jc      (weight digits x lost-V mask).
+    The weight digits and both masks are slots of one packed operand (_pv_group), PACK slots per
+    MMA, so small row blocks do not waste the MMA rows."""
     vlsb = tl.load(VLSB + nn, mask=nmask, other=0)
     G = Ew + vlsb[None, :]                                                 # term = M * Vfix * 2^G
     gtop = tl.max(tl.where(vis, G + 24, NEG), axis=1)                      # (M,)
@@ -282,25 +344,34 @@ def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nmask, cc, NKEYS, FN, DV: tl.conste
     Wf, lw = _floor_shift(Mw, G - base[:, None])                           # Wf < 2^(7*SW)
     Wf = tl.where(vis, Wf, 0)
     lw = lw & vis
-    acc = tl.zeros((Mw.shape[0], cc.shape[0]), tl.int64)
-    e = tl.zeros((Mw.shape[0], cc.shape[0]), tl.int64)
+    NGW: tl.constexpr = (SW + 2 + PACK - 1) // PACK     # slots: SW weight digits, lost mask, vis mask
+    acc = tl.zeros((BM, cc.shape[0]), tl.int64)
+    e = tl.zeros((BM, cc.shape[0]), tl.int64)
     nz = tl.zeros((nn.shape[0], cc.shape[0]), tl.int32)
     for b in tl.static_range(SV):
         vb = tl.load(VX + (b * NKEYS + nn[:, None]) * DV + cc[None, :], mask=nmask[:, None], other=0)
         nz = nz | (vb != 0).to(tl.int32)
-        e += tl.dot(lw.to(tl.int8), tl.abs(vb), out_dtype=tl.int32).to(tl.int64) << (7 * b)
-        for s in tl.static_range(SW):
-            ws = ((Wf >> (7 * s)) & 127).to(tl.int8)
-            acc += tl.dot(ws, vb, out_dtype=tl.int32).to(tl.int64) << (7 * (s + b))
+        for g in tl.static_range(NGW):
+            if g * PACK <= SW:
+                a = _pv_group(Wf, lw, vis, g, PACK, BM, SW)
+                if g * PACK < SW:                                          # weight digits x V digit b
+                    acc += _slot_sum(tl.dot(a, vb, out_dtype=tl.int32), g, PACK, BM, 0, SW, 7 * b)
+                if g * PACK + PACK > SW:                                   # lost weight x |V digit b|
+                    e += _slot_sum(tl.dot(a, tl.abs(vb), out_dtype=tl.int32), g, PACK, BM, SW, SW + 1, 7 * b)
     vw = tl.load(VLOST + nn[:, None] * DV + cc[None, :], mask=nmask[:, None], other=0)
     vl = vw & 1
     vbad = tl.max((vw >> 1).to(tl.int32), axis=1) != 0                    # (N,) NaN/inf in this channel block
-    for s in tl.static_range(SW):
-        ws = ((Wf >> (7 * s)) & 127).to(tl.int8)
-        e += tl.dot(ws, vl, out_dtype=tl.int32).to(tl.int64) << (7 * s)
-    visb = vis.to(tl.int8)
-    e += tl.dot(visb, vl, out_dtype=tl.int32).to(tl.int64)
-    chan = tl.dot(visb, nz.to(tl.int8), out_dtype=tl.int32) > 0           # channel has any term
+    chan = tl.zeros((BM, cc.shape[0]), tl.int64)
+    for g in tl.static_range(NGW):
+        a = _pv_group(Wf, lw, vis, g, PACK, BM, SW)
+        if g * PACK < SW or g * PACK + PACK > SW + 1:
+            rv = tl.dot(a, vl, out_dtype=tl.int32)
+            if g * PACK < SW:                                              # weight digits x lost V
+                e += _slot_sum(rv, g, PACK, BM, 0, SW, 0)
+            if g * PACK + PACK > SW + 1:                                   # visible x lost V
+                e += _slot_sum(rv, g, PACK, BM, SW + 1, SW + 2, 0)
+                chan += _slot_sum(tl.dot(a, nz.to(tl.int8), out_dtype=tl.int32), g, PACK, BM, SW + 1, SW + 2, 0)
+    chan = chan > 0                                                        # channel has any term
     # True N in [acc - e, acc + e] * 2^base, with |acc| < 2^ANCH (ANCH = 7*SW + 7*SV + log2 BLOCK_N).
     # Re-anchor at TNR = base + ANCH, i.e. units 2^(base + ANCH - FN): a right shift by
     # sr = ANCH - FN (counted truncation) or an exact left shift.
@@ -331,7 +402,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                      BLOCK_DV: tl.constexpr, FS: tl.constexpr, EXP2_MARGIN: tl.constexpr,
                      USE_TC: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr, TC_FALLBACK: tl.constexpr,
                      USE_TC_PV: tl.constexpr, SW: tl.constexpr, SV: tl.constexpr, ANCH: tl.constexpr,
-                     RERUN: tl.constexpr):
+                     RERUN: tl.constexpr, PACK: tl.constexpr):
     # Segments: G independent problems (e.g. sequence x KV head), each with R_SEG query rows
     # attending its own NK_SEG keys. Rows and keys are stored segment after segment, so
     # ROWS = G * R_SEG and NKEYS = G * NK_SEG. Each program handles one segment's row block.
@@ -352,7 +423,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
     qm, qe, qbad = _decode_bf16(qb)
     flag = tl.max(qbad.to(tl.int32), axis=1)
     if USE_TC:
-        q0, q1, q2, q3, qlsb, ql1s, qlost = _slice_q(qm, qe, SQ)
+        q0, q1, q2, q3, qlsb, ql1s, qlost = _slice_q(qm, qe, SQ, PACK, BLOCK_M, D)
     PRr = tl.full((BLOCK_M,), NEG, tl.int64)
     PZr = tl.zeros((BLOCK_M,), tl.int64)
     PZEr = tl.zeros((BLOCK_M,), tl.int64)
@@ -376,7 +447,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
             # only for tiles that contain an uncertified score (windowed recompute); NaN/inf
             # keys come from a flag made at cache write.
             t, unc, kbad = _tc_logits(q0, q1, q2, q3, qlsb, ql1s, qlost, KX, kb0 + nn, nn < kmax, NKEYS,
-                                      KLSB, KL1S, KLOST, AM, AE, D, SQ, SK)
+                                      KLSB, KL1S, KLOST, AM, AE, D, SQ, SK, PACK, BLOCK_M)
             flag = tl.maximum(flag, tl.max((vis & kbad[None, :]).to(tl.int32), axis=1))
             if TC_FALLBACK and tl.max(tl.max((unc & vis).to(tl.int32), axis=1), axis=0) > 0:
                 kb = tl.load(K + nn[:, None] * D + dd[None, :], mask=(nn < kmax)[:, None], other=0)
@@ -415,7 +486,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
         TZE = tl.sum((zl & vis).to(tl.int64), axis=1)
         if USE_TC_PV:
             TNR, TN, TNE, vbad = _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, kb0 + nn, nn < kmax, cc, NKEYS, FN, DV,
-                                        SW, SV, ANCH)
+                                        SW, SV, ANCH, PACK, BLOCK_M)
             flag = tl.maximum(flag, tl.max((vis & vbad[None, :]).to(tl.int32), axis=1))
         else:
             vb = tl.load(V + nn[:, None] * DV + cc[None, :], mask=(nn < kmax)[:, None], other=0)
@@ -640,7 +711,7 @@ def tc_v_slices(v_bits: np.ndarray, S: int, dev) -> list:
             torch.from_numpy(np.ascontiguousarray(w)).to(dev)]
 
 
-def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int = 4, block_m: int = 16,
+def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int = 4, block_m: int | None = None,
            block_n: int = 16, block_dv: int = 32, merge_order=None, exp2_margin: float = 2.0 ** -26,
            q_tc=None, k_tc=None, tc_fallback: bool = True, v_tc=None, sw: int = 5, pv_tier2: bool = True,
            sq: int = 3, num_warps: int = 4):
@@ -653,7 +724,10 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     Pass k_tc (from tc_slices) to use tensor-core scores, with q cut into sq digits inside the
     kernel (q_tc is accepted for compatibility; only its digit count is used), and v_tc (from
     tc_v_slices) for tensor-core P·V. With pv_tier2, (row, channel block) pairs that tensor-core P·V leaves
-    uncertified are recomputed on the device with int64 P·V (DESIGN D12). Returns (OUT int32 (R, dv) or
+    uncertified are recomputed on the device with int64 P·V (DESIGN D12). block_m (query rows per
+    program, a power of two) defaults to the segment's row count, capped at 16: a decode step with
+    2 query heads per KV head then runs 2-row blocks, and the tensor-core paths fill the 16 MMA rows
+    with digit slices instead of padding (DESIGN D14). Returns (OUT int32 (R, dv) or
     (G, R, dv), split_flags, combine_flags), all on the device; flags are per flattened row."""
     batched = Qt.dim() == 3
     G = Qt.shape[0] if batched else 1
@@ -664,6 +738,10 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     R, n = G * r_seg, G * n_seg
     assert d <= 128 and (d & (d - 1)) == 0, "d must be a power of two <= 128"
     assert dv % block_dv == 0
+    if block_m is None:
+        block_m = min(16, triton.next_power_of_2(max(1, r_seg)))
+    assert block_m >= 1 and (block_m & (block_m - 1)) == 0, "block_m must be a power of two"
+    pack = max(1, 16 // block_m)   # digit slots per MMA: PACK * block_m >= 16 rows
     dev = Qt.device
     key_log2 = max(1, int(np.ceil(np.log2(max(2, maxlen)))))
     fz = fn = 64 - 3 - key_log2
@@ -715,7 +793,8 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
                                split_len, fz, fn, *tc, n, *v_args, r_seg, n_seg, nrb, need, D=d, DV=dv,
                                BLOCK_M=block_m, BLOCK_N=bn, BLOCK_DV=block_dv, FS=SCORE_FS,
                                EXP2_MARGIN=exp2_margin, USE_TC=use_tc, SQ=sq, SK=sk, TC_FALLBACK=tc_fallback,
-                               USE_TC_PV=pv, SW=sw_, SV=sv_, ANCH=anch_, RERUN=rerun, num_warps=num_warps)
+                               USE_TC_PV=pv, SW=sw_, SV=sv_, ANCH=anch_, RERUN=rerun, PACK=pack,
+                               num_warps=num_warps)
 
     ck = split(z32, False, block_n, use_tc_pv, vtc, sw, sv, anch)
     # Registers and spills of the compiled split kernel (None under the CPU interpreter).
@@ -733,9 +812,11 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     OF = torch.zeros((R, ncb), dtype=torch.int32, device=dev)
     p, qmin = (8, -133) if out == "bf16" else (24, -149)
 
+    cbm = 16   # combine rows per program: it works on flattened rows, not segments
+
     def combine(need, rerun):
-        _ea_combine_kernel[(triton.cdiv(R, block_m), ncb)](PR_, PZ_, PZE_, PNR_, PN_, PNE_, ORD, nsplit, R, fz, fn,
-                                                           OUT, OF, need, DV=dv, BLOCK_M=block_m, BLOCK_DV=block_dv,
+        _ea_combine_kernel[(triton.cdiv(R, cbm), ncb)](PR_, PZ_, PZE_, PNR_, PN_, PNE_, ORD, nsplit, R, fz, fn,
+                                                           OUT, OF, need, DV=dv, BLOCK_M=cbm, BLOCK_DV=block_dv,
                                                            P=p, QMIN=qmin, N_ITER=96, OUT_FP32=(out == "fp32"),
                                                            RERUN=rerun, num_warps=num_warps)
 
@@ -752,13 +833,13 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
         z8 = torch.zeros(1, dtype=torch.int8, device=dev)
         split(NEED, True, block_n_t2, False, [z8, torch.zeros(1, dtype=torch.int64, device=dev), z8], 1, 1, 0)
         combine(NEED, True)
-    _LAST_DEBUG.update(split_flags=FL, combine_flags=OF, tier2_need=NEED, PR=PR_, PZ=PZ_, PZE=PZE_, PNR=PNR_, PN=PN_, PNE=PNE_,
+    _LAST_DEBUG.update(block_m=block_m, pack=pack, split_flags=FL, combine_flags=OF, tier2_need=NEED, PR=PR_, PZ=PZ_, PZE=PZE_, PNR=PNR_, PN=PN_, PNE=PNE_,
                        fz=fz, fn=fn)
     return (OUT.view(G, r_seg, dv) if batched else OUT), FL, OF
 
 
 def attention_triton(q_bits, k_bits, v_bits, alpha, kv_len, out: str = "bf16", splits: int = 4,
-                     block_m: int = 16, block_n: int = 16, block_dv: int | None = None,
+                     block_m: int | None = None, block_n: int = 16, block_dv: int | None = None,
                      merge_order=None, device: str = "cpu", fallback: bool = True,
                      exp2_margin: float = 2.0 ** -26, use_tc: bool = False, sq: int = 3, sk: int = 4,
                      k_slices=None, tc_fallback: bool = True, use_tc_pv: bool = False, sw: int = 5,

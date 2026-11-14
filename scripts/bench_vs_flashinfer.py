@@ -49,10 +49,12 @@ from exactattn.triton_kernels import _LAST_DEBUG, launch, tc_slices_device, tc_v
 HQ, HKV, D = 16, 8, 128
 DEV = os.environ.get("EA_BENCH_DEVICE", "cuda")   # "cpu" + TRITON_INTERPRET=1 for a smoke test
 PAGE = 16
-# (block_dv, num_warps) per exact mode. block_dv = 128 computes each score once per row block
-# instead of once per channel block, at the price of larger P·V accumulators.
-CONFIGS = {"int64": [(32, 4)], "tc": [(32, 4), (64, 8)],
-           "tcpv": [(32, 4), (64, 4), (64, 8), (128, 8)]}
+# (block_dv, num_warps, block_m) per exact mode. block_dv = 128 computes each score once per row
+# block instead of once per channel block, at the price of larger P·V accumulators. block_m None
+# is launch's default (the segment's rows, at most 16: digit-packed MMAs, DESIGN D14); 16 is the
+# old padded layout, kept as an A/B and as a cross-check that the row block cannot change bits.
+CONFIGS = {"int64": [(32, 4, None)], "tc": [(32, 4, None), (64, 8, None), (32, 4, 16)],
+           "tcpv": [(32, 4, None), (64, 4, None), (64, 8, None), (128, 8, None), (32, 4, 16)]}
 
 
 def time_step(fn, iters: int, warmup: int = 3):
@@ -180,7 +182,7 @@ class Case:
         return self._ref
 
     # ---------------- ExactAttention ----------------
-    def exact(self, mode: str, sms: int, block_dv: int = 32, num_warps: int = 4):
+    def exact(self, mode: str, sms: int, block_dv: int = 32, num_warps: int = 4, block_m=None):
         B, n, T = self.B, self.n, self.T
         grp = HQ // HKV
         G, r_seg = B * HKV, T * grp
@@ -193,9 +195,9 @@ class Case:
         t = torch.arange(T, device=DEV).repeat_interleave(grp)
         KL = (n - T + 1 + t).to(torch.int32).expand(G, r_seg).contiguous()
         alpha = default_alpha(D)
-        block_m = 16
+        bm = block_m or min(16, 1 << max(0, (r_seg - 1).bit_length()))
         ncb = D // block_dv
-        progs = G * -(-r_seg // block_m) * ncb
+        progs = G * -(-r_seg // bm) * ncb
         splits = int(max(1, min(n // 256, -(-4 * sms // progs))))
         kw = dict(splits=splits, block_m=block_m, block_n=32 if mode == "tcpv" else 16, block_dv=block_dv,
                   num_warps=num_warps)
@@ -213,7 +215,7 @@ class Case:
             return launch(Qt, Kt, Vt, KL, n, alpha, **kw)
 
         OUT, FL, OF = fn()
-        regs = (_LAST_DEBUG.get("n_regs"), _LAST_DEBUG.get("n_spills"))
+        regs = (_LAST_DEBUG.get("n_regs"), _LAST_DEBUG.get("n_spills"), _LAST_DEBUG.get("block_m"))
         if DEV == "cuda":
             torch.cuda.synchronize()
         flagged = (FL.amax(dim=(0, 2)) > 0) | (OF.amax(dim=1) > 0)
@@ -275,12 +277,12 @@ def main():
                 record("flash_attn", lambda: (case.flash_attn(), ""))
                 for m in modes:
                     best, first, note_u = None, None, ""
-                    for bdv, nw in CONFIGS[m]:
+                    for bdv, nw, bm in CONFIGS[m]:
                         try:
-                            fn, u, bad, out, flg, (nr, ns) = case.exact(m, sms, bdv, nw)
+                            fn, u, bad, out, flg, (nr, ns, bmr) = case.exact(m, sms, bdv, nw, bm)
                             ms, gmode = time_step(fn, args.iters)
                         except Exception as ex:  # noqa: BLE001
-                            errors.append((f"exact-{m}", f"{type(ex).__name__}: {ex} (T={T} B={B} n={n} cfg={bdv}/{nw})"))
+                            errors.append((f"exact-{m}", f"{type(ex).__name__}: {ex} (T={T} B={B} n={n} cfg={bdv}/{nw}/{bm})"))
                             if os.environ.get("EA_BENCH_TRACE"):
                                 traceback.print_exc()
                             continue
@@ -291,10 +293,10 @@ def main():
                             both = ~(first[1] | flg)                     # rows certified by both
                             o1 = first[0].reshape(-1, D)[both]
                             if not torch.equal(o1, out.reshape(-1, D)[both]):
-                                note_u += f" **{m} config {bdv}/{nw} changed bits**"
+                                note_u += f" **{m} config {bdv}/{nw}/m{bmr} changed bits**"
                         if best is None or ms < best[0]:
                             sp = f" r{nr}" + (f" spill{ns}" if ns else "") if nr is not None else ""
-                            best = (ms, f"{ms:.3f} {gmode[0]} [{bdv}/{nw}{sp}]")
+                            best = (ms, f"{ms:.3f} {gmode[0]} [{bdv}/{nw}/m{bmr}{sp}]")
                         del fn, out, flg
                     res[f"exact-{m}"] = best if best else (None, "n/a")
                     if note_u:
@@ -308,7 +310,7 @@ def main():
                 print(lines[-1], flush=True)
                 del case
                 torch.cuda.empty_cache()
-    lines.insert(4, "Exact cells: `ms mode [block_dv/num_warps rREGS spillBYTES]` for the fastest tile config.")
+    lines.insert(4, "Exact cells: `ms mode [block_dv/num_warps/mBLOCK_M rREGS spillBYTES]` for the fastest tile config.")
     lines.insert(5, "")
     if errors:
         lines += ["", "Backend errors (first per backend and error type):", ""]

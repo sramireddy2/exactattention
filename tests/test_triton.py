@@ -300,3 +300,25 @@ def test_nan_inf_inputs_are_flagged(mode):
     sees = kv_len > 40
     assert f[sees].all(), (f, kv_len)
     assert np.array_equal(f[~sees], clean[~sees])
+
+
+@pytest.mark.parametrize("mode", ["int64", "tc", "tcpv"])
+def test_row_block_size_does_not_change_bits(mode):
+    """Small row blocks (decode: 2 query heads per KV head) pack digit slices into the 16 MMA rows
+    instead of padding (DESIGN D14). The row block is a tiling choice, so every size must give the
+    same bits and the same flags."""
+    rng = np.random.default_rng(zlib.crc32(f"blockm/{mode}".encode()))
+    d, dv, R, n = 64, 64, 16, 90
+    Q, K, V = bf16(rng, (R, d), "outlier"), bf16(rng, (n, d), "normal"), bf16(rng, (n, dv), "wide")
+    kv_len = rng.integers(1, n + 1, size=R)
+    alpha = default_alpha(d)
+    kw = dict(splits=2, block_n=16, block_dv=32, device=DEVICE, fallback=False,
+              use_tc=mode != "int64", use_tc_pv=mode == "tcpv")
+    ref, f_ref = attention_triton(Q, K, V, alpha, kv_len, block_m=16, **kw)
+    for bm in (1, 2, 4, 8):
+        got, f = attention_triton(Q, K, V, alpha, kv_len, block_m=bm, **kw)
+        assert np.array_equal(f, f_ref), (bm, f, f_ref)
+        assert np.array_equal(got[f == 0], ref[f == 0]), bm
+    for r in np.flatnonzero(f_ref == 0):
+        L = int(kv_len[r])
+        assert np.array_equal(ref[r], attention_row(Q[r], K[:L], V[:L], alpha)), r

@@ -324,7 +324,7 @@ code:
    path runs 4 times.
 4. **Per-element fp64 in the score error bound** (`l1 * 2^-lsb` per element).
 5. **Padded rows.** Decode has only 2 rows per segment (GQA group 2), but `tl.dot` needs
-   M ≥ 16, so 7/8 of the elementwise (row, key) work is padding. Not addressed yet.
+   M ≥ 16, so 7/8 of the elementwise (row, key) work is padding. Addressed in D14.
 
 **This pass:**
 
@@ -342,6 +342,34 @@ code:
   config with the split kernel's register and spill counts. It also checks that every config
   gives the same bits on rows both certify, which SPEC §5.3 requires.
 - `test_nan_inf_inputs_are_flagged` covers the new NaN/inf path in all three modes.
+
+## D14. Small row blocks: digit slices fill the MMA rows instead of padding
+
+Suspect 5 of D13. In a decode step each segment (sequence × KV head) has `T × group` query rows:
+2 for one token with GQA group 2. int8 `tl.dot` needs M ≥ 16, so the row block was 16, and 14 of
+16 rows did all of the elementwise work (int64 accumulators, the certified RN32, exp2, weight
+rounding, the P·V bounds) on padding.
+
+The row block is now its own size, `block_m` (a power of two). It defaults to the segment's
+rows, capped at 16. The MMAs get their 16 rows from the digit slices instead:
+
+- **Scores.** q has SQ digits, and each is an independent int8 operand. With `PACK = 16 / block_m`,
+  PACK digits are stacked along the MMA rows (row `jl·block_m + r` holds digit `g·PACK + jl` of
+  query row r). One MMA per K digit then gives all of those digit products. They are unpacked
+  with a reshape to (PACK, block_m, keys), shifted by `7(j + t)` in int64, and summed. The
+  sum is exact, so the order of the terms does not matter.
+- **P·V.** The SW weight digits, the lost-weight mask and the visibility mask become SW + 2
+  "slots" of one packed weight operand. Each V operand (V digit b, |V digit b|, the lost-V mask,
+  the nonzero mask) is multiplied by it once, and each sum takes the slots it needs. At
+  block_m = 2, a tile's P·V takes 8 MMAs where it took 25.
+- At block_m = 16, PACK = 1, and the code is the old one-digit-per-MMA layout.
+- The combine kernel works on flattened rows and keeps 16-row blocks.
+
+The elementwise work per tile is now `block_m × keys` instead of `16 × keys`, which is 8× less
+at decode with group 2. The row block is a tiling choice, so SPEC §5.3 says it cannot change any
+bit. `test_row_block_size_does_not_change_bits` checks bits and flags at block_m = 1, 2, 4, 8
+against 16 in all three modes. The benchmark keeps a block_m = 16 config for tc and tcpv, both as
+an A/B on the GPU and as the same check at serving shapes.
 
 ## Open questions
 
