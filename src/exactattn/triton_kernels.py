@@ -189,18 +189,38 @@ def _ratio_round(a, b, sh, P: tl.constexpr, QMIN: tl.constexpr, N_ITER: tl.const
 # ---------------------------------------------------------------------------
 
 @triton.jit
-def _windowed_logits(qm, qe, km, ke, AM, AE, FS: tl.constexpr):
-    """Certified t = RN32(alpha * q.k) from a windowed int64 dot product. Returns (t, uncertified)."""
-    P = qm[:, None, :] * km[None, :, :]                               # (M, N, D)
-    E = qe[:, None, :] + ke[None, :, :]
-    nzp = P != 0
-    lead = tl.where(nzp, E + _bitlen(tl.abs(P)) - 1, NEG)
-    Lmax = tl.max(lead, axis=2)                                        # (M, N)
-    base = Lmax + 1 - FS
-    term, lost = _floor_shift(P, E - base[:, :, None])
-    acc = tl.sum(tl.where(nzp, term, 0), axis=2)
-    err = tl.sum((lost & nzp).to(tl.int64), axis=2)
-    anyp = tl.max(nzp.to(tl.int32), axis=2) != 0
+def _qk_chunk(Q, qoff, rmask, K, nn, nmask, c, D: tl.constexpr, DC: tl.constexpr):
+    """Channels [c, c + DC) of the exact products q_m,d * k_n,d: mantissa P and exponent E, (M, N, DC)."""
+    dc = c + tl.arange(0, DC)
+    qm, qe, _qb = _decode_bf16(tl.load(Q + qoff[:, None] + dc[None, :], mask=rmask[:, None], other=0))
+    km, ke, _kb = _decode_bf16(tl.load(K + nn[:, None] * D + dc[None, :], mask=nmask[:, None], other=0))
+    return qm[:, None, :] * km[None, :, :], qe[:, None, :] + ke[None, :, :]
+
+
+@triton.jit
+def _windowed_logits(Q, qoff, rmask, K, nn, nmask, AM, AE, D: tl.constexpr, DC: tl.constexpr,
+                     FS: tl.constexpr):
+    """Certified t = RN32(alpha * q.k) from a windowed int64 dot product. Returns (t, uncertified).
+
+    DC channels at a time, in two passes (the leading exponent over all d, then the windowed sum),
+    so no (M, N, D) tensor is ever live (DESIGN D17). The integer sums are exact, so acc and err
+    are the same as the one-shot form's, bit for bit, whatever DC is. q and k chunks are reloaded
+    from global memory (L1/L2 hits) rather than kept in registers."""
+    lmax = tl.full((qoff.shape[0], nn.shape[0]), NEG, tl.int64)
+    for c in range(0, D, DC):
+        P, E = _qk_chunk(Q, qoff, rmask, K, nn, nmask, c, D, DC)
+        lead = tl.where(P != 0, E + _bitlen(tl.abs(P)) - 1, NEG)
+        lmax = tl.maximum(lmax, tl.max(lead, axis=2))                  # (M, N)
+    base = lmax + 1 - FS
+    acc = tl.zeros((qoff.shape[0], nn.shape[0]), tl.int64)
+    err = tl.zeros((qoff.shape[0], nn.shape[0]), tl.int64)
+    for c in range(0, D, DC):
+        P, E = _qk_chunk(Q, qoff, rmask, K, nn, nmask, c, D, DC)
+        nzp = P != 0
+        term, lost = _floor_shift(P, E - base[:, :, None])
+        acc += tl.sum(tl.where(nzp, term, 0), axis=2)
+        err += tl.sum((lost & nzp).to(tl.int64), axis=2)
+    anyp = lmax != NEG
     big = (tl.abs(acc) + err) >= (1 << 62)
     t_lo, ov1 = _rn32_product(AM, AE, acc, base)
     t_hi, ov2 = _rn32_product(AM, AE, acc + err, base)
@@ -487,7 +507,8 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                      BLOCK_DV: tl.constexpr, FS: tl.constexpr, EXP2_MARGIN: tl.constexpr,
                      USE_TC: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr, TC_FALLBACK: tl.constexpr,
                      USE_TC_PV: tl.constexpr, SW: tl.constexpr, SV: tl.constexpr, ANCH: tl.constexpr,
-                     RERUN: tl.constexpr, PACK: tl.constexpr, EXP2T, EXP2_INT: tl.constexpr):
+                     RERUN: tl.constexpr, PACK: tl.constexpr, EXP2T, EXP2_INT: tl.constexpr,
+                     WDC: tl.constexpr):
     # Segments: G independent problems (e.g. sequence x KV head), each with R_SEG query rows
     # attending its own NK_SEG keys. Rows and keys are stored segment after segment, so
     # ROWS = G * R_SEG and NKEYS = G * NK_SEG. Each program handles one segment's row block.
@@ -536,16 +557,14 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                                       KLSB, KL1S, KLOST, AM, AE, D, SQ, SK, PACK, BLOCK_M)
             flag = tl.maximum(flag, tl.max((vis & kbad[None, :]).to(tl.int32), axis=1))
             if TC_FALLBACK and tl.max(tl.max((unc & vis).to(tl.int32), axis=1), axis=0) > 0:
-                kb = tl.load(K + nn[:, None] * D + dd[None, :], mask=(nn < kmax)[:, None], other=0)
-                km, ke, _kb = _decode_bf16(kb)
-                t_w, unc_w = _windowed_logits(qm, qe, km, ke, AM, AE, FS)
+                t_w, unc_w = _windowed_logits(Q, rows * D, rmask, K, nn, nn < kmax, AM, AE, D, WDC, FS)
                 t = tl.where(unc, t_w, t)
                 unc = unc & unc_w
         else:
-            kb = tl.load(K + nn[:, None] * D + dd[None, :], mask=(nn < kmax)[:, None], other=0)
-            km, ke, kbad = _decode_bf16(kb)                                # (N, D)
-            flag = tl.maximum(flag, tl.max((vis & (tl.max(kbad.to(tl.int32), axis=1) != 0)[None, :]).to(tl.int32), axis=1))
-            t, unc = _windowed_logits(qm, qe, km, ke, AM, AE, FS)
+            kb = tl.load(K + nn[:, None] * D + dd[None, :], mask=(nn < kmax)[:, None], other=0).to(tl.int32)
+            kbad = tl.max((((kb >> 7) & 0xFF) == 0xFF).to(tl.int32), axis=1)  # (N,) NaN/inf key
+            flag = tl.maximum(flag, tl.max((vis & (kbad != 0)[None, :]).to(tl.int32), axis=1))
+            t, unc = _windowed_logits(Q, rows * D, rmask, K, nn, nn < kmax, AM, AE, D, WDC, FS)
         # ---- weights ----
         if EXP2_INT:
             Mw, Ew, risky = _exp2_weight(t, EXP2T)
@@ -910,13 +929,17 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     grid = (G * nrb, nsplit, ncb)
     z32 = dz[torch.int32]
 
+    def wdc(bn):
+        # Windowed-score channel chunk (DESIGN D17): about 16 int64 products per thread live at once.
+        return max(1, min(d, (512 * num_warps) // (block_m * bn)))
+
     def split(need, rerun, bn, pv, v_args, sw_, sv_, anch_):
         return _ea_split_kernel[grid](Qt, Kt, Vt, KL, R, am, ae, PR_, PZ_, PZE_, PNR_, PN_, PNE_, FL,
                                split_len, fz, fn, *tc, n, *v_args, r_seg, n_seg, nrb, need, D=d, DV=dv,
                                BLOCK_M=block_m, BLOCK_N=bn, BLOCK_DV=block_dv, FS=SCORE_FS,
                                EXP2_MARGIN=exp2_margin, USE_TC=use_tc, SQ=sq, SK=sk, TC_FALLBACK=tc_fallback,
                                USE_TC_PV=pv, SW=sw_, SV=sv_, ANCH=anch_, RERUN=rerun, PACK=pack,
-                               EXP2T=exp2t, EXP2_INT=(exp2 == "int"), num_warps=num_warps)
+                               EXP2T=exp2t, EXP2_INT=(exp2 == "int"), WDC=wdc(bn), num_warps=num_warps)
 
     ck = split(z32, False, block_n, use_tc_pv, vtc, sw, sv, anch)
     # Registers and spills of the compiled split kernel (None under the CPU interpreter).

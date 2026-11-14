@@ -451,6 +451,50 @@ allocation; int64 and tc steps are two. Two tests cover this:
 - `test_step_runs_no_fill_or_reduction_ops` profiles a step and fails on any fill, reduction,
   comparison or cast op. It fails on the previous code.
 
+## D17. Windowed scores in channel chunks: no (M, N, D) tensor
+
+Run 1113-flash (RTX PRO 6000, sm_120) timed passes D13 to D16 for the first time. The
+integer-only path (int64) improved a lot:
+
+- T = 1, B = 1, n = 1024: 20.4 ms → 0.222 ms (block_m 2, integer exp2). FlashInfer is 0.010 ms,
+  so the gap went from about 1850× to 22×.
+- On the same case, integer exp2 is 1.84× faster than float64 exp2 (0.408 ms).
+- T = 8 (16 rows, block_m 16) got slower, 18.4 → 25.6 ms, with 10 KB of spills.
+
+Every stage that builds a tensor-core kernel with the windowed score fallback (`TC_FALLBACK`)
+timed out at 20 to 25 minutes, twice each. On the laptop, compiling offline for sm_120 with
+Triton 3.9 and ptxas-blackwell (no GPU) shows why:
+
+- `_windowed_logits` built the full (M, N, D) int64 product tensor. At 16 × 32 × 128 that is
+  65,536 values, about 512 per thread.
+- The tc kernel with the fallback took 116 s to compile and spilled 100 KB per thread. The tcpv
+  one was still compiling after 6+ minutes. Without the fallback, tcpv compiled in 15 s.
+
+The windowed dot product now runs D in chunks of DC channels, with DC sized for about 16 live
+int64 products per thread (`WDC`, set by `launch`). It makes two passes: the leading exponent
+over all d, then the windowed sum at the final base. The integer sums are exact, so acc and err
+are the same as the one-shot form's, bit for bit, at any DC. Certification decisions are
+unchanged, and so are the outputs. q and k chunks are reloaded from global memory (L1/L2 hits)
+instead of being kept in registers. The int64 path's NaN/inf key check reads the exponent
+bits directly instead of decoding the whole K tile.
+
+Offline sm_120 compiles (Triton lowering + ptxas; spill stores per thread):
+
+| kernel | before | after |
+|---|---|---|
+| tcpv, fallback on, block_m 16 | > 6 min, still compiling | 42 s, 1.5 KB |
+| tc, fallback on, block_m 16 | 116 s, 100 KB | 17 s, 2.5 KB |
+| int64, block_m 16 | 70 s, 88 KB | 9 s, 1.9 KB |
+| int64, block_m 2 | 3 s, 340 B | 6 s, 0 B |
+
+The tensor-core kernels still sit at 255 registers with 1–2.5 KB of spills: the next thing to
+tune.
+
+The CPU interpreter runs kernels without compiling them, so it cannot catch this kind of
+failure. `scripts/sm120_compile_check.py` compiles every split-kernel config the GPU stages
+build, with no GPU needed. It fails if a config takes longer than a time limit or spills more
+than a byte limit. Run it before every PACE job. All nine configs compile in 5–55 s.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
