@@ -495,6 +495,39 @@ failure. `scripts/sm120_compile_check.py` compiles every split-kernel config the
 build, with no GPU needed. It fails if a config takes longer than a time limit or spills more
 than a byte limit. Run it before every PACE job. All nine configs compile in 5–55 s.
 
+**Run 1114-flash (job 15619813) with this fix.** Every stage passed on the first attempt:
+
+- the 26 GPU tests passed;
+- the tcpv fixture for head 27_11 matched its SHA-256 with 0 fallback rows (it had 3 before
+  tier 2);
+- the benchmarks had 0 uncertified rows and no config changed bits.
+
+Best exact time against FlashInfer and against the pre-D13 code (run 1112-flash):
+
+| T | B | n | FlashInfer | best exact | ratio | before (1112) |
+|---|---|---|---|---|---|---|
+| 1 | 1 | 1K | 0.009 | 0.119 tcpv | 14× | 2.78 |
+| 1 | 1 | 16K | 0.021 | 0.567 tcpv | 27× | 10.1 |
+| 1 | 1 | 64K | 0.188 | 1.41 tcpv | 7.5× | 24.8 |
+| 1 | 8 | 16K | 0.359 | 2.60 tcpv | 7.2× | 440 |
+| 1 | 32 | 4K | 0.359 | 3.47 tcpv | 9.7× | 339 |
+| 1 | 32 | 16K | 1.41 | 14.9 tcpv | 10.6× | out of memory |
+| 8 | 1 | 16K | 0.021 | 6.44 tc | 311× | — |
+| 8 | 8 | 4K | 0.037 | 6.89 tcpv | 185× | — |
+
+(ms per step, CUDA graphs.) The A/Bs, each on the same tile config:
+
+- **Packed rows (D14).** block_m 2 against the padded block_m 16, at T=1, B=8, n=16K: tcpv
+  6.6 vs 30.8 ms, tc 7.4 vs 50.1 ms.
+- **Integer exp2 (D15).**
+  - tc, B=1, n=64K: 3.33 vs 6.06 ms with float64.
+  - tc, B=8, n=16K: 7.38 vs 11.5 ms.
+  - tcpv gains only about 5%, and int64 about 3%.
+- **Chunked scores (this section).** int64 at T=8, B=1, n=1K: 25.6 → 1.09 ms.
+
+Decode is now 7–35× FlashInfer. Verify steps (T = 8, 16 rows, PACK = 1) are the weak spot at
+57–311×: they take about 12× the T = 1 time for 8× the rows, and spill 170–518 B.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
