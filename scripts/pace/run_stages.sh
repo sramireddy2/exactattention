@@ -106,7 +106,9 @@ write_summary() {
 
 submit_next() {   # $1 = extra sbatch args (e.g. a dependency)
   if [ "$CHAIN" -ge "$MAX_CHAIN" ]; then echo "chain: at EA_MAX_CHAIN=$MAX_CHAIN, no successor"; return; fi
-  sbatch --parsable -A "${SLURM_JOB_ACCOUNT:-gts-agarg35}" -q embers $1 \
+  local exc=""   # nodes whose GPU failed earlier in this run (bad_node)
+  [ -s "$OUT/bad_nodes" ] && exc="--exclude=$(cut -d' ' -f3 "$OUT/bad_nodes" | sort -u | paste -sd, -)"
+  sbatch --parsable -A "${SLURM_JOB_ACCOUNT:-gts-agarg35}" -q embers $exc $1 \
     --export=ALL,EA_RUN="$RUN",EA_CHAIN=$((CHAIN + 1)),EA_PLAN="${EA_PLAN:-gpu_check}" \
     -o "$HOME/scratch/ea_jobs/exactattn-$RUN-%j.out" "$REPO/scripts/pace/gpu_check.sbatch" 2>/dev/null
 }
@@ -134,11 +136,29 @@ trap on_term TERM
 
 remaining() { echo $(( BUDGET_S - ($(date +%s) - START) )); }
 
+# A node whose GPU cannot open a CUDA context ("device busy or unavailable": another process
+# holds it in exclusive mode, or it is faulted) fails every stage in seconds. nvidia-smi and
+# get_device_name do not open a context, so probe with a real allocation.
+gpu_ok() {
+  timeout 120 python -c "import torch; torch.zeros(1, device='cuda'); torch.cuda.synchronize()" >/dev/null 2>&1
+}
+bad_node() {   # $1 = stage that hit it: leave it not-done, keep the successor off this node, stop
+  echo "GPU unusable on $(hostname -s) during $1 - stage left not-done"
+  echo "$(date '+%F %T') $(hostname -s) job ${SLURM_JOB_ID:-local} stage $1" >> "$OUT/bad_nodes"
+  if [ -n "$NEXT" ]; then
+    EXC=$(cut -d' ' -f3 "$OUT/bad_nodes" | sort -u | paste -sd, -)
+    scontrol update JobId="$NEXT" ExcNodeList="$EXC" 2>/dev/null && echo "chain: successor $NEXT excludes $EXC"
+  fi
+  write_summary
+  exit 1
+}
+
 for e in "${STAGES[@]}"; do
   name="${e%%|*}"; rest="${e#*|}"; cap="${rest%%|*}"; cmd="${rest#*|}"
   [ -f "$OUT/$name.done" ] && continue
   left=$(remaining)
   [ "$left" -lt 90 ] && continue
+  if [ "$name" != env ] && ! gpu_ok; then bad_node "$name"; fi
   t=$(( cap < left ? cap : left ))
   echo $(( $(cat "$OUT/$name.attempts" 2>/dev/null || echo 0) + 1 )) > "$OUT/$name.attempts"
   echo "== $name (cap ${t}s) $(date +%T) on $(hostname) job ${SLURM_JOB_ID:-local} chain $CHAIN"
@@ -156,6 +176,8 @@ for e in "${STAGES[@]}"; do
     n=$(( $(cat "$OUT/$name.timeouts" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$OUT/$name.timeouts"
     echo "   timeout #$n"
     [ "$n" -ge "$MAX_TIMEOUTS" ] && echo "TIMEOUT" > "$OUT/$name.done"
+  elif [ "$rc" -ne 0 ] && grep -q "busy or unavailable" "$OUT/$name.log" && ! gpu_ok; then
+    bad_node "$name"
   else
     echo "rc=$rc" > "$OUT/$name.done"; echo "   rc=$rc"
   fi

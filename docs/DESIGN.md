@@ -763,6 +763,19 @@ branch. Tier 1 is unchanged: there `go` is a compile-time True. A program with n
 costs one small load and a reduction. The outputs cannot change: such a program never wrote
 anything before either, because all of its stores were masked by NEED.
 
+Run 1117-flash (job 15658020) timed nothing. Its node's GPU could not open a CUDA context
+(`device busy or unavailable`, error 999 from `cuDevicePrimaryCtxRetain`), so every stage
+failed within seconds. The stage runner still marked them done, and the chain stopped.
+`nvidia-smi` and `get_device_name` do not open a context, so the env stage had passed.
+
+`run_stages.sh` now probes each GPU stage with a real allocation first, and again after a
+failure that names the error. On an unusable GPU it:
+- leaves the stage not-done;
+- records the node in `bad_nodes`;
+- moves the pre-queued successor off that node (`scontrol update ExcNodeList`), and every later
+  submission excludes it;
+- exits, so the successor reruns the stage elsewhere.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
