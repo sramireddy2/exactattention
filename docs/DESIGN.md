@@ -712,6 +712,43 @@ The old tier-2 kernel ran at 128 registers with 12.6 KB of spills per thread. Th
 NEED pairs cost 4.5 ms. A NEED pair now reruns one 26K-instruction program with no spills,
 instead of a 308K-instruction one.
 
+**Run 1116-flash (job 15646338, code 4901277).** Every stage passed:
+
+- the tests passed;
+- the fixture for head 27_11 matched its SHA-256 with 0 fallback rows;
+- 0 rows were uncertified, and no config changed bits.
+
+Best exact time, in ms per step, against FlashInfer:
+
+| T | B | n | FlashInfer | 1114 | 1115 | 1116 | ratio |
+|---|---|---|---|---|---|---|---|
+| 8 | 1 | 1K | 0.008 | 1.07 | 0.322 | 0.332 | 39× |
+| 8 | 1 | 16K | 0.023 | 6.44 | 3.10 | 1.06 | 47× |
+| 8 | 8 | 4K | 0.032 | 6.89 | 4.25 | 1.30 | 41× |
+| 8 | 8 | 16K | 0.363 | 20.6 | 16.6 | 3.40 | 9.4× |
+| 1 | 1 | 16K | 0.021 | 0.567 | 0.594 | 0.342 | 17× |
+| 1 | 1 | 64K | 0.187 | 1.41 | 1.29 | 0.725 | 3.9× |
+| 1 | 8 | 16K | 0.359 | 2.60 | 2.16 | 1.11 | 3.1× |
+| 1 | 32 | 16K | 1.41 | 14.9 | 10.5 | 6.41 | 4.6× |
+
+Verify steps are now 6× faster than in run 1114 at B = 1, n = 16K. The 64-key tiles win
+almost everywhere.
+
+`profile_step` breakdown at T = 8, B = 1, n = 16K:
+
+| launch | ms |
+|---|---|
+| tier-1 split | 0.59 |
+| tier-1 combine | 0.10 |
+| tier-2 split | 0.33 |
+| tier-2 combine | 0.07 |
+
+With three q digits, the tier-1 split takes 1.76 ms instead of 0.59.
+
+Tier 2 still costs 0.33 ms for 2 NEED pairs. Its grid has 16K programs (8 segments × 8 row
+blocks × 64 splits × 4 channel blocks), and almost all of them only load and slice q, then
+find nothing to do. That fixed cost is the next item. At decode it is 0.03–0.05 ms.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
