@@ -869,6 +869,48 @@ it is per-program latency, not bandwidth. The suspected cause is `_ratio_round`'
 bit-serial division, run twice per output, after a serial merge over the splits. That is the
 next target.
 
+## D22. The combine kernel: short rounding, one output per thread, pipelined merge
+
+Runs 1118b and 1119 put the combine kernel at about 0.1 ms per launch. That is 0.096 of
+0.278 ms at decode B=1 16K, and two launches (0.196 ms) of verify's 0.929 ms. The time barely
+depends on the work: B=8 decode merges 12 splits in 0.062 ms, B=1 merges 64 in 0.096, and the
+tier-2 combine with only 2 live programs still takes 0.093. That is about 0.65 µs per split
+plus a fixed 0.054 ms. Compiled offline (sm_120, the GPU's hints), the old kernel was 13.3K
+SASS instructions per thread at 201 registers. The merge loop was 474 per split, and 12.8K
+were outside the loop, almost all of it `_ratio_round`'s 96-step bit-serial division, run
+twice (lower and upper bound) on 4 outputs per thread. With 16-row tiles, a B=1 step had only
+4 combine programs of 4 warps, so nothing hid that chain.
+
+**Rounding in P + 1 steps.** `_ratio_round` computes q1 = floor(a · 2^s2 / b), and the exponent
+choice qe ≥ K − (P − 1) keeps q1 < 2^(P+1). So when s2 > P + 1, the first z = s2 − (P + 1)
+long-division steps produce zero bits: floor(a · 2^z / b) = 0, so a < b and a · 2^z < b < 2^62.
+Those steps only double the remainder, so `a << z` replaces them. At most P + 1 steps remain:
+9 for bf16, 25 for fp32. Since z ≤ 61 whenever a ≥ 1, the shift never overflows, and the old
+96-step cap is gone with it. `test_ratio_round_is_exact` checks (q, qe) against exact fractions
+on 2048 cases per precision: long quotients, negative s2, subnormal clamping, exact quotients
+and ties. Skipping one step too many fails it.
+
+**4 × 32 tiles.** Combine programs now take 4 rows instead of 16. At 4 warps that is one output
+per thread, and 4× as many programs. NEED and OF keep their 32-channel layout, so only the grid
+changes.
+
+**Pipelined merge.** The split loop is `tl.range(NSPLIT, num_stages=3)`. Triton turns the
+partials' loads into cp.async copies through 6.3 KB of shared memory, so later splits load
+while the current one merges.
+
+Each change alters only the arithmetic schedule or the tiling, never a value, so the outputs
+and flags are the same bits.
+
+| combine, sm_120 SASS per thread | instructions | merge loop per split | registers |
+|---|---|---|---|
+| before (16 rows, 96 steps) | 13 304 | 474 | 201 |
+| 16 rows, P + 1 steps | 2 808 | 463 | 154 |
+| 4 rows, P + 1 steps | 936 | 210 | 60 |
+| plus pipelined merge (kept) | 1 128 | 254 | 60 |
+
+`sm120_compile_check.py` now also builds the combine kernel (tier 1 bf16 and fp32, and tier 2).
+Run 1120 times it on the GPU.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model

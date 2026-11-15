@@ -20,7 +20,7 @@ triton = pytest.importorskip("triton")
 from exactattn import attention_row, default_alpha  # noqa: E402
 import triton.language as tl  # noqa: E402
 
-from exactattn.triton_kernels import _bitlen, _exp2_weight, _f32_bits, attention_triton  # noqa: E402
+from exactattn.triton_kernels import _bitlen, _exp2_weight, _f32_bits, _ratio_round, attention_triton  # noqa: E402
 from gen import KINDS, bf16  # noqa: E402
 
 
@@ -392,6 +392,62 @@ def test_kernel_integer_helpers_match_numpy():
         ref = (q24.astype(np.float64) * np.exp2(qes.astype(np.float64))).astype(np.float32)
     ref = np.where((qs & 1) != 0, -ref, ref)
     assert np.array_equal(Fb, ref.view(np.int32))
+
+
+@triton.jit
+def _ratio_probe(A, B, SH, OQ, OQE, NB: tl.constexpr, P: tl.constexpr, QMIN: tl.constexpr):
+    i = tl.arange(0, NB)
+    q, qe = _ratio_round(tl.load(A + i), tl.load(B + i), tl.load(SH + i), P, QMIN)
+    tl.store(OQ + i, q)
+    tl.store(OQE + i, qe)
+
+
+@pytest.mark.parametrize("P,QMIN", [(8, -133), (24, -149)])
+def test_ratio_round_is_exact(P, QMIN):
+    """_ratio_round(a, b, sh) is RN(a / b * 2^sh) to P bits with exponent floor QMIN, checked with
+    exact fractions. The cases cover long quotients whose leading zero steps are skipped by one
+    shift (DESIGN D22), negative fraction lengths, subnormal clamping, exact quotients and ties."""
+    import torch
+    from fractions import Fraction
+
+    rng = np.random.default_rng(22 + P)
+    NB = 2048
+    la = rng.integers(0, 63, NB)
+    lb = rng.integers(1, 63, NB)
+    a = np.array([int(rng.integers(1 << max(x - 1, 0), 1 << x)) if x else 0 for x in la], dtype=np.int64)
+    b = np.array([int(rng.integers(1 << (x - 1), 1 << x)) for x in lb], dtype=np.int64)
+    # Exact quotients (odd j) and ties (even j): a / b = n / 2^s with n = m or 2m + 1, m a P-bit
+    # integer. An odd (P + 1)-bit n rounds to P bits with exactly half an ulp left over.
+    for j in range(256):
+        c = int(rng.integers(1, 1 << 8)) | 1
+        m = int(rng.integers(1 << (P - 1), 1 << P))
+        a[j], b[j] = c * (m if j % 2 else 2 * m + 1), c << int(rng.integers(0, 40))
+    k = np.array([int(x).bit_length() - int(y).bit_length() for x, y in zip(a, b)])
+    tgt = rng.integers(QMIN - 30, 128, NB)                       # result exponents around the range
+    sh = (tgt - k).astype(np.int64)
+    dev = torch.device(DEVICE)
+    oq = torch.empty(NB, dtype=torch.int64, device=dev)
+    oqe = torch.empty(NB, dtype=torch.int64, device=dev)
+    _ratio_probe[(1,)](*(torch.from_numpy(x).to(dev) for x in (a, b, sh)), oq, oqe, NB=NB, P=P, QMIN=QMIN)
+    q, qe = oq.cpu().numpy(), oqe.cpu().numpy()
+    for i in range(NB):
+        A, Bv, S = int(a[i]), int(b[i]), int(sh[i])
+        if A == 0:
+            assert q[i] == 0
+            continue
+        x = Fraction(A, Bv) * Fraction(2) ** S
+        K = x.numerator.bit_length() - x.denominator.bit_length()
+        if Fraction(2) ** K > x:
+            K -= 1
+        e = max(K - (P - 1), QMIN)
+        y = x / Fraction(2) ** e
+        r = y.numerator // y.denominator
+        frac = y - r
+        if frac > Fraction(1, 2) or (frac == Fraction(1, 2) and r % 2 == 1):
+            r += 1
+        if r == 1 << P:
+            r, e = r >> 1, e + 1
+        assert (int(q[i]), int(qe[i])) == (r, e), (i, A, Bv, S, int(q[i]), int(qe[i]), r, e)
 
 
 @pytest.mark.parametrize("mode", ["int64", "tc", "tcpv"])

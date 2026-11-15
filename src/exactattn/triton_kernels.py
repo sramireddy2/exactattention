@@ -145,8 +145,13 @@ def _rn32_product(am, ae, acc, base):
 
 
 @triton.jit
-def _ratio_round(a, b, sh, P: tl.constexpr, QMIN: tl.constexpr, N_ITER: tl.constexpr):
-    """RN(a / b * 2^sh), a >= 0, 0 < b < 2^62. Returns (q, qe)."""
+def _ratio_round(a, b, sh, P: tl.constexpr, QMIN: tl.constexpr):
+    """RN(a / b * 2^sh), a >= 0, 0 < b < 2^62. Returns (q, qe).
+
+    q1 = floor(a * 2^s2 / b) has at most P + 1 bits (qe >= K - (P - 1)), so when s2 > P + 1 its
+    first z = s2 - (P + 1) long-division steps give zero bits: floor(a * 2^z / b) = 0, so a < b
+    and a * 2^z < b < 2^62. Those steps only double the remainder, so one shift replaces them, and
+    at most P + 1 steps are left (DESIGN D22)."""
     k = _bitlen(a) - _bitlen(b)
     kp = tl.minimum(tl.maximum(k, 0), 62)
     kn = tl.minimum(tl.maximum(-k, 0), 62)
@@ -162,10 +167,12 @@ def _ratio_round(a, b, sh, P: tl.constexpr, QMIN: tl.constexpr, N_ITER: tl.const
     sn = tl.minimum(tl.maximum(-s2, 0), 62)
     q_neg = ip >> sn
     st_neg = (r != 0) | ((ip & ((one << sn) - 1)) != 0)
-    q_pos = ip
-    rr = r
-    for i in tl.static_range(N_ITER):
-        act = s2 > i
+    z = tl.maximum(s2 - (P + 1), 0)
+    q_pos = tl.where(z > 0, 0, ip)
+    rr = tl.where(z > 0, a << tl.minimum(z, 62), r)
+    n_it = s2 - z
+    for i in tl.static_range(P + 1):
+        act = n_it > i
         r2 = rr << 1
         bit = r2 >= b
         r2 = tl.where(bit, r2 - b, r2)
@@ -715,7 +722,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
 @triton.jit
 def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, OUT, OFLAG, NEED, FLAG, FL_NCB,
                        DV: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_DV: tl.constexpr,
-                       P: tl.constexpr, QMIN: tl.constexpr, N_ITER: tl.constexpr, OUT_FP32: tl.constexpr,
+                       P: tl.constexpr, QMIN: tl.constexpr, OUT_FP32: tl.constexpr,
                        RERUN: tl.constexpr, WRITE_NEED: tl.constexpr, FL_DIV: tl.constexpr):
     # Tier 1 with WRITE_NEED also writes tier 2's work list (DESIGN D12, D16): NEED = this
     # combine's flag set and no split flagged the pair (FLAG), fused here instead of torch ops.
@@ -739,7 +746,8 @@ def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, O
         NE = tl.zeros((BLOCK_M, BLOCK_DV), tl.int64)
         flag = tl.zeros((BLOCK_M,), tl.int32)
         sflag = tl.zeros((BLOCK_M,), tl.int32)
-        for i in range(NSPLIT):
+        # Pipelined: the partials of later splits load (cp.async) while this one merges.
+        for i in tl.range(NSPLIT, num_stages=3):
             s = tl.load(ORDER + i)
             off = s * ROWS + rows
             if WRITE_NEED:
@@ -777,8 +785,8 @@ def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, O
         hi_den = tl.where(Nhi <= 0, Zhi[:, None], Zlo[:, None])
         lo_den = tl.maximum(lo_den, 1)
         hi_den = tl.maximum(hi_den, 1)
-        ql, qel = _ratio_round(tl.abs(Nlo), lo_den, sh, P, QMIN, N_ITER)
-        qh, qeh = _ratio_round(tl.abs(Nhi), hi_den, sh, P, QMIN, N_ITER)
+        ql, qel = _ratio_round(tl.abs(Nlo), lo_den, sh, P, QMIN)
+        qh, qeh = _ratio_round(tl.abs(Nhi), hi_den, sh, P, QMIN)
         sl = tl.where(Nlo < 0, -1, 1)
         shh = tl.where(Nhi < 0, -1, 1)
         same = ((ql == 0) & (qh == 0)) | ((ql == qh) & (qel == qeh) & (sl == shh)) | (~chan)
@@ -1065,12 +1073,15 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     OF = torch.empty((R, nccb), dtype=torch.int32, device=dev)   # every entry is written
     p, qmin = (8, -133) if out == "bf16" else (24, -149)
 
-    cbm = 16   # combine rows per program: it works on flattened rows, not segments
+    # Combine rows per program (it works on flattened rows, not segments). 4 rows x 32 channels is
+    # one output per thread at 4 warps: the merge and the rounding are latency-bound chains, so
+    # more programs with shorter per-thread work beat fewer, wider ones (DESIGN D22).
+    cbm = 4
 
     def combine(need, rerun, write_need):
         _ea_combine_kernel[(triton.cdiv(R, cbm), nccb)](PR_, PZ_, PZE_, PNR_, PN_, PNE_, ORD, nsplit, R, fz, fn,
                                                         OUT, OF, need, FL, ncb, DV=dv, BLOCK_M=cbm, BLOCK_DV=cbdv,
-                                                        P=p, QMIN=qmin, N_ITER=96, OUT_FP32=(out == "fp32"),
+                                                        P=p, QMIN=qmin, OUT_FP32=(out == "fp32"),
                                                         RERUN=rerun, WRITE_NEED=write_need, FL_DIV=block_dv // cbdv,
                                                         num_warps=4)
 

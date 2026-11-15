@@ -1,4 +1,4 @@
-"""Compile the split kernel for sm_120 (RTX PRO 6000 / RTX 50) without a GPU, and report compile
+"""Compile the split and combine kernels for sm_120 (RTX PRO 6000 / RTX 50) without a GPU, and report compile
 time, registers and spills per config (DESIGN D17).
 
 The CPU interpreter runs the kernels but never compiles them, so it cannot see compile-time
@@ -67,25 +67,44 @@ def kernel_config(over):
     return cfg, nw, ns
 
 
+# The combine kernel as launch builds it: 4 rows x 32 channels, 4 warps (DESIGN D22).
+COMBINE = dict(DV=128, BLOCK_M=4, BLOCK_DV=32, P=8, QMIN=-133, OUT_FP32=False, RERUN=False,
+               WRITE_NEED=True, FL_DIV=4, num_warps=4)
+COMBINE_CONFIGS = {
+    "combine tier1 bf16": {},
+    "combine tier1 fp32": {"P": 24, "QMIN": -149, "OUT_FP32": True},
+    "combine tier2": {"RERUN": True, "WRITE_NEED": False},
+}
+PTR_COMBINE = {"PR": "*i64", "PZ": "*i64", "PZE": "*i64", "PNR": "*i64", "PN": "*i64", "PNE": "*i64",
+               "ORDER": "*i64", "OUT": "*i32", "OFLAG": "*i32", "NEED": "*i32", "FLAG": "*i32"}
+
+
 def build_ptx(over, ttgir_out=None):
-    """Lower the split kernel to sm_120 PTX with Triton's own pipeline (no GPU needed).
-    Returns (ptx, shared memory bytes per program)."""
+    """Lower the split kernel (or, with over["kernel"] == "combine", the combine kernel) to sm_120
+    PTX with Triton's own pipeline (no GPU needed). Returns (ptx, shared memory bytes per program)."""
     from triton.backends.compiler import GPUTarget
     from triton.backends.nvidia.compiler import CUDABackend
     from triton.compiler import ASTSource
     from triton._C.libtriton import ir
 
-    from exactattn.triton_kernels import _ea_split_kernel
+    from exactattn.triton_kernels import _ea_combine_kernel, _ea_split_kernel
 
-    cfg, nw, ns = kernel_config(over)
-    sig = {a: ("constexpr" if a in cfg else PTR.get(a, "i32")) for a in _ea_split_kernel.arg_names}
-    # The GPU's JIT specializes arguments divisible by 16 (all pointers, and these sizes at serving
-    # shapes); without the same hints, loads are not vectorized or pipelined through shared memory
-    # and the kernel differs from the one the GPU runs.
-    div16 = set(PTR) | {"ROWS", "SPLIT_LEN", "NKEYS", "NK_SEG"}
-    attrs = {(i,): [["tt.divisibility", 16]] for i, a in enumerate(_ea_split_kernel.arg_names)
+    if over.get("kernel") == "combine":
+        kern, ptr = _ea_combine_kernel, PTR_COMBINE
+        cfg = {**COMBINE, **{k: v for k, v in over.items() if k != "kernel"}}
+        nw, ns = cfg.pop("num_warps"), None
+        div16 = set(ptr) | {"ROWS"}
+    else:
+        kern, ptr = _ea_split_kernel, PTR
+        cfg, nw, ns = kernel_config(over)
+        # The GPU's JIT specializes arguments divisible by 16 (all pointers, and these sizes at
+        # serving shapes); without the same hints, loads are not vectorized or pipelined through
+        # shared memory and the kernel differs from the one the GPU runs.
+        div16 = set(ptr) | {"ROWS", "SPLIT_LEN", "NKEYS", "NK_SEG"}
+    sig = {a: ("constexpr" if a in cfg else ptr.get(a, "i32")) for a in kern.arg_names}
+    attrs = {(i,): [["tt.divisibility", 16]] for i, a in enumerate(kern.arg_names)
              if a in div16 and a not in cfg}
-    src = ASTSource(_ea_split_kernel, sig, {a: cfg[a] for a in _ea_split_kernel.arg_names if a in cfg}, attrs)
+    src = ASTSource(kern, sig, {a: cfg[a] for a in kern.arg_names if a in cfg}, attrs)
     target = GPUTarget("cuda", 120, 32)
     be = CUDABackend(target)
     extra = {} if ns is None else {"num_stages": ns}
@@ -143,7 +162,8 @@ def main():
     a = ap.parse_args()
     bad = False
     with ProcessPoolExecutor(a.jobs) as ex:
-        for name, sec, regs, spill, smem, err in ex.map(compile_one, CONFIGS.items()):
+        items = list(CONFIGS.items()) + [(n, {**o, "kernel": "combine"}) for n, o in COMBINE_CONFIGS.items()]
+        for name, sec, regs, spill, smem, err in ex.map(compile_one, items):
             over = regs is None or sec > a.max_seconds or spill > a.max_spill or smem > a.max_shared
             bad |= over
             print(f"{'FAIL' if over else 'ok  '} {name:18s} {sec:6.1f} s  regs {regs}  spill {spill} B  "
