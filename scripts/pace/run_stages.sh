@@ -64,7 +64,9 @@ STAGES=(
 # ~/.cache/flashinfer, which persists across jobs, so a preempted warmup is not lost.
 BF="python scripts/bench_vs_flashinfer.py"
 if [ "${EA_PLAN:-gpu_check}" = "flash" ]; then
-  PART="-p gpu-rtxpro-blackwell"   # the comparison is on the RTX PRO 6000 (sm_120), never an L40S
+  # The comparison is on the RTX PRO 6000 (sm_120), never an L40S. Submission adds gpu-v100 to
+  # any -p list, so pin the GPU type in the gres as well.
+  PART="-p gpu-rtxpro-blackwell --gres=gpu:rtx_pro_6000_blackwell:1"
   PART="-p gpu-rtxpro-blackwell"         # the comparison is on the RTX PRO 6000 (sm_120); never an L40S
   # FlashInfer JIT needs nvcc matching torch's CUDA (13.2); PACE modules stop at 12.8, so use the
   # pip nvidia-cuda-nvcc in the venv (pip install "nvidia-cuda-nvcc>=13.2,<13.3").
