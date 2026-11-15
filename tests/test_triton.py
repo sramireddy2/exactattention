@@ -180,8 +180,9 @@ def test_pv_tier2_recovers_uncertified_pairs(kind, block_dv):
     """Tier 2 (DESIGN D12): pairs that tensor-core P·V cannot certify are recomputed on the device
     with int64 P·V. "wide" V (48-bit exponent spread per row) defeats 3 V digits on most rows, so
     tier 1 alone flags many; with tier 2 the flags fall to what the int64 path alone leaves, and
-    every certified row is still bit-exact. block_dv 64 makes tier 2 rerun 2-row x 32-channel
-    blocks inside the tier-1 blocks (DESIGN D19)."""
+    every certified row is still bit-exact. block_dv 64 makes tier 2 rerun 32-channel blocks inside
+    the tier-1 blocks (DESIGN D19), and under the interpreter each tier-2 program strides over
+    several work items (DESIGN D23)."""
     rng = np.random.default_rng(zlib.crc32(f"tier2/{kind}".encode()))
     d, dv, R, n = 64, 64, 16, 100
     Q, K, V = bf16(rng, (R, d), kind), bf16(rng, (n, d), kind), bf16(rng, (n, dv), "wide")
@@ -493,6 +494,10 @@ def test_fused_need_equals_torch_formula(block_dv):
     got = _LAST_DEBUG["tier2_need"]
     assert want.sum() > 0 and (sfl != 0).any()               # both cases present
     assert torch_equal(got, want)
+    # The work list (DESIGN D23) holds each NEED pair exactly once, in any order.
+    cnt = int(_LAST_DEBUG["tier2_cnt"].cpu()[0])
+    items = sorted(_LAST_DEBUG["tier2_wl"].cpu()[:cnt].tolist())
+    assert items == np.flatnonzero(want.cpu().numpy().ravel()).tolist()
 
 
 def torch_equal(a, b):

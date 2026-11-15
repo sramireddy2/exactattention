@@ -22,10 +22,10 @@ from concurrent.futures import ProcessPoolExecutor
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 BASE = dict(D=128, DV=128, BLOCK_M=16, BLOCK_N=64, BLOCK_DV=32, EXP2_MARGIN=2.0 ** -26, USE_TC=True,
-            SQ=4, SK=4, TC_FALLBACK=True, USE_TC_PV=True, SW=5, SV=3, RERUN=False, PACK=1,
+            SQ=4, SK=4, TC_FALLBACK=True, USE_TC_PV=True, SW=5, SV=3, RERUN=False, PACK=1, RESET_CNT=True,
             EXP2_INT=True, num_warps=4)
-INT64 = dict(USE_TC=False, USE_TC_PV=False, BLOCK_N=16)
-TC = dict(USE_TC_PV=False, BLOCK_N=16)
+INT64 = dict(USE_TC=False, USE_TC_PV=False, BLOCK_N=16, RESET_CNT=False)
+TC = dict(USE_TC_PV=False, BLOCK_N=16, RESET_CNT=False)
 DECODE = dict(BLOCK_M=2, PACK=8)
 CONFIGS = {
     "int64 m2": {**INT64, **DECODE},
@@ -41,12 +41,14 @@ CONFIGS = {
     "tcpv m16 32/4": {},
     "tcpv m16 128/8": {"BLOCK_DV": 128, "num_warps": 8},     # verify steps (T = 8: 16 rows)
     "tcpv m16 128/8 q3": {"BLOCK_DV": 128, "num_warps": 8, "SQ": 3},
-    "tcpv tier2 m2": {**DECODE, "USE_TC_PV": False, "BLOCK_N": 16, "RERUN": True},
+    # Tier 2 as launch runs it (DESIGN D23): one row x 32 channels per work item, 64-key tiles.
+    "tcpv tier2": {"BLOCK_M": 1, "PACK": 16, "USE_TC_PV": False, "BLOCK_N": 64, "RERUN": True,
+                   "RESET_CNT": False, "num_warps": 8, "num_stages": 2},
 }
 PTR = {"Q": "*i16", "K": "*i16", "V": "*i16", "KVLEN": "*i32", "PR": "*i64", "PZ": "*i64", "PZE": "*i64",
        "PNR": "*i64", "PN": "*i64", "PNE": "*i64", "FLAG": "*i32", "KX": "*i8", "KLSB": "*i64",
-       "KL1S": "*fp64", "KLOST": "*i32", "VX": "*i8", "VLSB": "*i64", "VLOST": "*i8", "NEED": "*i32",
-       "EXP2T": "*i64"}
+       "KL1S": "*fp64", "KLOST": "*i32", "VX": "*i8", "VLSB": "*i64", "VLOST": "*i8", "CNT": "*i32",
+       "WL": "*i32", "EXP2T": "*i64"}
 
 
 def kernel_config(over):
@@ -76,7 +78,8 @@ COMBINE_CONFIGS = {
     "combine tier2": {"RERUN": True, "WRITE_NEED": False},
 }
 PTR_COMBINE = {"PR": "*i64", "PZ": "*i64", "PZE": "*i64", "PNR": "*i64", "PN": "*i64", "PNE": "*i64",
-               "ORDER": "*i64", "OUT": "*i32", "OFLAG": "*i32", "NEED": "*i32", "FLAG": "*i32"}
+               "ORDER": "*i64", "OUT": "*i32", "OFLAG": "*i32", "NEED": "*i32", "FLAG": "*i32",
+               "CNT": "*i32", "WL": "*i32"}
 
 
 def build_ptx(over, ttgir_out=None):

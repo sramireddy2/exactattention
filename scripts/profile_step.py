@@ -1,9 +1,9 @@
 """Where an exact step's GPU time goes: device time per kernel, and how much work tier 2 reruns
 (DESIGN D18). Same data and layout as scripts/bench_vs_flashinfer.py.
 
-Tier 2 recomputes, with int64 P·V, every program (segment row block x KV split x channel block)
-that holds a (row, channel block) pair the tensor-core P·V could not certify. So its cost
-follows the share of programs with such a pair, which grows with the row block.
+Tier 2 recomputes, with int64 P·V, each (row, 32-channel block) pair the tensor-core P·V could
+not certify, over every KV split, from a work list the tier-1 combine appends to (DESIGN D23).
+So its cost follows the number of such pairs.
 
     python scripts/profile_step.py --out results/profile_step.md
 """
@@ -50,12 +50,9 @@ def tier2_share():
     NEED = _LAST_DEBUG.get("tier2_need")
     if NEED is None:
         return "no tier 2"
-    bm = _LAST_DEBUG["block_m_t2"]                          # tier 2's own row block
-    R, ncb = NEED.shape
-    nb = (NEED.view(R // bm, bm, ncb) != 0).any(dim=1)
-    return (f"NEED pairs {int((NEED != 0).sum())}/{NEED.numel()}; programs rerun "
-            f"{int(nb.sum())}/{nb.numel()} 2-row x 32-channel blocks ({float(nb.float().mean()):.3f}, "
-            f"each over every KV split)")
+    cnt = int(_LAST_DEBUG["tier2_cnt"][0])                  # work-list items: one pair each
+    return (f"NEED pairs {int((NEED != 0).sum())}/{NEED.numel()}; tier 2 reran {cnt} work items "
+            f"(row x 32-channel block, each over every KV split)")
 
 
 def main():

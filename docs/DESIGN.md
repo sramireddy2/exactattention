@@ -933,9 +933,47 @@ splits.
 
 Where verify T=8 B=1 16K (0.765 ms) goes now: tier-1 split 0.579, tier-1 combine 0.023,
 tier-2 split 0.139, tier-2 combine 0.019. At decode B=1 16K: split 0.179 of 0.205. The split
-kernel is now the whole cost. Its cheapest target is tier 2: 2 rerun programs take 0.139 ms
-because each walks all 16K keys in int64 by itself; spreading the NEED blocks across KV splits
-should bring that to a few µs.
+kernel is now the whole cost. Its cheapest target is tier 2: 0.139 ms to rerun 2 blocks (D23).
+
+## D23. Tier 2: a work list and 64-key tiles
+
+Tier 2's grid already covered every KV split, so a rerun block walks only its split's keys. Its
+cost comes from two other places.
+
+- **Tile overhead.** At verify B=1 16K a split is 256 keys: 16 tiles of 16 keys in 0.139 ms.
+  At verify B=8 4K it is 352 keys: 22 tiles in 0.189 ms. Both come to about 8.7 µs per tile.
+  With 2 or 3 pairs there is about one 4-warp program per SM, so nothing hides latency. Offline
+  SASS shows half of a 16-key tile's instructions (1644 of 3314 per warp) in `_tc_logits`, a
+  per-tile cost that bigger tiles spread over more keys.
+- **The grid.** It was every 2-row block × split × 32-channel block (24.6K programs at verify
+  B=8), nearly all empty. Bigger, 8-warp programs would make those cost more.
+
+**Work list.** The tier-1 combine appends each NEED pair, a (row, 32-channel block), to a list
+`WL` with one atomic add per pair on a counter `CNT`. Tier 1's split program (0, 0, 0) zeroes
+the counter, because a fill launch would break the step's no-fill rule (D16). Tier 2's split
+grid is (programs, KV splits), with programs = ⌈2 · SMs / splits⌉, about two waves. Each
+program strides over the list, so any count is covered and the grid stays fixed (graph-safe).
+With no pairs, every program reads `CNT` and exits. The list's order depends on the atomics,
+but each item writes only its own (split, row, channels) partials and takes an `atomic_max` of
+its flag, so the bits do not depend on that order. The kernel body moved into
+`_split_program`, which tier 1 calls once and tier 2 calls once per item.
+
+**One row, 64-key tiles, 8 warps.** A list item is a single row, so tier 2 runs
+`block_m_t2 = 1` (16 digit slots per MMA). Two flagged rows of a block are now two items,
+which run in parallel. Tiles are 64 keys when the split length allows it (else 32), with
+pipelining depth 2.
+
+| tier-2 tile, sm_120 SASS | regs / spill | hot SASS per warp per key | warp-instructions per 32 keys |
+|---|---|---|---|
+| 2 rows, 16 keys, 4 warps (before) | 254 / 0 | 207 | 26.5K |
+| 2 rows, 64 keys, 8 warps | 255 / 24 B | 45 | 11.4K |
+| 1 row, 32 keys, 4 warps | 249 / 0 | 73 | 9.4K |
+| 1 row, 64 keys, 8 warps (kept) | 255 / 0 | 36 | 9.3K |
+
+`sm120_sass_profile.py` now follows the extra inlining level: nvdisasm prints one line-info
+comment per level, and work-list loops are skipped when it looks for the key loop.
+`test_fused_need_equals_torch_formula` checks that the list holds each NEED pair exactly once.
+Under the interpreter the SM count is 2, so the tier-2 tests run several items per program.
 
 ## Open questions
 

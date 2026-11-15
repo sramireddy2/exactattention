@@ -38,11 +38,16 @@ def rare_lines(src):
 def parse(sass):
     """[(line chain, opcode, operands)] and label positions. nvdisasm -gi gives each instruction's
     line and, for inlined code, the caller's line; the last entry is the kernel-level line."""
-    ins, labels, chain = [], {}, ()
+    ins, labels, chain, more = [], {}, (), False
     for s in sass.splitlines():
         if "//##" in s:
-            chain = tuple(int(x) for x in re.findall(r"line (\d+)", s))
+            # Deeper inlining prints one comment per level ("a inlined at b", then "b inlined at
+            # c"); consecutive comments are one chain, innermost line first.
+            new = tuple(int(x) for x in re.findall(r"line (\d+)", s))
+            chain = chain + tuple(x for x in new if not chain or x != chain[-1]) if more else new
+            more = True
             continue
+        more = False
         m = re.match(r"^(\.L_x_\d+):", s.strip())
         if m:
             labels[m.group(1)] = len(ins)
@@ -53,13 +58,35 @@ def parse(sass):
     return ins, labels
 
 
-def key_loop(ins, labels):
+def body_lines(src):
+    """Source lines of _split_program, the per-program body both tiers inline (DESIGN D23), and
+    the kernel lines that call it."""
+    a = next(i for i, ln in enumerate(src, 1) if ln.startswith("def _split_program("))
+    b = next(i for i, ln in enumerate(src[a:], a + 1) if ln.startswith(("@triton.jit", "def ")))
+    calls = {i for i, ln in enumerate(src, 1) if "_split_program(" in ln and not ln.startswith("def ")}
+    return set(range(a, b)), calls
+
+
+def body_line(chain, body):
+    """The kernel-level line of an instruction, read inside _split_program: inlined helpers are
+    charged to the body line that calls them, not to the kernel's call of the body."""
+    inside = [ln for ln in chain if ln in body]
+    return inside[-1] if inside else (chain[-1] if chain else -1)
+
+
+def key_loop(ins, labels, body=None, calls=()):
+    """The largest backward branch, i.e. the key loop. With body, a loop that holds kernel-level
+    code other than the call of _split_program (tier 2's work-list loop) does not count."""
     best = None
     for i, (_, op, rest) in enumerate(ins):
         m = re.search(r"`\((\.L_x_\d+)\)", rest) if op == "BRA" else None
         if m and m.group(1) in labels and labels[m.group(1)] <= i:
-            if best is None or i - labels[m.group(1)] > best[1] - best[0]:
-                best = (labels[m.group(1)], i)
+            lo = labels[m.group(1)]
+            if body is not None and any(c and not any(ln in body for ln in c) and c[-1] not in calls
+                                        for c, _, _ in ins[lo:i + 1]):
+                continue
+            if best is None or i - lo > best[1] - best[0]:
+                best = (lo, i)
     return best
 
 
@@ -75,14 +102,15 @@ def profile(name, over):
     stack = re.findall(r"(\d+) bytes stack frame", info)
     src = open(SRC).read().splitlines()
     rare = rare_lines(src)
+    body, calls = body_lines(src)
     ins, labels = parse(sass)
-    lo, hi = key_loop(ins, labels)
+    lo, hi = key_loop(ins, labels, body, calls)
     by_line, ops, n_rare = collections.Counter(), collections.Counter(), 0
     for chain, op, _ in ins[lo:hi + 1]:
         if any(ln in rare for ln in chain):
             n_rare += 1
             continue
-        by_line[chain[-1] if chain else -1] += 1
+        by_line[body_line(chain, body)] += 1
         ops[op] += 1
     hot = sum(by_line.values())
     return dict(name=name, warps=nw, block_n=cfg["BLOCK_N"], regs=int(regs[0]) if regs else None,

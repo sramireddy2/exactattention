@@ -563,23 +563,21 @@ def _exp2_weight_f64(t, EXP2_MARGIN: tl.constexpr):
 # ---------------------------------------------------------------------------
 
 @triton.jit
-def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
-                     PR, PZ, PZE, PNR, PN, PNE, FLAG,
-                     SPLIT_LEN, FZ, FN,
-                     KX, KLSB, KL1S, KLOST, NKEYS, VX, VLSB, VLOST,
-                     R_SEG, NK_SEG, NRB, NEED, FL_NCB,
-                     D: tl.constexpr, DV: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-                     BLOCK_DV: tl.constexpr, FS: tl.constexpr, EXP2_MARGIN: tl.constexpr,
-                     USE_TC: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr, TC_FALLBACK: tl.constexpr,
-                     USE_TC_PV: tl.constexpr, SW: tl.constexpr, SV: tl.constexpr, ANCH: tl.constexpr,
-                     RERUN: tl.constexpr, PACK: tl.constexpr, EXP2T, EXP2_INT: tl.constexpr,
-                     WDC: tl.constexpr, FL_DIV: tl.constexpr):
+def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
+                   PR, PZ, PZE, PNR, PN, PNE, FLAG,
+                   SPLIT_LEN, FZ, FN,
+                   KX, KLSB, KL1S, KLOST, NKEYS, VX, VLSB, VLOST,
+                   R_SEG, NK_SEG, NRB, FL_NCB,
+                   D: tl.constexpr, DV: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                   BLOCK_DV: tl.constexpr, FS: tl.constexpr, EXP2_MARGIN: tl.constexpr,
+                   USE_TC: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr, TC_FALLBACK: tl.constexpr,
+                   USE_TC_PV: tl.constexpr, SW: tl.constexpr, SV: tl.constexpr, ANCH: tl.constexpr,
+                   RERUN: tl.constexpr, PACK: tl.constexpr, EXP2T, EXP2_INT: tl.constexpr,
+                   WDC: tl.constexpr, FL_DIV: tl.constexpr):
+    # One program's work: row block pid_m (segment-major), KV split pid_s, channel block pid_c.
     # Segments: G independent problems (e.g. sequence x KV head), each with R_SEG query rows
     # attending its own NK_SEG keys. Rows and keys are stored segment after segment, so
     # ROWS = G * R_SEG and NKEYS = G * NK_SEG. Each program handles one segment's row block.
-    pid_m = tl.program_id(0)
-    pid_s = tl.program_id(1)
-    pid_c = tl.program_id(2)
     seg = pid_m // NRB
     lrows = (pid_m % NRB) * BLOCK_M + tl.arange(0, BLOCK_M)
     rmask = lrows < R_SEG
@@ -598,134 +596,162 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
     VLOST += kb0 * DV
     KST = (kb0 * 0 + NKEYS) * D                                            # digit-plane strides
     VST = (kb0 * 0 + NKEYS) * DV
-    go = True
-    if RERUN:
-        # Tier 2 (DESIGN D12, D20): recompute only the (row, channel block) pairs in NEED. Its grid
-        # is fixed (graph-safe) and almost all of it has nothing to do, so a program checks NEED
-        # first and exits before loading or slicing q.
-        need = (tl.load(NEED + rows * tl.num_programs(2) + pid_c, mask=rmask, other=0) != 0) & rmask
-        go = tl.max(need.to(tl.int32), axis=0) > 0
-    if go:
-        kvl = tl.load(KVLEN + rows, mask=rmask, other=0)
-        dd = tl.arange(0, D)
-        cc = pid_c * BLOCK_DV + tl.arange(0, BLOCK_DV)
-        qb = tl.load(Q + rows[:, None] * D + dd[None, :], mask=rmask[:, None], other=0)
-        qm, qe, qbad = _decode_bf16(qb)
-        flag = tl.max(qbad.to(tl.int32), axis=1)
+    kvl = tl.load(KVLEN + rows, mask=rmask, other=0)
+    dd = tl.arange(0, D)
+    cc = pid_c * BLOCK_DV + tl.arange(0, BLOCK_DV)
+    qb = tl.load(Q + rows[:, None] * D + dd[None, :], mask=rmask[:, None], other=0)
+    qm, qe, qbad = _decode_bf16(qb)
+    flag = tl.max(qbad.to(tl.int32), axis=1)
+    if USE_TC:
+        q0, q1, q2, q3, qlsb, ql1s, qlost = _slice_q(qm, qe, SQ, PACK, BLOCK_M, D)
+        qerr, qbig = _l1_ceil(ql1s)
+    PRr = tl.full((BLOCK_M,), NEG, tl.int64)
+    PZr = tl.zeros((BLOCK_M,), tl.int64)
+    PZEr = tl.zeros((BLOCK_M,), tl.int64)
+    # The (row, channel) running partial is the loop's largest live state. Its exponent is held
+    # in int32 (DESIGN D21); the value and the error count need int64.
+    PNRr = tl.full((BLOCK_M, BLOCK_DV), NEG32, tl.int32)
+    PNr = tl.zeros((BLOCK_M, BLOCK_DV), tl.int64)
+    PNEr = tl.zeros((BLOCK_M, BLOCK_DV), tl.int64)
+    k0 = pid_s * SPLIT_LEN
+    kmax = tl.max(kvl, axis=0)
+    k1 = tl.minimum(k0 + SPLIT_LEN, kmax)
+    for n0 in range(k0, k1, BLOCK_N):
+        nn = n0 + tl.arange(0, BLOCK_N)
+        vis = (nn[None, :] < kvl[:, None]) & rmask[:, None]              # (M, N)
+        # ---- scores ----
         if USE_TC:
-            q0, q1, q2, q3, qlsb, ql1s, qlost = _slice_q(qm, qe, SQ, PACK, BLOCK_M, D)
-            qerr, qbig = _l1_ceil(ql1s)
-        PRr = tl.full((BLOCK_M,), NEG, tl.int64)
-        PZr = tl.zeros((BLOCK_M,), tl.int64)
-        PZEr = tl.zeros((BLOCK_M,), tl.int64)
-        # The (row, channel) running partial is the loop's largest live state. Its exponent is held
-        # in int32 (DESIGN D21); the value and the error count need int64.
-        PNRr = tl.full((BLOCK_M, BLOCK_DV), NEG32, tl.int32)
-        PNr = tl.zeros((BLOCK_M, BLOCK_DV), tl.int64)
-        PNEr = tl.zeros((BLOCK_M, BLOCK_DV), tl.int64)
-        k0 = pid_s * SPLIT_LEN
-        kmax = tl.max(kvl, axis=0)
-        k1 = tl.minimum(k0 + SPLIT_LEN, kmax)
-        for n0 in range(k0, k1, BLOCK_N):
-            nn = n0 + tl.arange(0, BLOCK_N)
-            vis = (nn[None, :] < kvl[:, None]) & rmask[:, None]              # (M, N)
-            # ---- scores ----
-            if USE_TC:
-                # Tensor cores: int8 slice products, certified. The bf16 K tile is read and decoded
-                # only for tiles that contain an uncertified score (windowed recompute); NaN/inf
-                # keys come from a flag made at cache write.
-                t, unc, kbad = _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nn < kmax, KST,
-                                          KLSB, KL1S, KLOST, AM, AE, D, SQ, SK, PACK, BLOCK_M)
-                flag = tl.maximum(flag, tl.max((vis & kbad[None, :]).to(tl.int32), axis=1))
-                if TC_FALLBACK and tl.max(tl.max((unc & vis).to(tl.int32), axis=1), axis=0) > 0:
-                    t_w, unc_w = _windowed_logits(Q, rows * D, rmask, K, nn, nn < kmax, AM, AE, D, WDC, FS)
-                    t = tl.where(unc, t_w, t)
-                    unc = unc & unc_w
-            else:
-                kb = tl.load(K + nn[:, None] * D + dd[None, :], mask=(nn < kmax)[:, None], other=0).to(tl.int32)
-                kbad = tl.max((((kb >> 7) & 0xFF) == 0xFF).to(tl.int32), axis=1)  # (N,) NaN/inf key
-                flag = tl.maximum(flag, tl.max((vis & (kbad != 0)[None, :]).to(tl.int32), axis=1))
-                t, unc = _windowed_logits(Q, rows * D, rmask, K, nn, nn < kmax, AM, AE, D, WDC, FS)
-            # ---- weights ----
-            if EXP2_INT:
-                Mw, Ew, risky = _exp2_weight(t, EXP2T)
-                if tl.max(tl.max((risky & vis).to(tl.int32), axis=1), axis=0) > 0:
-                    # Rare (about 2^-14 of weights): float64 exp2 for this tile.
-                    Mw2, Ew2, risky2 = _exp2_weight_f64(t, EXP2_MARGIN)
-                    Mw = tl.where(risky, Mw2, Mw)
-                    Ew = tl.where(risky, Ew2, Ew)
-                    risky = risky & risky2
-            else:
-                Mw, Ew, risky = _exp2_weight_f64(t, EXP2_MARGIN)
-            unc = unc | risky | (tl.abs(t) >= 1073741824.0)
-            flag = tl.maximum(flag, tl.max((vis & unc).to(tl.int32), axis=1))
-            # ---- tile partial ----
-            top = tl.where(vis, Ew + 23, NEG)
-            TR = tl.max(top, axis=1)                                           # (M,)
-            zt, zl = _floor_shift(Mw, Ew - (TR[:, None] - FZ))
-            TZ = tl.sum(tl.where(vis, zt, 0), axis=1)
-            TZE = tl.sum((zl & vis).to(tl.int64), axis=1)
-            if USE_TC_PV:
-                TNR, TN, TNE, vbad = _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nn < kmax, cc, VST, FN, DV,
-                                            SW, SV, ANCH, PACK, BLOCK_M)
-                flag = tl.maximum(flag, tl.max((vis & vbad[None, :]).to(tl.int32), axis=1))
-            else:
-                vb = tl.load(V + nn[:, None] * DV + cc[None, :], mask=(nn < kmax)[:, None], other=0)
-                vm, ve, vbad = _decode_bf16(vb)                                # (N, BDV)
-                flag = tl.maximum(flag, tl.max((vis & (tl.max(vbad.to(tl.int32), axis=1) != 0)[None, :]).to(tl.int32), axis=1))
-                lv = tl.where(vm != 0, ve + _bitlen(tl.abs(vm)) - 1, NEG)
-                valid = vis[:, :, None] & (vm != 0)[None, :, :]                # (M, N, BDV)
-                L = tl.where(valid, top[:, :, None] + 1 + lv[None, :, :], NEG)
-                TNR = tl.max(L, axis=1)                                        # (M, BDV)
-                TNR = tl.where(TNR > NEG // 2, TNR, NEG32).to(tl.int32)
-                nt, nl = _floor_shift(Mw[:, :, None] * vm[None, :, :],
-                                      Ew[:, :, None] + ve[None, :, :] - (TNR[:, None, :] - FN))
-                TN = tl.sum(tl.where(valid, nt, 0), axis=1)
-                TNE = tl.sum((nl & valid).to(tl.int64), axis=1)
-            # ---- merge into the running partial ----
-            nR = tl.maximum(PRr, TR)
-            a1, e1 = _rescale(PZr, PZEr, nR - PRr)
-            a2, e2 = _rescale(TZ, TZE, nR - TR)
-            PRr = nR
-            PZr = a1 + a2
-            PZEr = e1 + e2
-            nNR = tl.maximum(PNRr, TNR)
-            b1, f1 = _rescale(PNr, PNEr, (nNR - PNRr).to(tl.int64))
-            b2, f2 = _rescale(TN, TNE, (nNR - TNR).to(tl.int64))
-            PNRr = nNR
-            PNr = b1 + b2
-            PNEr = f1 + f2
-            flag = tl.maximum(flag, ((tl.abs(PZr) + PZEr) >= (1 << 62)).to(tl.int32))
-            flag = tl.maximum(flag, tl.max(((tl.abs(PNr) + PNEr) >= (1 << 62)).to(tl.int32), axis=1))
-        off = pid_s * ROWS + rows
-        wmask = rmask
-        if RERUN:
-            wmask = need          # tier 2 keeps tier 1's Z partials and rewrites only N for NEED pairs
+            # Tensor cores: int8 slice products, certified. The bf16 K tile is read and decoded
+            # only for tiles that contain an uncertified score (windowed recompute); NaN/inf
+            # keys come from a flag made at cache write.
+            t, unc, kbad = _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nn < kmax, KST,
+                                      KLSB, KL1S, KLOST, AM, AE, D, SQ, SK, PACK, BLOCK_M)
+            flag = tl.maximum(flag, tl.max((vis & kbad[None, :]).to(tl.int32), axis=1))
+            if TC_FALLBACK and tl.max(tl.max((unc & vis).to(tl.int32), axis=1), axis=0) > 0:
+                t_w, unc_w = _windowed_logits(Q, rows * D, rmask, K, nn, nn < kmax, AM, AE, D, WDC, FS)
+                t = tl.where(unc, t_w, t)
+                unc = unc & unc_w
         else:
-            zmask = rmask & ((rows * 0 + pid_c) == 0)  # only channel block 0 writes Z
-            tl.store(PR + off, PRr, mask=zmask)
-            tl.store(PZ + off, PZr, mask=zmask)
-            tl.store(PZE + off, PZEr, mask=zmask)
-        o2 = off[:, None] * DV + cc[None, :]
-        tl.store(PNR + o2, tl.where(PNRr > NEG32, PNRr.to(tl.int64), NEG), mask=wmask[:, None])
-        tl.store(PN + o2, PNr, mask=wmask[:, None])
-        tl.store(PNE + o2, PNEr, mask=wmask[:, None])
-        # FLAG has FL_NCB channel blocks of tier 1's width; tier 2 runs FL_DIV narrower blocks per
-        # entry, so it takes the maximum (atomics: the result does not depend on their order).
-        fo = FLAG + (pid_s * ROWS + rows) * FL_NCB + pid_c // FL_DIV
-        if RERUN:
-            tl.atomic_max(fo, flag, mask=wmask)
+            kb = tl.load(K + nn[:, None] * D + dd[None, :], mask=(nn < kmax)[:, None], other=0).to(tl.int32)
+            kbad = tl.max((((kb >> 7) & 0xFF) == 0xFF).to(tl.int32), axis=1)  # (N,) NaN/inf key
+            flag = tl.maximum(flag, tl.max((vis & (kbad != 0)[None, :]).to(tl.int32), axis=1))
+            t, unc = _windowed_logits(Q, rows * D, rmask, K, nn, nn < kmax, AM, AE, D, WDC, FS)
+        # ---- weights ----
+        if EXP2_INT:
+            Mw, Ew, risky = _exp2_weight(t, EXP2T)
+            if tl.max(tl.max((risky & vis).to(tl.int32), axis=1), axis=0) > 0:
+                # Rare (about 2^-14 of weights): float64 exp2 for this tile.
+                Mw2, Ew2, risky2 = _exp2_weight_f64(t, EXP2_MARGIN)
+                Mw = tl.where(risky, Mw2, Mw)
+                Ew = tl.where(risky, Ew2, Ew)
+                risky = risky & risky2
         else:
-            tl.store(fo, flag, mask=wmask)
+            Mw, Ew, risky = _exp2_weight_f64(t, EXP2_MARGIN)
+        unc = unc | risky | (tl.abs(t) >= 1073741824.0)
+        flag = tl.maximum(flag, tl.max((vis & unc).to(tl.int32), axis=1))
+        # ---- tile partial ----
+        top = tl.where(vis, Ew + 23, NEG)
+        TR = tl.max(top, axis=1)                                           # (M,)
+        zt, zl = _floor_shift(Mw, Ew - (TR[:, None] - FZ))
+        TZ = tl.sum(tl.where(vis, zt, 0), axis=1)
+        TZE = tl.sum((zl & vis).to(tl.int64), axis=1)
+        if USE_TC_PV:
+            TNR, TN, TNE, vbad = _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nn < kmax, cc, VST, FN, DV,
+                                        SW, SV, ANCH, PACK, BLOCK_M)
+            flag = tl.maximum(flag, tl.max((vis & vbad[None, :]).to(tl.int32), axis=1))
+        else:
+            vb = tl.load(V + nn[:, None] * DV + cc[None, :], mask=(nn < kmax)[:, None], other=0)
+            vm, ve, vbad = _decode_bf16(vb)                                # (N, BDV)
+            flag = tl.maximum(flag, tl.max((vis & (tl.max(vbad.to(tl.int32), axis=1) != 0)[None, :]).to(tl.int32), axis=1))
+            lv = tl.where(vm != 0, ve + _bitlen(tl.abs(vm)) - 1, NEG)
+            valid = vis[:, :, None] & (vm != 0)[None, :, :]                # (M, N, BDV)
+            L = tl.where(valid, top[:, :, None] + 1 + lv[None, :, :], NEG)
+            TNR = tl.max(L, axis=1)                                        # (M, BDV)
+            TNR = tl.where(TNR > NEG // 2, TNR, NEG32).to(tl.int32)
+            nt, nl = _floor_shift(Mw[:, :, None] * vm[None, :, :],
+                                  Ew[:, :, None] + ve[None, :, :] - (TNR[:, None, :] - FN))
+            TN = tl.sum(tl.where(valid, nt, 0), axis=1)
+            TNE = tl.sum((nl & valid).to(tl.int64), axis=1)
+        # ---- merge into the running partial ----
+        nR = tl.maximum(PRr, TR)
+        a1, e1 = _rescale(PZr, PZEr, nR - PRr)
+        a2, e2 = _rescale(TZ, TZE, nR - TR)
+        PRr = nR
+        PZr = a1 + a2
+        PZEr = e1 + e2
+        nNR = tl.maximum(PNRr, TNR)
+        b1, f1 = _rescale(PNr, PNEr, (nNR - PNRr).to(tl.int64))
+        b2, f2 = _rescale(TN, TNE, (nNR - TNR).to(tl.int64))
+        PNRr = nNR
+        PNr = b1 + b2
+        PNEr = f1 + f2
+        flag = tl.maximum(flag, ((tl.abs(PZr) + PZEr) >= (1 << 62)).to(tl.int32))
+        flag = tl.maximum(flag, tl.max(((tl.abs(PNr) + PNEr) >= (1 << 62)).to(tl.int32), axis=1))
+    off = pid_s * ROWS + rows
+    wmask = rmask
+    if not RERUN:             # tier 2 keeps tier 1's Z partials and rewrites only its pair's N
+        zmask = rmask & ((rows * 0 + pid_c) == 0)  # only channel block 0 writes Z
+        tl.store(PR + off, PRr, mask=zmask)
+        tl.store(PZ + off, PZr, mask=zmask)
+        tl.store(PZE + off, PZEr, mask=zmask)
+    o2 = off[:, None] * DV + cc[None, :]
+    tl.store(PNR + o2, tl.where(PNRr > NEG32, PNRr.to(tl.int64), NEG), mask=wmask[:, None])
+    tl.store(PN + o2, PNr, mask=wmask[:, None])
+    tl.store(PNE + o2, PNEr, mask=wmask[:, None])
+    # FLAG has FL_NCB channel blocks of tier 1's width; tier 2 runs FL_DIV narrower blocks per
+    # entry, so it takes the maximum (atomics: the result does not depend on their order).
+    fo = FLAG + (pid_s * ROWS + rows) * FL_NCB + pid_c // FL_DIV
+    if RERUN:
+        tl.atomic_max(fo, flag, mask=wmask)
+    else:
+        tl.store(fo, flag, mask=wmask)
 
 
 @triton.jit
-def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, OUT, OFLAG, NEED, FLAG, FL_NCB,
+def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
+                     PR, PZ, PZE, PNR, PN, PNE, FLAG,
+                     SPLIT_LEN, FZ, FN,
+                     KX, KLSB, KL1S, KLOST, NKEYS, VX, VLSB, VLOST,
+                     R_SEG, NK_SEG, NRB, FL_NCB, CNT, WL, NCCB,
+                     D: tl.constexpr, DV: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                     BLOCK_DV: tl.constexpr, FS: tl.constexpr, EXP2_MARGIN: tl.constexpr,
+                     USE_TC: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr, TC_FALLBACK: tl.constexpr,
+                     USE_TC_PV: tl.constexpr, SW: tl.constexpr, SV: tl.constexpr, ANCH: tl.constexpr,
+                     RERUN: tl.constexpr, PACK: tl.constexpr, EXP2T, EXP2_INT: tl.constexpr,
+                     WDC: tl.constexpr, FL_DIV: tl.constexpr, RESET_CNT: tl.constexpr):
+    pid_s = tl.program_id(1)
+    if RERUN:
+        # Tier 2 (DESIGN D12, D23): the tier-1 combine appended each (row, channel block) pair to
+        # rerun to the work list WL, and CNT counts them. The grid is fixed (graph-safe) and small:
+        # programs stride over the list, one row x one channel block per item, for this KV split.
+        # The list's order depends on atomics, but each item writes only its own partials, so the
+        # bits do not.
+        cnt = tl.load(CNT)
+        for it in range(tl.program_id(0), cnt, tl.num_programs(0)):
+            item = tl.load(WL + it)
+            _split_program(item // NCCB, pid_s, item % NCCB, Q, K, V, KVLEN, ROWS, AM, AE, PR, PZ, PZE, PNR, PN, PNE,
+                           FLAG, SPLIT_LEN, FZ, FN, KX, KLSB, KL1S, KLOST, NKEYS, VX, VLSB, VLOST, R_SEG, NK_SEG, NRB,
+                           FL_NCB, D, DV, BLOCK_M, BLOCK_N, BLOCK_DV, FS, EXP2_MARGIN, USE_TC, SQ, SK, TC_FALLBACK,
+                           USE_TC_PV, SW, SV, ANCH, RERUN, PACK, EXP2T, EXP2_INT, WDC, FL_DIV)
+    else:
+        if RESET_CNT:
+            # Tier 1 runs first in a step: zero tier 2's work-list count here, not with a fill launch.
+            if (tl.program_id(0) == 0) & (pid_s == 0) & (tl.program_id(2) == 0):
+                tl.store(CNT, 0)
+        _split_program(tl.program_id(0), pid_s, tl.program_id(2), Q, K, V, KVLEN, ROWS, AM, AE, PR, PZ, PZE, PNR, PN,
+                       PNE, FLAG, SPLIT_LEN, FZ, FN, KX, KLSB, KL1S, KLOST, NKEYS, VX, VLSB, VLOST, R_SEG, NK_SEG, NRB,
+                       FL_NCB, D, DV, BLOCK_M, BLOCK_N, BLOCK_DV, FS, EXP2_MARGIN, USE_TC, SQ, SK, TC_FALLBACK,
+                       USE_TC_PV, SW, SV, ANCH, RERUN, PACK, EXP2T, EXP2_INT, WDC, FL_DIV)
+
+
+@triton.jit
+def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, OUT, OFLAG, NEED, FLAG, FL_NCB, CNT, WL,
                        DV: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_DV: tl.constexpr,
                        P: tl.constexpr, QMIN: tl.constexpr, OUT_FP32: tl.constexpr,
                        RERUN: tl.constexpr, WRITE_NEED: tl.constexpr, FL_DIV: tl.constexpr):
-    # Tier 1 with WRITE_NEED also writes tier 2's work list (DESIGN D12, D16): NEED = this
-    # combine's flag set and no split flagged the pair (FLAG), fused here instead of torch ops.
+    # Tier 1 with WRITE_NEED also writes tier 2's work (DESIGN D12, D16, D23): NEED = this
+    # combine's flag set and no split flagged the pair (FLAG), fused here instead of torch ops, and
+    # each such pair appended to the work list WL (CNT counts them; tier 1's split zeroed it).
     pid_m = tl.program_id(0)
     pid_c = tl.program_id(1)
     rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -802,7 +828,11 @@ def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, O
         tl.store(OUT + rows[:, None] * DV + cc[None, :], bits, mask=wmask[:, None])
         tl.store(OFLAG + rows * tl.num_programs(1) + pid_c, flag, mask=wmask)
         if WRITE_NEED:
-            tl.store(NEED + rows * tl.num_programs(1) + pid_c, ((flag != 0) & (sflag == 0)).to(tl.int32), mask=rmask)
+            pair = rows * tl.num_programs(1) + pid_c
+            nd = (flag != 0) & (sflag == 0) & rmask
+            tl.store(NEED + pair, nd.to(tl.int32), mask=rmask)
+            slot = tl.atomic_add(CNT + rows * 0, 1, mask=nd)     # one slot per pair, any order
+            tl.store(WL + slot, pair, mask=nd)
 
 
 # ---------------------------------------------------------------------------
@@ -925,6 +955,18 @@ def _dummies(dev) -> dict:
     return _DEV_CACHE[key]
 
 
+def _sm_count(dev) -> int:
+    """Streaming multiprocessors on a CUDA/ROCm device; 32 for other GPUs (it only sizes tier 2's
+    grid), and 2 for the CPU interpreter, so tests run tier 2's work-list loop over several items
+    per program."""
+    key = ("sms", str(dev))
+    if key not in _DEV_CACHE:
+        d = torch.device(dev)
+        _DEV_CACHE[key] = (torch.cuda.get_device_properties(d).multi_processor_count if d.type == "cuda"
+                           else 2 if d.type == "cpu" else 32)
+    return _DEV_CACHE[key]
+
+
 def _arange_dev(n: int, dev) -> torch.Tensor:
     key = ("arange", str(dev), n)
     if key not in _DEV_CACHE:
@@ -979,10 +1021,6 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     dev = Qt.device
     key_log2 = max(1, int(np.ceil(np.log2(max(2, maxlen)))))
     fz = fn = 64 - 3 - key_log2
-    # Tier 2 runs int64 P·V, which has no MMA shape limit; its (rows, keys, channels) int64
-    # products stay small at 16 keys. Any tile size gives the same bits (SPEC §5.3).
-    block_n_t2 = min(block_n, 16)
-    block_m_t2 = min(block_m, 2)
     if v_tc is not None:
         # P·V contracts over the key tile, and int8 MMAs on NVIDIA need K >= 32 (mma.m16n8k32).
         # The CPU interpreter does not enforce this. The tile size cannot change the output
@@ -991,6 +1029,12 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     split_len = max(block_n, -(-max(maxlen, 1) // splits))
     split_len = -(-split_len // block_n) * block_n
     nsplit = max(1, -(-max(maxlen, 1) // split_len))
+    # Tier 2 (DESIGN D23) reruns one row x one 32-channel block per work item with int64 P·V. A
+    # rerun has few programs to hide latency with, so it takes 64-key tiles at 8 warps: a 16-key
+    # tile spent half its instructions on per-tile tensor-core score overhead. Tiles must not
+    # cross a split, and any tile size gives the same bits (SPEC §5.3).
+    block_n_t2 = 64 if split_len % 64 == 0 else 32 if split_len % 32 == 0 else 16
+    block_m_t2 = 1
     am, ae = decode_fp32(np.float32(alpha))
     dz = _dummies(dev)
     use_tc = k_tc is not None
@@ -1040,20 +1084,28 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
         # (more latency hiding, more spills). A tiling choice, so it cannot change bits.
         stages["maxnreg"] = maxnreg
 
-    def split(need, rerun, bn, pv, v_args, sw_, sv_, anch_, bm, bdv, nw):
+    tier2 = use_tc_pv and pv_tier2
+    # Combine channel blocks (at most 32): NEED, OF and tier 2's work items use them (DESIGN D19).
+    cbdv = min(block_dv, 32)
+    nccb = dv // cbdv
+    # Tier 2's work list: CNT items in WL, each a flattened (row, combine channel block) pair.
+    CNT = torch.empty(1, dtype=torch.int32, device=dev) if tier2 else z32
+    WL = torch.empty(R * nccb, dtype=torch.int32, device=dev) if tier2 else z32
+
+    def split(rerun, bn, pv, v_args, sw_, sv_, anch_, bm, bdv, nw, grid0, stg):
         nrb_ = triton.cdiv(r_seg, bm)
         # Windowed-score channel chunk (DESIGN D17): about 16 int64 products per thread live at once.
         wdc = max(1, min(d, (512 * nw) // (bm * bn)))
-        return _ea_split_kernel[(G * nrb_, nsplit, dv // bdv)](
+        return _ea_split_kernel[(grid0 or G * nrb_, nsplit, 1 if rerun else dv // bdv)](
             Qt, Kt, Vt, KL, R, am, ae, PR_, PZ_, PZE_, PNR_, PN_, PNE_, FL,
-            split_len, fz, fn, *tc, n, *v_args, r_seg, n_seg, nrb_, need, ncb, D=d, DV=dv,
+            split_len, fz, fn, *tc, n, *v_args, r_seg, n_seg, nrb_, ncb, CNT, WL, nccb, D=d, DV=dv,
             BLOCK_M=bm, BLOCK_N=bn, BLOCK_DV=bdv, FS=SCORE_FS,
             EXP2_MARGIN=exp2_margin, USE_TC=use_tc, SQ=sq, SK=sk, TC_FALLBACK=tc_fallback,
             USE_TC_PV=pv, SW=sw_, SV=sv_, ANCH=anch_, RERUN=rerun, PACK=max(1, 16 // bm),
-            EXP2T=exp2t, EXP2_INT=(exp2 == "int"), WDC=wdc, FL_DIV=block_dv // bdv, num_warps=nw, **stages)
+            EXP2T=exp2t, EXP2_INT=(exp2 == "int"), WDC=wdc, FL_DIV=block_dv // bdv,
+            RESET_CNT=tier2 and not rerun, num_warps=nw, **stg)
 
-    ck = split(z32, False, block_n, use_tc_pv, vtc, sw, sv, anch, block_m, block_dv, num_warps)
-    stages.pop("maxnreg", None)                                  # tier 2 keeps its own registers
+    ck = split(False, block_n, use_tc_pv, vtc, sw, sv, anch, block_m, block_dv, num_warps, 0, stages)
     # Registers and spills of the compiled split kernel (None under the CPU interpreter).
     _LAST_DEBUG.update(n_regs=getattr(ck, "n_regs", None), n_spills=getattr(ck, "n_spills", None))
     if merge_order is None:
@@ -1066,10 +1118,6 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
         assert sorted(order.tolist()) == list(range(nsplit))
         ORD = torch.from_numpy(order.astype(np.int64)).to(dev)
     OUT = torch.empty((R, dv), dtype=torch.int32, device=dev)
-    # The combine kernel, and so NEED and OF, use channel blocks of at most 32: tier 2 then reruns
-    # only the 32-channel blocks that need it (DESIGN D19).
-    cbdv = min(block_dv, 32)
-    nccb = dv // cbdv
     OF = torch.empty((R, nccb), dtype=torch.int32, device=dev)   # every entry is written
     p, qmin = (8, -133) if out == "bf16" else (24, -149)
 
@@ -1080,12 +1128,12 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
 
     def combine(need, rerun, write_need):
         _ea_combine_kernel[(triton.cdiv(R, cbm), nccb)](PR_, PZ_, PZE_, PNR_, PN_, PNE_, ORD, nsplit, R, fz, fn,
-                                                        OUT, OF, need, FL, ncb, DV=dv, BLOCK_M=cbm, BLOCK_DV=cbdv,
+                                                        OUT, OF, need, FL, ncb, CNT, WL, DV=dv, BLOCK_M=cbm,
+                                                        BLOCK_DV=cbdv,
                                                         P=p, QMIN=qmin, OUT_FP32=(out == "fp32"),
                                                         RERUN=rerun, WRITE_NEED=write_need, FL_DIV=block_dv // cbdv,
                                                         num_warps=4)
 
-    tier2 = use_tc_pv and pv_tier2
     NEED = torch.empty((R, nccb), dtype=torch.int32, device=dev) if tier2 else None
     combine(NEED if tier2 else z32, False, tier2)
     if tier2:
@@ -1094,14 +1142,17 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
         # recomputed with int64 P·V and is combined again. Every path encloses the same exact N,
         # so a certified result is the same bits whichever tier produced it. Fixed grids and no
         # host sync: it costs two near-empty launches when nothing is flagged. The tier-1 combine
-        # wrote NEED = (combine flag) & (no split flag), so tier 2 adds no other device work.
+        # wrote NEED = (combine flag) & (no split flag) and the work list, so tier 2 adds no other
+        # device work.
         assert split_len % block_n_t2 == 0
-        # Tier 2 reruns rows in blocks of 2 and channels in the combine's blocks, so a pair that
-        # needs it costs its own 2 x 32 block over the keys, not the tier-1 program's.
-        split(NEED, True, block_n_t2, False, [dz[torch.int8], dz[torch.int64], dz[torch.int8]], 1, 1, 0,
-              block_m_t2, cbdv, 4)
+        # Tier 2's split grid is (programs, KV splits) whatever the batch, about two waves, and
+        # each program strides over the work list (DESIGN D23). A grid over every row block would
+        # be mostly empty programs, and at large batch their launch cost would exceed the work.
+        progs = max(1, min(R * nccb, -(-2 * _sm_count(dev) // nsplit)))
+        split(True, block_n_t2, False, [dz[torch.int8], dz[torch.int64], dz[torch.int8]], 1, 1, 0,
+              block_m_t2, cbdv, 8, progs, {"num_stages": 2})
         combine(NEED, True, False)
-    _LAST_DEBUG.update(block_m=block_m, block_m_t2=block_m_t2, pack=pack, split_flags=FL, combine_flags=OF, tier2_need=NEED, PR=PR_, PZ=PZ_, PZE=PZE_, PNR=PNR_, PN=PN_, PNE=PNE_,
+    _LAST_DEBUG.update(block_m=block_m, block_m_t2=block_m_t2, pack=pack, split_flags=FL, combine_flags=OF, tier2_need=NEED, tier2_cnt=CNT, tier2_wl=WL, PR=PR_, PZ=PZ_, PZE=PZE_, PNR=PNR_, PN=PN_, PNE=PNE_,
                        fz=fz, fn=fn)
     return (OUT.view(G, r_seg, dv) if batched else OUT), FL, OF
 
