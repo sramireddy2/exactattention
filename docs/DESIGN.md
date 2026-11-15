@@ -909,7 +909,33 @@ and flags are the same bits.
 | plus pipelined merge (kept) | 1 128 | 254 | 60 |
 
 `sm120_compile_check.py` now also builds the combine kernel (tier 1 bf16 and fp32, and tier 2).
-Run 1120 times it on the GPU.
+
+Run 1120-flash (1ee0524, compared with 1119; all bits checked, 0 uncertified rows, best tcpv
+config, ms):
+
+| shape | 1119 | 1120 | × FlashInfer |
+|---|---|---|---|
+| decode B=1 4K | 0.106 | 0.076 | 7.2× |
+| decode B=1 16K | 0.278 | 0.205 | 9.9× |
+| decode B=1 64K | 0.672 | 0.559 | 3.0× |
+| decode B=8 16K | 1.072 | 1.008 | 2.8× |
+| decode B=32 16K | 6.283 | 6.261 | 4.4× |
+| verify T=8 B=1 4K | 0.330 | 0.297 | 23.8× |
+| verify T=8 B=1 16K | 0.929 | 0.765 | 36.4× |
+| verify T=8 B=8 4K | 1.103 | 0.998 | 28.8× |
+| verify T=8 B=8 16K | 3.086 | 3.092 | 8.5× |
+
+Per launch, the combine went from 0.096–0.102 ms to 0.020–0.025 ms (tier 1) and from 0.094 to
+0.019 ms (tier 2); B=8 decode's went from 0.062 to 0.007. The saving is a fixed ~0.075 ms per
+launch, so it shows at small batch and vanishes where the split kernel dominates (B=32, verify
+B=8 16K). What is left of a 2-program tier-2 combine, 0.019 ms, is the serial merge over 64
+splits.
+
+Where verify T=8 B=1 16K (0.765 ms) goes now: tier-1 split 0.579, tier-1 combine 0.023,
+tier-2 split 0.139, tier-2 combine 0.019. At decode B=1 16K: split 0.179 of 0.205. The split
+kernel is now the whole cost. Its cheapest target is tier 2: 2 rerun programs take 0.139 ms
+because each walks all 16K keys in int64 by itself; spreading the NEED blocks across KV splits
+should bring that to a few µs.
 
 ## Open questions
 
