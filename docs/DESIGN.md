@@ -792,8 +792,22 @@ The runner now:
 - pins flash runs and their successors to the RTX PRO 6000
   (`-p gpu-rtxpro-blackwell --gres=gpu:rtx_pro_6000_blackwell:1`).
 
-The early exit is being timed again as run 1118b. Run 1119, which times D21, runs at the same
-time from a second checkout (`EA_REPO`).
+Run 1118b-flash timed the early exit (c7f48e4). Run 1119-flash, which times D21, ran at the
+same time from a second checkout (`EA_REPO`). FlashInfer's times agree to 1% between the two
+nodes. Best exact config, ms (× FlashInfer):
+
+| shape | 1116 | 1118b (early exit) |
+|---|---|---|
+| decode B=1 16K | 0.342 (17×) | 0.277 (13.4×) |
+| decode B=1 64K | 0.725 (3.9×) | 0.664 (3.5×) |
+| decode B=8 16K | 1.11 (3.1×) | 1.057 (2.9×) |
+| decode B=32 16K | 6.41 (4.6×) | 6.43 (4.6×) |
+| verify T=8 B=1 16K | 1.06 | 0.935 (41.8×) |
+| verify T=8 B=8 16K | 3.40 (9.4×) | 3.26 (9.0×) |
+
+At decode no pair needs tier 2, and its two launches now take 0.004 ms. In verify T=8 B=1 16K,
+2 of 256 tier-2 programs have work. Tier 2 still costs 0.23 ms there (split 0.137, combine
+0.093), down from 0.33. What is left is the latency of the few live programs, not the grid.
 
 ## D21. Registers
 
@@ -831,6 +845,29 @@ at pipelining depth 1 (16 KB of shared memory). At decode it costs about 40× th
 and 11% more instructions, for twice the warps to hide latency. `launch` takes `maxnreg`, and the
 benchmark carries `r128` A/Bs for tcpv 128/8 and 64/8. A register cap is a tiling choice, so the
 benchmark's bit check covers it. Tier 2 keeps its own registers.
+
+Run 1119-flash (16a6460, compared with 1118b; all bits checked, 0 uncertified rows):
+
+| shape | config | 1118b | 1119 |
+|---|---|---|---|
+| verify T=8 B=1 16K | tc 64/8 | 3.750 (spill 450 B) | 2.751 (222 B) |
+| verify T=8 B=8 16K | tc 64/8 | 29.40 | 22.81 |
+| verify T=8 B=1 16K | tcpv 128/8, best | 0.935 | 0.929 |
+| verify T=8 B=8 16K | tcpv 128/8, best | 3.261 | 3.086 |
+| decode B=1 16K | tcpv 128/8, best | 0.277 | 0.278 |
+| decode B=32 16K | tcpv 128/8, best | 6.434 | 6.283 |
+
+The int32 exponent pays where the spills were: tc is 22–27% faster. Best-config tcpv verify
+at B=8 is 5% faster, and decode is flat. The 128-register cap loses everywhere except
+tcpv 64/8 at verify B=8 16K (5.14 vs 5.27 ms), and that config is not the best one. Occupancy
+is not the limit, so `r128` stays an option and not a default.
+
+Where verify T=8 B=1 16K (0.929 ms) goes: tier-1 split 0.576, tier-1 combine 0.102,
+tier-2 split 0.141, tier-2 combine 0.094. At decode B=1 16K the combine is 0.096 of 0.278 ms.
+The combine costs about 0.1 ms whatever the batch, and even when only 2 programs have work, so
+it is per-program latency, not bandwidth. The suspected cause is `_ratio_round`'s 96-step
+bit-serial division, run twice per output, after a serial merge over the splits. That is the
+next target.
 
 ## Open questions
 
