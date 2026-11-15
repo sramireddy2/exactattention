@@ -776,6 +776,25 @@ failure that names the error. On an unusable GPU it:
   submission excludes it;
 - exits, so the successor reruns the stage elsewhere.
 
+Run 1118-flash also timed nothing, but this time the probe was at fault. A node's first
+`import torch` reads thousands of files off Lustre scratch with a cold cache. That took 93 s on
+the login node (8.5 s once warm) and over 10 minutes on the compute nodes. The env stage hit its
+600 s cap twice, and the probe's 120 s cap then marked four healthy nodes bad in a row. Two of
+those jobs had also landed on L40S nodes: the sbatch partition list allows them, and submission
+adds `gpu-v100` to any `-p` list.
+
+The runner now:
+- probes once per job, before its first GPU stage, with a cap of up to 1500 s. The probe also
+  warms the cache for the stages after it;
+- marks a node bad only on an explicit CUDA error. A timeout or a failed import is
+  inconclusive, and the stage runs under its own cap;
+- gives the env stage 1800 s;
+- pins flash runs and their successors to the RTX PRO 6000
+  (`-p gpu-rtxpro-blackwell --gres=gpu:rtx_pro_6000_blackwell:1`).
+
+The early exit is being timed again as run 1118b. Run 1119, which times D21, runs at the same
+time from a second checkout (`EA_REPO`).
+
 ## D21. Registers
 
 Every tensor-core split kernel uses all 255 registers, so an 8-warp program has an SM to itself.
