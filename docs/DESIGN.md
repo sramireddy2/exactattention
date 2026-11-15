@@ -613,7 +613,8 @@ tiles, so its int64 (rows, keys, channels) products stay small.
 
 **Static counts.** Offline sm_120 key-loop counts per program: before is 51bb44b (32-key
 tiles, SQ = 3), after is this section's code. "Per 32 keys" means warps × count per warp ×
-32 / block_n.
+32 / block_n. These were compiled without the GPU's divisibility hints, so they overstate the
+loads; D19 has the corrected counts.
 
 | config (rows, block_dv / warps) | instructions per 32 keys, before → after | loop spill ops per 32 keys | stack |
 |---|---|---|---|
@@ -630,6 +631,86 @@ The GPU decides between 128/8 and 64/8 for verify: a 64-channel block computes e
 but spills a quarter as much.
 
 The benchmark adds A/Bs: `n32` (32-key tiles) and `q3` (three q digits).
+
+## D19. Run 1115: tier 2 at 2 × 32 blocks, shared memory, offline hints
+
+**Run 1115-flash (job 15642615, code 86a52a7).** Every stage passed:
+
+- the tests passed;
+- the tcpv fixture for head 27_11 matched its SHA-256 with 0 fallback rows;
+- 0 rows were uncertified, and no config changed bits.
+
+Verify steps were 1.2–3.3× faster than in run 1114 (ms, best exact config):
+
+| T = 8 | FlashInfer | 1114 | 1115 |
+|---|---|---|---|
+| B = 1, n = 1K | 0.008 | 1.07 | 0.322 |
+| B = 1, n = 4K | 0.013 | 1.26 | 0.425 |
+| B = 1, n = 16K | 0.021 | 6.44 | 3.10 |
+| B = 8, n = 1K | 0.017 | 1.55 | 0.570 |
+| B = 8, n = 4K | 0.035 | 6.89 | 4.25 |
+| B = 8, n = 16K | 0.364 | 20.6 | 16.6 |
+
+The q3 A/B isolates D18's fourth q digit: tc at T = 8, B = 1, n = 16K took 6.15 ms with three
+digits and 3.92 ms with four. Decode also improved, from 2.60 to 2.16 ms at B = 8, n = 16K and
+from 14.9 to 10.5 ms at B = 32, n = 16K.
+
+The run showed two problems.
+
+**1. 64-key tiles did not launch.** At Triton's default pipelining depth of 3, the 64/8 and
+128/8 configs needed 120–159 KB of shared memory, and sm_120 allows 99 KB per block.
+
+The offline compile check missed this for two reasons:
+- It never read the shared-memory size.
+- It compiled without the GPU JIT's divisibility hints: Triton marks every pointer, and every
+  size divisible by 16, at launch. Without them, loads are neither vectorized nor pipelined
+  through shared memory, so the offline kernel was not the GPU's kernel.
+
+`scripts/sm120_compile_check.py` now passes the same hints. Its shared-memory figures now
+match the GPU's error messages to the byte (159,232 B and 120,320 B), and it fails any config
+above 101,376 B. `launch` uses pipelining depth 2 for 64-key tensor-core tiles, which needs
+68–85 KB. D18's static counts were made without the hints; the table below replaces them.
+
+**2. Tier 2 dominated verify steps.** `profile_step` at T = 8, B = 1, n = 16K:
+
+| launch | ms |
+|---|---|
+| tier-1 split | 0.67 |
+| tier-1 combine | 0.20 |
+| tier-2 split | 4.50 |
+| tier-2 combine | 0.16 |
+
+2 of 128 (row, channel block) pairs needed tier 2. Tier 2 ran on tier 1's grid, though, so each
+of those pairs reran its whole 16-row × 128-channel program over all 16K keys with int64 P·V.
+
+Tier 2 now has its own grid:
+- 2-row blocks (`block_m_t2`, digit-packed scores as in decode);
+- 32-channel blocks: the combine kernel, and so NEED and the combine flags, now uses channel
+  blocks of at most 32 whatever the split kernel's `block_dv`;
+- 16-key tiles and 4 warps.
+
+A pair that needs tier 2 now costs its own 2 × 32 block, 32× less work at block_m 16 and
+block_dv 128. Tier 2's split flags land in tier 1's coarser flag entries. Several tier-2
+programs share an entry, so they merge with an atomic maximum, whose result does not depend on
+their order. The tier-2 recovery test and the fused-NEED test now also run at block_dv 64, where
+tier 2's blocks sit inside tier 1's.
+
+Offline sm_120 key-loop counts with the GPU's hints, before (51bb44b: 32-key tiles, SQ = 3,
+depth 3) and after (this code: 64-key tensor-core tiles at depth 2, SQ = 4). "Per 32 keys" is
+warps × count per warp × 32 / block_n, per program:
+
+| config (rows, block_dv / warps) | instructions per 32 keys, before → after | loop spill ops per 32 keys | shared |
+|---|---|---|---|
+| tcpv verify, m16, 128/8 | 62.7K → 22.7K | 2976 → 580 | 80 → 84 KB |
+| tcpv verify, m16, 64/8 | 50.9K → 16.7K | 1768 → 280 | 63 → 67 KB |
+| tcpv decode, m2, 128/8 | 27.8K → 13.7K | 536 → 32 | 85 → 85 KB |
+| tcpv decode, m2, 64/8 | 19.3K → 9.4K | 328 → 0 | 68 → 68 KB |
+| tc verify, m16, 64/8 | 166K → 161K | 8528 → 8144 | 31 → 33 KB |
+| tier 2, old 16 × 128 → new 2 × 32 block | 308K → 26K | 55,040 → 0 | 39 → 25 KB |
+
+The old tier-2 kernel ran at 128 registers with 12.6 KB of spills per thread. That is how 2
+NEED pairs cost 4.5 ms. A NEED pair now reruns one 26K-instruction program with no spills,
+instead of a 308K-instruction one.
 
 ## Open questions
 

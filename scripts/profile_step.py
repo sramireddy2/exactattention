@@ -50,11 +50,11 @@ def tier2_share():
     NEED = _LAST_DEBUG.get("tier2_need")
     if NEED is None:
         return "no tier 2"
-    bm = _LAST_DEBUG["block_m"]
+    bm = _LAST_DEBUG["block_m_t2"]                          # tier 2's own row block
     R, ncb = NEED.shape
     nb = (NEED.view(R // bm, bm, ncb) != 0).any(dim=1)
     return (f"NEED pairs {int((NEED != 0).sum())}/{NEED.numel()}; programs rerun "
-            f"{int(nb.sum())}/{nb.numel()} row-block x channel-block ({float(nb.float().mean()):.3f}, "
+            f"{int(nb.sum())}/{nb.numel()} 2-row x 32-channel blocks ({float(nb.float().mean()):.3f}, "
             f"each over every KV split)")
 
 

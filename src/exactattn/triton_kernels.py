@@ -559,13 +559,13 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                      PR, PZ, PZE, PNR, PN, PNE, FLAG,
                      SPLIT_LEN, FZ, FN,
                      KX, KLSB, KL1S, KLOST, NKEYS, VX, VLSB, VLOST,
-                     R_SEG, NK_SEG, NRB, NEED,
+                     R_SEG, NK_SEG, NRB, NEED, FL_NCB,
                      D: tl.constexpr, DV: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                      BLOCK_DV: tl.constexpr, FS: tl.constexpr, EXP2_MARGIN: tl.constexpr,
                      USE_TC: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr, TC_FALLBACK: tl.constexpr,
                      USE_TC_PV: tl.constexpr, SW: tl.constexpr, SV: tl.constexpr, ANCH: tl.constexpr,
                      RERUN: tl.constexpr, PACK: tl.constexpr, EXP2T, EXP2_INT: tl.constexpr,
-                     WDC: tl.constexpr):
+                     WDC: tl.constexpr, FL_DIV: tl.constexpr):
     # Segments: G independent problems (e.g. sequence x KV head), each with R_SEG query rows
     # attending its own NK_SEG keys. Rows and keys are stored segment after segment, so
     # ROWS = G * R_SEG and NKEYS = G * NK_SEG. Each program handles one segment's row block.
@@ -696,14 +696,20 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
     tl.store(PNR + o2, PNRr, mask=wmask[:, None])
     tl.store(PN + o2, PNr, mask=wmask[:, None])
     tl.store(PNE + o2, PNEr, mask=wmask[:, None])
-    tl.store(FLAG + (pid_s * ROWS + rows) * tl.num_programs(2) + pid_c, flag, mask=wmask)
+    # FLAG has FL_NCB channel blocks of tier 1's width; tier 2 runs FL_DIV narrower blocks per
+    # entry, so it takes the maximum (atomics: the result does not depend on their order).
+    fo = FLAG + (pid_s * ROWS + rows) * FL_NCB + pid_c // FL_DIV
+    if RERUN:
+        tl.atomic_max(fo, flag, mask=wmask)
+    else:
+        tl.store(fo, flag, mask=wmask)
 
 
 @triton.jit
-def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, OUT, OFLAG, NEED, FLAG,
+def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, OUT, OFLAG, NEED, FLAG, FL_NCB,
                        DV: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_DV: tl.constexpr,
                        P: tl.constexpr, QMIN: tl.constexpr, N_ITER: tl.constexpr, OUT_FP32: tl.constexpr,
-                       RERUN: tl.constexpr, WRITE_NEED: tl.constexpr):
+                       RERUN: tl.constexpr, WRITE_NEED: tl.constexpr, FL_DIV: tl.constexpr):
     # Tier 1 with WRITE_NEED also writes tier 2's work list (DESIGN D12, D16): NEED = this
     # combine's flag set and no split flagged the pair (FLAG), fused here instead of torch ops.
     pid_m = tl.program_id(0)
@@ -728,7 +734,7 @@ def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, O
         s = tl.load(ORDER + i)
         off = s * ROWS + rows
         if WRITE_NEED:
-            sflag = tl.maximum(sflag, tl.load(FLAG + off * tl.num_programs(1) + pid_c, mask=rmask, other=0))
+            sflag = tl.maximum(sflag, tl.load(FLAG + off * FL_NCB + pid_c // FL_DIV, mask=rmask, other=0))
         sR = tl.load(PR + off, mask=rmask, other=NEG)
         sZ = tl.load(PZ + off, mask=rmask, other=0)
         sZE = tl.load(PZE + off, mask=rmask, other=0)
@@ -920,7 +926,7 @@ def _exp2_table_dev(dev):
 def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int = 4, block_m: int | None = None,
            block_n: int = 16, block_dv: int = 32, merge_order=None, exp2_margin: float = 2.0 ** -26,
            q_tc=None, k_tc=None, tc_fallback: bool = True, v_tc=None, sw: int = 5, pv_tier2: bool = True,
-           sq: int = 4, num_warps: int = 4, exp2: str = "int"):
+           sq: int = 4, num_warps: int = 4, exp2: str = "int", num_stages: int | None = None):
     """Device-level launch with no host transfers and no sync.
 
     Qt (R, d), Kt (n, d), Vt (n, dv) are int16 views of bf16 on the device; KL (R,) is int32.
@@ -958,6 +964,7 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     # Tier 2 runs int64 P·V, which has no MMA shape limit; its (rows, keys, channels) int64
     # products stay small at 16 keys. Any tile size gives the same bits (SPEC §5.3).
     block_n_t2 = min(block_n, 16)
+    block_m_t2 = min(block_m, 2)
     if v_tc is not None:
         # P·V contracts over the key tile, and int8 MMAs on NVIDIA need K >= 32 (mma.m16n8k32).
         # The CPU interpreter does not enforce this. The tile size cannot change the output
@@ -1002,23 +1009,28 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     PNE_ = torch.empty((nsplit, R, dv), **i64)
     ncb = dv // block_dv
     FL = torch.empty((nsplit, R, ncb), dtype=torch.int32, device=dev)   # every entry is written
-    nrb = triton.cdiv(r_seg, block_m)
-    grid = (G * nrb, nsplit, ncb)
     z32 = dz[torch.int32]
 
-    def wdc(bn):
+    # Software-pipelining depth of the split kernel's key loop. Each stage buffers a tile's operands
+    # in shared memory, so 64-key tensor-core tiles may need fewer than Triton's default.
+    # Triton's default of 3 makes 64-key tensor-core tiles need 120-160 KB, over sm_120's 99 KB.
+    if num_stages is None and use_tc_pv and block_n >= 64:
+        num_stages = 2
+    stages = {} if num_stages is None else {"num_stages": num_stages}
+
+    def split(need, rerun, bn, pv, v_args, sw_, sv_, anch_, bm, bdv, nw):
+        nrb_ = triton.cdiv(r_seg, bm)
         # Windowed-score channel chunk (DESIGN D17): about 16 int64 products per thread live at once.
-        return max(1, min(d, (512 * num_warps) // (block_m * bn)))
+        wdc = max(1, min(d, (512 * nw) // (bm * bn)))
+        return _ea_split_kernel[(G * nrb_, nsplit, dv // bdv)](
+            Qt, Kt, Vt, KL, R, am, ae, PR_, PZ_, PZE_, PNR_, PN_, PNE_, FL,
+            split_len, fz, fn, *tc, n, *v_args, r_seg, n_seg, nrb_, need, ncb, D=d, DV=dv,
+            BLOCK_M=bm, BLOCK_N=bn, BLOCK_DV=bdv, FS=SCORE_FS,
+            EXP2_MARGIN=exp2_margin, USE_TC=use_tc, SQ=sq, SK=sk, TC_FALLBACK=tc_fallback,
+            USE_TC_PV=pv, SW=sw_, SV=sv_, ANCH=anch_, RERUN=rerun, PACK=max(1, 16 // bm),
+            EXP2T=exp2t, EXP2_INT=(exp2 == "int"), WDC=wdc, FL_DIV=block_dv // bdv, num_warps=nw, **stages)
 
-    def split(need, rerun, bn, pv, v_args, sw_, sv_, anch_):
-        return _ea_split_kernel[grid](Qt, Kt, Vt, KL, R, am, ae, PR_, PZ_, PZE_, PNR_, PN_, PNE_, FL,
-                               split_len, fz, fn, *tc, n, *v_args, r_seg, n_seg, nrb, need, D=d, DV=dv,
-                               BLOCK_M=block_m, BLOCK_N=bn, BLOCK_DV=block_dv, FS=SCORE_FS,
-                               EXP2_MARGIN=exp2_margin, USE_TC=use_tc, SQ=sq, SK=sk, TC_FALLBACK=tc_fallback,
-                               USE_TC_PV=pv, SW=sw_, SV=sv_, ANCH=anch_, RERUN=rerun, PACK=pack,
-                               EXP2T=exp2t, EXP2_INT=(exp2 == "int"), WDC=wdc(bn), num_warps=num_warps)
-
-    ck = split(z32, False, block_n, use_tc_pv, vtc, sw, sv, anch)
+    ck = split(z32, False, block_n, use_tc_pv, vtc, sw, sv, anch, block_m, block_dv, num_warps)
     # Registers and spills of the compiled split kernel (None under the CPU interpreter).
     _LAST_DEBUG.update(n_regs=getattr(ck, "n_regs", None), n_spills=getattr(ck, "n_spills", None))
     if merge_order is None:
@@ -1031,19 +1043,24 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
         assert sorted(order.tolist()) == list(range(nsplit))
         ORD = torch.from_numpy(order.astype(np.int64)).to(dev)
     OUT = torch.empty((R, dv), dtype=torch.int32, device=dev)
-    OF = torch.empty((R, ncb), dtype=torch.int32, device=dev)   # every entry is written
+    # The combine kernel, and so NEED and OF, use channel blocks of at most 32: tier 2 then reruns
+    # only the 32-channel blocks that need it (DESIGN D19).
+    cbdv = min(block_dv, 32)
+    nccb = dv // cbdv
+    OF = torch.empty((R, nccb), dtype=torch.int32, device=dev)   # every entry is written
     p, qmin = (8, -133) if out == "bf16" else (24, -149)
 
     cbm = 16   # combine rows per program: it works on flattened rows, not segments
 
     def combine(need, rerun, write_need):
-        _ea_combine_kernel[(triton.cdiv(R, cbm), ncb)](PR_, PZ_, PZE_, PNR_, PN_, PNE_, ORD, nsplit, R, fz, fn,
-                                                           OUT, OF, need, FL, DV=dv, BLOCK_M=cbm, BLOCK_DV=block_dv,
-                                                           P=p, QMIN=qmin, N_ITER=96, OUT_FP32=(out == "fp32"),
-                                                           RERUN=rerun, WRITE_NEED=write_need, num_warps=num_warps)
+        _ea_combine_kernel[(triton.cdiv(R, cbm), nccb)](PR_, PZ_, PZE_, PNR_, PN_, PNE_, ORD, nsplit, R, fz, fn,
+                                                        OUT, OF, need, FL, ncb, DV=dv, BLOCK_M=cbm, BLOCK_DV=cbdv,
+                                                        P=p, QMIN=qmin, N_ITER=96, OUT_FP32=(out == "fp32"),
+                                                        RERUN=rerun, WRITE_NEED=write_need, FL_DIV=block_dv // cbdv,
+                                                        num_warps=4)
 
     tier2 = use_tc_pv and pv_tier2
-    NEED = torch.empty((R, ncb), dtype=torch.int32, device=dev) if tier2 else None
+    NEED = torch.empty((R, nccb), dtype=torch.int32, device=dev) if tier2 else None
     combine(NEED if tier2 else z32, False, tier2)
     if tier2:
         # Tier 2 (DESIGN D12): a pair whose final rounding failed, with no split-level flag (bad
@@ -1053,9 +1070,12 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
         # host sync: it costs two near-empty launches when nothing is flagged. The tier-1 combine
         # wrote NEED = (combine flag) & (no split flag), so tier 2 adds no other device work.
         assert split_len % block_n_t2 == 0
-        split(NEED, True, block_n_t2, False, [dz[torch.int8], dz[torch.int64], dz[torch.int8]], 1, 1, 0)
+        # Tier 2 reruns rows in blocks of 2 and channels in the combine's blocks, so a pair that
+        # needs it costs its own 2 x 32 block over the keys, not the tier-1 program's.
+        split(NEED, True, block_n_t2, False, [dz[torch.int8], dz[torch.int64], dz[torch.int8]], 1, 1, 0,
+              block_m_t2, cbdv, 4)
         combine(NEED, True, False)
-    _LAST_DEBUG.update(block_m=block_m, pack=pack, split_flags=FL, combine_flags=OF, tier2_need=NEED, PR=PR_, PZ=PZ_, PZE=PZE_, PNR=PNR_, PN=PN_, PNE=PNE_,
+    _LAST_DEBUG.update(block_m=block_m, block_m_t2=block_m_t2, pack=pack, split_flags=FL, combine_flags=OF, tier2_need=NEED, PR=PR_, PZ=PZ_, PZE=PZE_, PNR=PNR_, PN=PN_, PNE=PNE_,
                        fz=fz, fn=fn)
     return (OUT.view(G, r_seg, dv) if batched else OUT), FL, OF
 

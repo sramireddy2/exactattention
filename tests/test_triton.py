@@ -175,18 +175,19 @@ def test_tensor_core_pv_on_real_activations():
         r = int(rows[i])
         assert np.array_equal(got[i], attention_row(q[r], k[: r + 1], v[: r + 1, :32], alpha)), r
 
-@pytest.mark.parametrize("kind", ["normal", "outlier"])
-def test_pv_tier2_recovers_uncertified_pairs(kind):
+@pytest.mark.parametrize("kind,block_dv", [("normal", 32), ("outlier", 32), ("normal", 64)])
+def test_pv_tier2_recovers_uncertified_pairs(kind, block_dv):
     """Tier 2 (DESIGN D12): pairs that tensor-core P·V cannot certify are recomputed on the device
     with int64 P·V. "wide" V (48-bit exponent spread per row) defeats 3 V digits on most rows, so
     tier 1 alone flags many; with tier 2 the flags fall to what the int64 path alone leaves, and
-    every certified row is still bit-exact."""
+    every certified row is still bit-exact. block_dv 64 makes tier 2 rerun 2-row x 32-channel
+    blocks inside the tier-1 blocks (DESIGN D19)."""
     rng = np.random.default_rng(zlib.crc32(f"tier2/{kind}".encode()))
     d, dv, R, n = 64, 64, 16, 100
     Q, K, V = bf16(rng, (R, d), kind), bf16(rng, (n, d), kind), bf16(rng, (n, dv), "wide")
     kv_len = rng.integers(1, n + 1, size=R)
     alpha = default_alpha(d)
-    kw = dict(splits=2, block_m=16, block_n=16, block_dv=32, device=DEVICE, fallback=False, use_tc=True)
+    kw = dict(splits=2, block_m=16, block_n=16, block_dv=block_dv, device=DEVICE, fallback=False, use_tc=True)
     _, f1 = attention_triton(Q, K, V, alpha, kv_len, use_tc_pv=True, pv_tier2=False, **kw)
     got, f2 = attention_triton(Q, K, V, alpha, kv_len, use_tc_pv=True, **kw)
     _, f64 = attention_triton(Q, K, V, alpha, kv_len, **kw)
@@ -414,7 +415,8 @@ def test_integer_exp2_equals_float64_exp2(mode):
         assert np.array_equal(a[r], attention_row(Q[r], K[:L], V[:L], alpha)), r
 
 
-def test_fused_need_equals_torch_formula():
+@pytest.mark.parametrize("block_dv", [32, 64])
+def test_fused_need_equals_torch_formula(block_dv):
     """The tier-1 combine kernel writes tier 2's work list (DESIGN D16). It must equal the torch
     formula it replaced, (combine flag != 0) & (no split flag), computed from a tier-1-only run."""
     from exactattn.triton_kernels import _LAST_DEBUG
@@ -425,13 +427,15 @@ def test_fused_need_equals_torch_formula():
     K[30, 5] = 0x7FC0                                          # a NaN key: split-flagged, not NEED
     kv_len = rng.integers(1, n + 1, size=R)
     alpha = default_alpha(d)
-    kw = dict(splits=2, block_n=16, block_dv=32, device=DEVICE, fallback=False, use_tc=True, use_tc_pv=True)
+    kw = dict(splits=2, block_n=16, block_dv=block_dv, device=DEVICE, fallback=False, use_tc=True, use_tc_pv=True)
     attention_triton(Q, K, V, alpha, kv_len, pv_tier2=False, **kw)
     FL, OF = _LAST_DEBUG["split_flags"].clone(), _LAST_DEBUG["combine_flags"].clone()
-    want = ((OF != 0) & (FL.amax(dim=0) == 0)).to(FL.dtype)
+    # NEED and OF have 32-channel blocks; FL has the split kernel's
+    sfl = FL.amax(dim=0).repeat_interleave(OF.shape[1] // FL.shape[2], dim=1)
+    want = ((OF != 0) & (sfl == 0)).to(FL.dtype)
     attention_triton(Q, K, V, alpha, kv_len, **kw)
     got = _LAST_DEBUG["tier2_need"]
-    assert want.sum() > 0 and (FL.amax(dim=0) != 0).any()    # both cases present
+    assert want.sum() > 0 and (sfl != 0).any()               # both cases present
     assert torch_equal(got, want)
 
 

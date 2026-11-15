@@ -53,15 +53,20 @@ def kernel_config(over):
 
     cfg = {**BASE, **over, "FS": SCORE_FS}
     nw = cfg.pop("num_warps")
+    ns = cfg.pop("num_stages", None)
+    if ns is None and cfg["USE_TC_PV"] and cfg["BLOCK_N"] >= 64:
+        ns = 2                                                  # as launch picks it
     if not cfg["USE_TC_PV"]:
         cfg.update(SW=1, SV=1)
     cfg["ANCH"] = 7 * cfg["SW"] + 7 * cfg["SV"] + (cfg["BLOCK_N"] - 1).bit_length()
     cfg["WDC"] = max(1, min(cfg["D"], (512 * nw) // (cfg["BLOCK_M"] * cfg["BLOCK_N"])))
-    return cfg, nw
+    cfg["FL_DIV"] = 1
+    return cfg, nw, ns
 
 
 def build_ptx(over, ttgir_out=None):
-    """Lower the split kernel to sm_120 PTX with Triton's own pipeline (no GPU needed)."""
+    """Lower the split kernel to sm_120 PTX with Triton's own pipeline (no GPU needed).
+    Returns (ptx, shared memory bytes per program)."""
     from triton.backends.compiler import GPUTarget
     from triton.backends.nvidia.compiler import CUDABackend
     from triton.compiler import ASTSource
@@ -69,12 +74,18 @@ def build_ptx(over, ttgir_out=None):
 
     from exactattn.triton_kernels import _ea_split_kernel
 
-    cfg, nw = kernel_config(over)
+    cfg, nw, ns = kernel_config(over)
     sig = {a: ("constexpr" if a in cfg else PTR.get(a, "i32")) for a in _ea_split_kernel.arg_names}
-    src = ASTSource(_ea_split_kernel, sig, {a: cfg[a] for a in _ea_split_kernel.arg_names if a in cfg})
+    # The GPU's JIT specializes arguments divisible by 16 (all pointers, and these sizes at serving
+    # shapes); without the same hints, loads are not vectorized or pipelined through shared memory
+    # and the kernel differs from the one the GPU runs.
+    div16 = set(PTR) | {"ROWS", "SPLIT_LEN", "NKEYS", "NK_SEG"}
+    attrs = {(i,): [["tt.divisibility", 16]] for i, a in enumerate(_ea_split_kernel.arg_names)
+             if a in div16 and a not in cfg}
+    src = ASTSource(_ea_split_kernel, sig, {a: cfg[a] for a in _ea_split_kernel.arg_names if a in cfg}, attrs)
     target = GPUTarget("cuda", 120, 32)
     be = CUDABackend(target)
-    opts = be.parse_options({"num_warps": nw})
+    opts = be.parse_options({"num_warps": nw, **({} if ns is None else {"num_stages": ns})})
     ctx = ir.context()
     ir.load_dialects(ctx)
     be.load_dialects(ctx)
@@ -88,7 +99,7 @@ def build_ptx(over, ttgir_out=None):
         cur = fn(cur, meta)
         if st == "ttgir" and ttgir_out:
             open(ttgir_out, "w").write(str(cur))
-    return cur
+    return cur, meta.get("shared", 0)
 
 
 def tool(name):
@@ -108,12 +119,12 @@ def ptxas(ptx, cubin, *flags):
 def compile_one(item):
     name, over = item
     t0 = time.time()
-    ptx = build_ptx(over)
+    ptx, smem = build_ptx(over)
     with tempfile.TemporaryDirectory() as td:
         out = ptxas(ptx, os.path.join(td, "k.cubin"))
     regs = re.findall(r"Used (\d+) registers", out)
     spill = re.findall(r"(\d+) bytes spill stores", out)
-    return (name, time.time() - t0, int(regs[0]) if regs else None, int(spill[0]) if spill else None,
+    return (name, time.time() - t0, int(regs[0]) if regs else None, int(spill[0]) if spill else None, smem,
             "" if regs else out[-400:])
 
 
@@ -121,15 +132,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-seconds", type=float, default=180.0)
     ap.add_argument("--max-spill", type=int, default=8192)
+    ap.add_argument("--max-shared", type=int, default=101376, help="bytes per block (sm_120: 99 KB)")
     ap.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 1))
     a = ap.parse_args()
     bad = False
     with ProcessPoolExecutor(a.jobs) as ex:
-        for name, sec, regs, spill, err in ex.map(compile_one, CONFIGS.items()):
-            over = regs is None or sec > a.max_seconds or spill > a.max_spill
+        for name, sec, regs, spill, smem, err in ex.map(compile_one, CONFIGS.items()):
+            over = regs is None or sec > a.max_seconds or spill > a.max_spill or smem > a.max_shared
             bad |= over
-            print(f"{'FAIL' if over else 'ok  '} {name:16s} {sec:6.1f} s  regs {regs}  spill {spill} B {err}",
-                  flush=True)
+            print(f"{'FAIL' if over else 'ok  '} {name:18s} {sec:6.1f} s  regs {regs}  spill {spill} B  "
+                  f"shared {smem} B {err}", flush=True)
     sys.exit(1 if bad else 0)
 
 

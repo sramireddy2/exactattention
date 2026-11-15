@@ -64,10 +64,11 @@ def key_loop(ins, labels):
 
 
 def profile(name, over):
-    cfg, nw = cc.kernel_config(over)
+    cfg, nw, _ = cc.kernel_config(over)
     with tempfile.TemporaryDirectory() as td:
         cubin = os.path.join(td, "k.cubin")
-        info = cc.ptxas(cc.build_ptx(over), cubin, "-lineinfo")
+        ptx, smem = cc.build_ptx(over)
+        info = cc.ptxas(ptx, cubin, "-lineinfo")
         sass = subprocess.run([cc.tool("nvdisasm"), "-gi", "-c", cubin], capture_output=True, text=True).stdout
     regs = re.findall(r"Used (\d+) registers", info)
     spill = re.findall(r"(\d+) bytes spill stores", info)
@@ -85,7 +86,7 @@ def profile(name, over):
         ops[op] += 1
     hot = sum(by_line.values())
     return dict(name=name, warps=nw, block_n=cfg["BLOCK_N"], regs=int(regs[0]) if regs else None,
-                spill=int(spill[0]) if spill else 0, stack=int(stack[0]) if stack else 0, hot=hot, rare=n_rare,
+                spill=int(spill[0]) if spill else 0, smem=smem, stack=int(stack[0]) if stack else 0, hot=hot, rare=n_rare,
                 local=ops["LDL"] + ops["STL"], by_line=by_line, ops=ops, src=src)
 
 
@@ -101,7 +102,8 @@ def main():
         over[k] = eval(v)  # noqa: S307 (numbers and booleans from the command line)
     p = profile(a.config, over)
     per32 = p["hot"] * p["warps"] * 32 / p["block_n"]
-    print(f"{a.config} {' '.join(a.overrides)}: regs {p['regs']}, spill {p['spill']} B, stack {p['stack']} B; "
+    print(f"{a.config} {' '.join(a.overrides)}: regs {p['regs']}, spill {p['spill']} B, stack {p['stack']} B, "
+          f"shared {p['smem']} B; "
           f"key loop {p['hot']} hot SASS per warp per tile (+{p['rare']} in rare branches), "
           f"{p['local']} of them local-memory spill loads/stores; {per32:.0f} warp-instructions and "
           f"{p['local'] * p['warps'] * 32 / p['block_n']:.0f} warp spill ops per 32 keys")
