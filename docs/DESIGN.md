@@ -975,6 +975,71 @@ comment per level, and work-list loops are skipped when it looks for the key loo
 `test_fused_need_equals_torch_formula` checks that the list holds each NEED pair exactly once.
 Under the interpreter the SM count is 2, so the tier-2 tests run several items per program.
 
+## D24. Tier-1 P·V: a dropped-channel fix, a top-digit weight-loss bound, equal-weight MMA sums
+
+After D22 and D23, the tier-1 split kernel is almost the whole step. Offline sm_120 SASS put
+`_tc_pv`, the tensor-core P·V, at 56% of a decode tile (1783 of 3203 instructions per warp) and
+43% of a verify tile (2331 of 5437). Decode B=1 16K moves about 0.75 TB/s and B=32 about
+0.7 TB/s, well under DRAM bandwidth, so the kernel is bound by instructions and their latency,
+not by bytes.
+
+**A soundness bug, fixed.** A V element far enough below its key's largest element (more than
+2^21 below at SV = 3) loses every bit in block fixed point: all its digits are 0 and only the
+lost mask records it. `_tc_pv` decided that a channel "has a term" from its nonzero digits alone.
+So when every visible key of a tile had such an element in channel c, the tile returned an
+exact-zero partial for c and dropped the V-loss error, and the output could be certified and
+wrong. Example: V channel 0 = 1 and channel 1 = 2^-40 on every key gave a certified 0 for
+channel 1, not 2^-40 (bf16 0x2b80), and tier 2 never saw the pair. Now a channel is empty only
+when acc = e = 0, where its interval is exactly {0}; a lost element makes e ≥ 1. Tier 1 then
+flags the pair, and tier 2's int64 P·V returns the exact bits. This needs exponent spreads of
+more than 2^21 within a V row across a whole tile. The benchmark's normal data and the Qwen
+fixture do not have them, and their bit checks passed, so earlier results stand.
+`test_pv_fully_lost_v_channel_is_not_dropped` covers all three of `_tc_pv`'s packings.
+
+**Weight loss from the top V digit.** The bound Σ lostW · |Vfix| needed one MMA on |digit b|
+for every V digit. Each `tl.abs` of an int8 tile cost about 160 instructions to unpack, take the
+absolute value and repack. For any digit signs,
+
+  |Vfix| ≤ |top digit| · 2^(7(SV−1)) + 127 · (1 + 2^7 + … + 2^(7(SV−2))) = |top| · 2^(7(SV−1)) + 2^(7(SV−1)) − 1,
+
+so the bound is now 2^(7(SV−1)) · Σ lostW · |top digit| plus nlost · (2^(7(SV−1)) − 1): one abs
+MMA. It is looser by under 2^14 units per lost weight. V is anchored at each key's largest
+element, near 2^20, so that is at most about 2^-6 of the key's largest |V|. The per-key total
+stays below 2^(7·SV), so D18's int64 bounds are unchanged.
+
+**Fewer int64 widenings.**
+- One slot per MMA (16-row verify blocks): weight digit j times V digit b has weight 7(j + b).
+  Products of equal weight now accumulate inside the int32 MMA, and adjacent weights pair in
+  int32, as D18 does for scores. That is 4 int64 terms instead of 15. Each product sum is below
+  64 · 127², at most 3 share a weight, and a pair stays below 2^31; a static assert checks this.
+  The V-loss products (weight digits × lost mask, below 64 · 127) are summed in int32 three at a
+  time.
+- One packed group (2-row decode blocks): the V digits' MMA results are summed in their own
+  layout, so the slots are unpacked once for acc, not once per digit. The two error MMAs share
+  one unpack (`_slot_err`).
+
+The exact sum and its error are the same in every packing. Only the weight-loss term changed.
+
+`sm120_sass_profile.py` had stopped finding the verify key loop: ptxas moves a `program_id`
+compare from the kernel's top level into it. The work-list filter now looks only for that loop's
+own lines.
+
+Key loop, sm_120 SASS with the GPU's hints. Each cell is instructions per warp per tile, then
+warp-instructions per 32 keys, then spill ops per 32 keys (64-key tiles):
+
+| config | before (a6369f8) | after |
+|---|---|---|
+| decode m2 128/8 | 3203; 12,812; 8 | 2522; 10,088; 8 |
+| decode m2 64/8 | 2172; 8,688; 0 | 1840; 7,360; 4 |
+| decode m2 32/4 | 3156; 6,312; 0 | 2807; 5,614; 0 |
+| verify m16 128/8 | 5437; 21,748; 628 | 4619; 18,476; 408 |
+| verify m16 32/4 | 6010; 12,020; 176 | 5579; 11,158; 124 |
+
+`_tc_pv` went from 1783 to 1106 per decode tile and from 2331 to 1420 per verify tile. What is
+left: `_tc_logits` (554 decode, 1296 verify), the merge of the tile partial into the running
+one (about 290 decode, 834 verify; at verify that is about 100 instructions per element for two
+general int64 rescales), and `_exp2_weight` (221, 423).
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model

@@ -278,6 +278,18 @@ def _slot_sum(R, g: tl.constexpr, PACK: tl.constexpr, BM: tl.constexpr, LO: tl.c
 
 
 @triton.jit
+def _slot_err(R, PACK: tl.constexpr, BM: tl.constexpr, SW: tl.constexpr, SHA: tl.constexpr):
+    """_tc_pv's error unpack for one packed group holding every slot (PACK >= SW + 2): the sum of
+    R_j << 7j over the weight-digit slots j < SW, R_SW << SHA (lost weight x |top V digit|) and
+    R_(SW+1) (visible x lost V), as int64 (BM, X). Exact."""
+    R3 = tl.reshape(R, (PACK, BM, R.shape[1])).to(tl.int64)
+    j = tl.arange(0, PACK)
+    m = j <= SW + 1
+    sh = tl.where(j < SW, 7 * j, tl.where(j == SW, SHA, 0)).to(tl.int64)
+    return tl.sum(tl.where(m[:, None, None], R3 << sh[:, None, None], 0), axis=0)
+
+
+@triton.jit
 def _slice_q(qm, qe, SQ: tl.constexpr, PACK: tl.constexpr, BM: tl.constexpr, D: tl.constexpr):
     """slices.slice_rows for the program's q rows, in registers (same digits as the numpy and
     torch slicers). Done once per program, so a decode step needs no separate slicing launches.
@@ -436,17 +448,20 @@ def _pv_group(Wlo, Whi, lw, vis, g: tl.constexpr, PACK: tl.constexpr, BM: tl.con
 @triton.jit
 def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nmask, cc, VST, FN, DV: tl.constexpr, SW: tl.constexpr,
            SV: tl.constexpr, ANCH: tl.constexpr, PACK: tl.constexpr, BM: tl.constexpr):
-    """One tile's P·V on tensor cores (DESIGN D9/D10). Returns (TNR, TN, TNE) in the partial format:
-    value N_c lies in [TN, TN + TNE] * 2^(TNR - FN).
+    """One tile's P·V on tensor cores (DESIGN D9/D10, D24). Returns (TNR, TN, TNE) in the partial
+    format: value N_c lies in [TN, TN + TNE] * 2^(TNR - FN).
 
     V rows are block fixed point (per-key exponent vlsb, SV signed 7-bit digits, a per-element
     lost-bits mask), made once at cache write. Weights times 2^vlsb are anchored per row at the
     tile's largest term and truncated to SW unsigned 7-bit digits. Each digit pair is an exact
-    int8 MMA, and two more small MMAs bound the truncation per element:
-      weight loss  sum_j lostW_mj * |Vfix_jc|       (lost-weight mask x |V| digits)
-      V loss       sum_j (W_mj + 1) * vlost_jc      (weight digits x lost-V mask).
+    int8 MMA, and more small MMAs bound the truncation per element:
+      weight loss  sum_j lostW_mj * |Vfix_jc|  <=  2^(7(SV-1)) * sum_j lostW_mj * |top V digit_jc|
+                                                   + nlost_m * (2^(7(SV-1)) - 1)
+      V loss       sum_j (W_mj + 1) * vlost_jc      (weight digits and visibility x lost-V mask).
+    The first holds for any digit signs: |Vfix| <= |top| * 2^(7(SV-1)) + 127 * (1 + 2^7 + ...).
     The weight digits and both masks are slots of one packed operand (_pv_group), PACK slots per
-    MMA, so small row blocks do not waste the MMA rows."""
+    MMA, so small row blocks do not waste the MMA rows. A channel with acc = e = 0 encloses exactly
+    zero and gets an empty partial; a lost V element makes e >= 1, so it is never dropped."""
     vlsb = tl.load(VLSB + nn, mask=nmask, other=0)
     G = Ew + vlsb[None, :]                                                 # term = M * Vfix * 2^G
     gtop = tl.max(tl.where(vis, G + 24, NEG), axis=1)                      # (M,)
@@ -458,36 +473,107 @@ def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nmask, cc, VST, FN, DV: tl.constexp
     Wlo = (Wf & 0xFFFFFFF).to(tl.int32)                                    # digits 0-3
     Whi = (Wf >> 28).to(tl.int32)                                          # digits 4 .. SW-1
     NGW: tl.constexpr = (SW + 2 + PACK - 1) // PACK     # slots: SW weight digits, lost mask, vis mask
-    acc = tl.zeros((BM, cc.shape[0]), tl.int64)
-    e = tl.zeros((BM, cc.shape[0]), tl.int64)
-    nz = tl.zeros((nn.shape[0], cc.shape[0]), tl.int32)
-    for b in tl.static_range(SV):
-        vb = tl.load((VX + b * VST) + (nn[:, None] * DV + cc[None, :]), mask=nmask[:, None], other=0)
-        nz = nz | (vb != 0).to(tl.int32)
-        for g in tl.static_range(NGW):
-            if g * PACK <= SW:
-                a = _pv_group(Wlo, Whi, lw, vis, g, PACK, BM, SW)
-                if g * PACK < SW:                                          # weight digits x V digit b
-                    acc += _slot_sum(tl.dot(a, vb, out_dtype=tl.int32), g, PACK, BM, 0, SW, 7 * b)
-                if g * PACK + PACK > SW:                                   # lost weight x |V digit b|
-                    e += _slot_sum(tl.dot(a, tl.abs(vb), out_dtype=tl.int32), g, PACK, BM, SW, SW + 1, 7 * b)
+    SHA: tl.constexpr = 7 * (SV - 1)                    # weight of the top V digit
+    BN: tl.constexpr = nn.shape[0]
+    # The int32 MMA sums below are exact: a digit-product sum is below BN * 127^2, at most SV of
+    # them share a weight, and a pair S_u + (S_(u+1) << 7) stays below 2^31.
+    tl.static_assert(BN * 16129 * SV * 129 < 2147483648)
     vw = tl.load(VLOST + nn[:, None] * DV + cc[None, :], mask=nmask[:, None], other=0)
     vl = vw & 1
     vbad = tl.max((vw >> 1).to(tl.int32), axis=1) != 0                    # (N,) NaN/inf in this channel block
-    chan = tl.zeros((BM, cc.shape[0]), tl.int64)
-    for g in tl.static_range(NGW):
-        a = _pv_group(Wlo, Whi, lw, vis, g, PACK, BM, SW)
-        if g * PACK < SW or g * PACK + PACK > SW + 1:
-            rv = tl.dot(a, vl, out_dtype=tl.int32)
-            if g * PACK < SW:                                              # weight digits x lost V
-                e += _slot_sum(rv, g, PACK, BM, 0, SW, 0)
-            if g * PACK + PACK > SW + 1:                                   # visible x lost V
-                e += _slot_sum(rv, g, PACK, BM, SW + 1, SW + 2, 0)
-                chan += _slot_sum(tl.dot(a, nz.to(tl.int8), out_dtype=tl.int32), g, PACK, BM, SW + 1, SW + 2, 0)
-    chan = chan > 0                                                        # channel has any term
+    nlost = tl.sum(lw.to(tl.int32), axis=1).to(tl.int64)                   # (M,) lost weights
+    if PACK == 1:
+        # One slot per MMA. Weight digit j times V digit b has weight 7(j + b): products of equal
+        # weight u accumulate inside the int32 MMA, and adjacent weights pair up in int32 before
+        # widening, as in _tc_logits (DESIGN D18): 4 int64 terms instead of SW * SV.
+        tl.static_assert(SW + SV - 1 <= 8)
+        S0 = tl.zeros((BM, cc.shape[0]), tl.int32)
+        S1 = S0
+        S2 = S0
+        S3 = S0
+        S4 = S0
+        S5 = S0
+        S6 = S0
+        S7 = S0
+        ea = S0
+        for b in tl.static_range(SV):
+            vb = tl.load((VX + b * VST) + (nn[:, None] * DV + cc[None, :]), mask=nmask[:, None], other=0)
+            for j in tl.static_range(SW):
+                a = _pv_group(Wlo, Whi, lw, vis, j, PACK, BM, SW)
+                if j + b == 0:
+                    S0 = tl.dot(a, vb, S0, out_dtype=tl.int32)
+                if j + b == 1:
+                    S1 = tl.dot(a, vb, S1, out_dtype=tl.int32)
+                if j + b == 2:
+                    S2 = tl.dot(a, vb, S2, out_dtype=tl.int32)
+                if j + b == 3:
+                    S3 = tl.dot(a, vb, S3, out_dtype=tl.int32)
+                if j + b == 4:
+                    S4 = tl.dot(a, vb, S4, out_dtype=tl.int32)
+                if j + b == 5:
+                    S5 = tl.dot(a, vb, S5, out_dtype=tl.int32)
+                if j + b == 6:
+                    S6 = tl.dot(a, vb, S6, out_dtype=tl.int32)
+                if j + b == 7:
+                    S7 = tl.dot(a, vb, S7, out_dtype=tl.int32)
+            if b == SV - 1:                                                # lost weight x |top V digit|
+                ea = tl.dot(_pv_group(Wlo, Whi, lw, vis, SW, PACK, BM, SW), tl.abs(vb), out_dtype=tl.int32)
+        acc = (S0 + (S1 << 7)).to(tl.int64)
+        if SW + SV > 3:
+            acc += (S2 + (S3 << 7)).to(tl.int64) << 14
+        if SW + SV > 5:
+            acc += (S4 + (S5 << 7)).to(tl.int64) << 28
+        if SW + SV > 7:
+            acc += (S6 + (S7 << 7)).to(tl.int64) << 42
+        # V loss: visible x lost V, then weight digit j x lost V (each below BN * 127) summed in
+        # int32 three digits at a time.
+        e = (ea.to(tl.int64) << SHA) + tl.dot(_pv_group(Wlo, Whi, lw, vis, SW + 1, PACK, BM, SW), vl,
+                                              out_dtype=tl.int32).to(tl.int64)
+        t3 = tl.zeros((BM, cc.shape[0]), tl.int32)
+        for j in tl.static_range(SW):
+            t3 += tl.dot(_pv_group(Wlo, Whi, lw, vis, j, PACK, BM, SW), vl, out_dtype=tl.int32) << (7 * (j % 3))
+            if j % 3 == 2 or j == SW - 1:
+                e += t3.to(tl.int64) << (21 * (j // 3))
+                t3 = tl.zeros((BM, cc.shape[0]), tl.int32)
+    elif NGW == 1:
+        # Every slot in one MMA group (decode): add the V digits' MMA results in their own layout,
+        # then unpack the slots once for acc and once for e.
+        a = _pv_group(Wlo, Whi, lw, vis, 0, PACK, BM, SW)
+        X = tl.zeros((PACK * BM, cc.shape[0]), tl.int64)
+        ra = tl.zeros((PACK * BM, cc.shape[0]), tl.int32)
+        for b in tl.static_range(SV):
+            vb = tl.load((VX + b * VST) + (nn[:, None] * DV + cc[None, :]), mask=nmask[:, None], other=0)
+            X += tl.dot(a, vb, out_dtype=tl.int32).to(tl.int64) << (7 * b)
+            if b == SV - 1:
+                ra = tl.dot(a, tl.abs(vb), out_dtype=tl.int32)
+        acc = _slot_sum(X, 0, PACK, BM, 0, SW, 0)
+        rv = tl.dot(a, vl, out_dtype=tl.int32)
+        slot = (tl.arange(0, PACK * BM) // BM)[:, None]
+        e = _slot_err(tl.where(slot == SW, ra, rv), PACK, BM, SW, SHA)
+    else:
+        acc = tl.zeros((BM, cc.shape[0]), tl.int64)
+        e = tl.zeros((BM, cc.shape[0]), tl.int64)
+        for b in tl.static_range(SV):
+            vb = tl.load((VX + b * VST) + (nn[:, None] * DV + cc[None, :]), mask=nmask[:, None], other=0)
+            for g in tl.static_range(NGW):
+                if g * PACK < SW:                                          # weight digits x V digit b
+                    acc += _slot_sum(tl.dot(_pv_group(Wlo, Whi, lw, vis, g, PACK, BM, SW), vb, out_dtype=tl.int32),
+                                     g, PACK, BM, 0, SW, 7 * b)
+                if b == SV - 1 and g * PACK <= SW and SW < g * PACK + PACK:   # lost weight x |top V digit|
+                    e += _slot_sum(tl.dot(_pv_group(Wlo, Whi, lw, vis, g, PACK, BM, SW), tl.abs(vb),
+                                          out_dtype=tl.int32), g, PACK, BM, SW, SW + 1, SHA)
+        for g in tl.static_range(NGW):
+            if g * PACK < SW or g * PACK + PACK > SW + 1:
+                rv = tl.dot(_pv_group(Wlo, Whi, lw, vis, g, PACK, BM, SW), vl, out_dtype=tl.int32)
+                if g * PACK < SW:                                          # weight digits x lost V
+                    e += _slot_sum(rv, g, PACK, BM, 0, SW, 0)
+                if g * PACK + PACK > SW + 1:                               # visible x lost V
+                    e += _slot_sum(rv, g, PACK, BM, SW + 1, SW + 2, 0)
+    e += nlost[:, None] * ((1 << SHA) - 1)
     # True N in [acc - e, acc + e] * 2^base, with |acc| < 2^ANCH (ANCH = 7*SW + 7*SV + log2 BLOCK_N).
     # Re-anchor at TNR = base + ANCH, i.e. units 2^(base + ANCH - FN): a right shift by
-    # sr = ANCH - FN (counted truncation) or an exact left shift.
+    # sr = ANCH - FN (counted truncation) or an exact left shift. acc = e = 0 maps to 0, 0.
+    chan = (acc != 0) | (e != 0)
     lo = acc - e
     wid = 2 * e
     sr = ANCH - FN
@@ -496,8 +582,6 @@ def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nmask, cc, VST, FN, DV: tl.constexp
     TN = tl.where(sr >= 0, TN_r, lo << sl)
     TNE = tl.where(sr >= 0, TNE_r, wid << sl)
     TNR = tl.where(chan, (base[:, None] + ANCH).to(tl.int32), NEG32)
-    TN = tl.where(chan, TN, 0)
-    TNE = tl.where(chan, TNE, 0)
     return TNR, TN, TNE, vbad
 
 

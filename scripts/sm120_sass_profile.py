@@ -59,12 +59,16 @@ def parse(sass):
 
 
 def body_lines(src):
-    """Source lines of _split_program, the per-program body both tiers inline (DESIGN D23), and
-    the kernel lines that call it."""
+    """Source lines of _split_program, the per-program body both tiers inline (DESIGN D23), the
+    kernel lines that call it, and the lines of tier 2's work-list loop. (Only those: ptxas may move
+    other kernel-level instructions, such as a program_id compare, into the key loop.)"""
     a = next(i for i, ln in enumerate(src, 1) if ln.startswith("def _split_program("))
     b = next(i for i, ln in enumerate(src[a:], a + 1) if ln.startswith(("@triton.jit", "def ")))
     calls = {i for i, ln in enumerate(src, 1) if "_split_program(" in ln and not ln.startswith("def ")}
-    return set(range(a, b)), calls
+    k = next(i for i, ln in enumerate(src, 1) if ln.startswith("def _ea_split_kernel("))
+    e = next(i for i, ln in enumerate(src[k:], k + 1) if ln.startswith(("@triton.jit", "def ")))
+    wl = {i for i in range(k, e) if "for it in range(" in src[i - 1] or "tl.load(WL + it)" in src[i - 1]}
+    return set(range(a, b)), calls, wl
 
 
 def body_line(chain, body):
@@ -74,16 +78,15 @@ def body_line(chain, body):
     return inside[-1] if inside else (chain[-1] if chain else -1)
 
 
-def key_loop(ins, labels, body=None, calls=()):
-    """The largest backward branch, i.e. the key loop. With body, a loop that holds kernel-level
-    code other than the call of _split_program (tier 2's work-list loop) does not count."""
+def key_loop(ins, labels, kern=()):
+    """The largest backward branch, i.e. the key loop. A loop that holds tier 2's work-list loop
+    code (kern) does not count."""
     best = None
     for i, (_, op, rest) in enumerate(ins):
         m = re.search(r"`\((\.L_x_\d+)\)", rest) if op == "BRA" else None
         if m and m.group(1) in labels and labels[m.group(1)] <= i:
             lo = labels[m.group(1)]
-            if body is not None and any(c and not any(ln in body for ln in c) and c[-1] not in calls
-                                        for c, _, _ in ins[lo:i + 1]):
+            if any(c and c[-1] in kern for c, _, _ in ins[lo:i + 1]):
                 continue
             if best is None or i - lo > best[1] - best[0]:
                 best = (lo, i)
@@ -102,9 +105,9 @@ def profile(name, over):
     stack = re.findall(r"(\d+) bytes stack frame", info)
     src = open(SRC).read().splitlines()
     rare = rare_lines(src)
-    body, calls = body_lines(src)
+    body, _, kern = body_lines(src)
     ins, labels = parse(sass)
-    lo, hi = key_loop(ins, labels, body, calls)
+    lo, hi = key_loop(ins, labels, kern)
     by_line, ops, n_rare = collections.Counter(), collections.Counter(), 0
     for chain, op, _ in ins[lo:hi + 1]:
         if any(ln in rare for ln in chain):

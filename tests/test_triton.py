@@ -175,6 +175,37 @@ def test_tensor_core_pv_on_real_activations():
         r = int(rows[i])
         assert np.array_equal(got[i], attention_row(q[r], k[: r + 1], v[: r + 1, :32], alpha)), r
 
+@pytest.mark.parametrize("block_m", [16, 4, 2])
+def test_pv_fully_lost_v_channel_is_not_dropped(block_m):
+    """A V element far below its row's largest one loses every bit in block fixed point: all its
+    digits are 0 and only the lost mask says it is there. A channel made only of such elements must
+    count as having terms (DESIGN D24): before, tensor-core P·V returned it as an exact 0 and
+    certified a wrong output. Tier 1 must flag it, and tier 2 must recover the exact bits. block_m
+    16, 4 and 2 cover _tc_pv's three packings (one slot per MMA, several groups, one group)."""
+    from exactattn.formats import float_to_bf16_bits
+
+    rng = np.random.default_rng(5)
+    d, dv, R, n = 64, 32, 16, 40
+    Q = float_to_bf16_bits(rng.standard_normal((R, d)))
+    K = float_to_bf16_bits(rng.standard_normal((n, d)))
+    v = rng.standard_normal((n, dv))
+    v[:, 0], v[:, 1] = 1.0, 2.0 ** -40            # channel 1 is 2^-40 of channel 0 on every key
+    V = float_to_bf16_bits(v)
+    kv_len = rng.integers(1, n + 1, size=R)
+    alpha = default_alpha(d)
+    kw = dict(splits=2, block_m=block_m, block_n=32, block_dv=32, device=DEVICE, fallback=False,
+              use_tc=True, use_tc_pv=True)
+    got1, f1 = attention_triton(Q, K, V, alpha, kv_len, pv_tier2=False, **kw)
+    got2, f2 = attention_triton(Q, K, V, alpha, kv_len, **kw)
+    assert f1.all(), f1                           # tier 1 cannot certify channel 1
+    assert not f2.any(), f2                       # tier 2's int64 P·V can
+    for r in range(R):
+        L = int(kv_len[r])
+        ref = attention_row(Q[r], K[:L], V[:L], alpha)
+        assert ref[1] != 0
+        assert np.array_equal(got2[r], ref), r
+
+
 @pytest.mark.parametrize("kind,block_dv", [("normal", 32), ("outlier", 32), ("normal", 64)])
 def test_pv_tier2_recovers_uncertified_pairs(kind, block_dv):
     """Tier 2 (DESIGN D12): pairs that tensor-core P·V cannot certify are recomputed on the device
