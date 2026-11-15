@@ -32,10 +32,14 @@ source "${EA_VENV:-$HOME/scratch/exactattn-venv}/bin/activate"
 START=$(date +%s)
 FIX="python scripts/fixture.py check"
 PYT="python -m pytest -q -p no:cacheprovider"
+PART=""     # sbatch -p for successors; a plan may pin one
+PROBED=0    # gpu_ok has run in this job
+PART=""                                # sbatch -p override for successors (a plan may pin one)
+PROBED=0
 
 # name | per-stage cap in seconds | command
 STAGES=(
-  "env|600|nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv && python -c \"import torch, triton; print(torch.__version__, torch.version.cuda, triton.__version__, torch.cuda.get_device_name(0))\""
+  "env|1800|nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv && python -c \"import torch, triton; print(torch.__version__, torch.version.cuda, triton.__version__, torch.cuda.get_device_name(0))\""
   "fixture_cpp|600|$FIX --backend cpp"
   "fixture_torch_cuda_0_0|900|$FIX --backend torch:cuda --only 0_0"
   "fixture_torch_cuda_27_11|900|$FIX --backend torch:cuda --only 27_11"
@@ -60,6 +64,8 @@ STAGES=(
 # ~/.cache/flashinfer, which persists across jobs, so a preempted warmup is not lost.
 BF="python scripts/bench_vs_flashinfer.py"
 if [ "${EA_PLAN:-gpu_check}" = "flash" ]; then
+  PART="-p gpu-rtxpro-blackwell"   # the comparison is on the RTX PRO 6000 (sm_120), never an L40S
+  PART="-p gpu-rtxpro-blackwell"         # the comparison is on the RTX PRO 6000 (sm_120); never an L40S
   # FlashInfer JIT needs nvcc matching torch's CUDA (13.2); PACE modules stop at 12.8, so use the
   # pip nvidia-cuda-nvcc in the venv (pip install "nvidia-cuda-nvcc>=13.2,<13.3").
   SP=$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
@@ -67,7 +73,7 @@ if [ "${EA_PLAN:-gpu_check}" = "flash" ]; then
     export CUDA_HOME="$SP/nvidia/cu13" PATH="$SP/nvidia/cu13/bin:$PATH"
   fi
   STAGES=(
-    "env|600|nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv && which nvcc; python -c \"import torch, triton, flashinfer; print(torch.__version__, torch.version.cuda, triton.__version__, flashinfer.__version__, torch.cuda.get_device_name(0))\""
+    "env|1800|nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv && which nvcc; python -c \"import torch, triton, flashinfer; print(torch.__version__, torch.version.cuda, triton.__version__, flashinfer.__version__, torch.cuda.get_device_name(0))\""
     "tests_segments|1200|EA_TRITON_DEVICE=cuda $PYT tests/test_triton.py -k 'segments or slicing or pv'"
     "fixture_tritontcpv_27_11|1500|$FIX --backend tritontcpv:cuda --only 27_11"
     "flashinfer_warmup|2400|$BF --batch 1 --keys 1024 --drafts 1,8 --modes int64 --iters 2 --out $OUT/warmup.md"
@@ -108,7 +114,7 @@ submit_next() {   # $1 = extra sbatch args (e.g. a dependency)
   if [ "$CHAIN" -ge "$MAX_CHAIN" ]; then echo "chain: at EA_MAX_CHAIN=$MAX_CHAIN, no successor"; return; fi
   local exc=""   # nodes whose GPU failed earlier in this run (bad_node)
   [ -s "$OUT/bad_nodes" ] && exc="--exclude=$(cut -d' ' -f3 "$OUT/bad_nodes" | sort -u | paste -sd, -)"
-  sbatch --parsable -A "${SLURM_JOB_ACCOUNT:-gts-agarg35}" -q embers $exc $1 \
+  sbatch --parsable -A "${SLURM_JOB_ACCOUNT:-gts-agarg35}" -q embers $PART $exc $1 \
     --export=ALL,EA_RUN="$RUN",EA_CHAIN=$((CHAIN + 1)),EA_PLAN="${EA_PLAN:-gpu_check}" \
     -o "$HOME/scratch/ea_jobs/exactattn-$RUN-%j.out" "$REPO/scripts/pace/gpu_check.sbatch" 2>/dev/null
 }
@@ -139,8 +145,19 @@ remaining() { echo $(( BUDGET_S - ($(date +%s) - START) )); }
 # A node whose GPU cannot open a CUDA context ("device busy or unavailable": another process
 # holds it in exclusive mode, or it is faulted) fails every stage in seconds. nvidia-smi and
 # get_device_name do not open a context, so probe with a real allocation.
-gpu_ok() {
-  timeout 120 python -c "import torch; torch.zeros(1, device='cuda'); torch.cuda.synchronize()" >/dev/null 2>&1
+# Only an explicit CUDA error fails the probe. A node's first `import torch` reads thousands of
+# files off Lustre scratch with a cold cache: 93 s on the login node, over 10 min on compute nodes
+# in run 1118, where a 120 s cap marked four healthy nodes bad. So a timeout or other failure is
+# inconclusive and the stage runs under its own cap; a successful probe also warms the cache.
+gpu_ok() {   # $1 = timeout in seconds
+  local out
+  out=$(timeout "${1:-600}" python -c "import torch; torch.zeros(1, device='cuda'); torch.cuda.synchronize(); print('GPU_OK')" 2>&1)
+  case "$out" in
+    *GPU_OK*) return 0 ;;
+    *"busy or unavailable"*|*"no CUDA-capable"*|*"CUDA error"*|*"NVIDIA driver"*)
+      echo "$out" | tail -n 3 | sed 's/^/   probe: /'; return 1 ;;
+    *) echo "   GPU probe inconclusive (timeout or import failure); running the stage anyway"; return 0 ;;
+  esac
 }
 bad_node() {   # $1 = stage that hit it: leave it not-done, keep the successor off this node, stop
   echo "GPU unusable on $(hostname -s) during $1 - stage left not-done"
@@ -158,7 +175,12 @@ for e in "${STAGES[@]}"; do
   [ -f "$OUT/$name.done" ] && continue
   left=$(remaining)
   [ "$left" -lt 90 ] && continue
-  if [ "$name" != env ] && ! gpu_ok; then bad_node "$name"; fi
+  if [ "$name" != env ] && [ "$PROBED" -eq 0 ]; then   # once per job, before its first GPU stage
+    PROBED=1
+    pt=$(( left - 300 )); [ "$pt" -gt 1500 ] && pt=1500; [ "$pt" -lt 60 ] && pt=60
+    gpu_ok "$pt" || bad_node "$name"
+    left=$(remaining); [ "$left" -lt 90 ] && continue
+  fi
   t=$(( cap < left ? cap : left ))
   echo $(( $(cat "$OUT/$name.attempts" 2>/dev/null || echo 0) + 1 )) > "$OUT/$name.attempts"
   echo "== $name (cap ${t}s) $(date +%T) on $(hostname) job ${SLURM_JOB_ID:-local} chain $CHAIN"
@@ -176,7 +198,7 @@ for e in "${STAGES[@]}"; do
     n=$(( $(cat "$OUT/$name.timeouts" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$OUT/$name.timeouts"
     echo "   timeout #$n"
     [ "$n" -ge "$MAX_TIMEOUTS" ] && echo "TIMEOUT" > "$OUT/$name.done"
-  elif [ "$rc" -ne 0 ] && grep -q "busy or unavailable" "$OUT/$name.log" && ! gpu_ok; then
+  elif [ "$rc" -ne 0 ] && grep -q "busy or unavailable" "$OUT/$name.log" && ! gpu_ok 300; then
     bad_node "$name"
   else
     echo "rc=$rc" > "$OUT/$name.done"; echo "   rc=$rc"
