@@ -749,6 +749,20 @@ Tier 2 still costs 0.33 ms for 2 NEED pairs. Its grid has 16K programs (8 segmen
 blocks × 64 splits × 4 channel blocks), and almost all of them only load and slice q, then
 find nothing to do. That fixed cost is the next item. At decode it is 0.03–0.05 ms.
 
+## D20. Empty tier-2 programs exit first
+
+Tier 2's grid is fixed so that a step stays capturable in a CUDA graph. At T = 8, B = 1,
+n = 16K that grid has 16K programs (8 segments × 8 two-row blocks × 64 splits × 4 channel
+blocks), and run 1116 found 2 pairs that needed it. Every program still loaded, decoded and
+sliced its q rows, including the float64 L1 norm, before it found its key range empty. That
+cost 0.33 ms, 30% of the step. The tier-2 combine likewise ran its 96-step final rounding
+for every block and then stored nothing.
+
+Both tier-2 kernels now load their NEED entries first and wrap the rest in `if go:`, a runtime
+branch. Tier 1 is unchanged: there `go` is a compile-time True. A program with no NEED pair now
+costs one small load and a reduction. The outputs cannot change: such a program never wrote
+anything before either, because all of its stores were masked by NEED.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model

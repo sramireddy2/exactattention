@@ -590,119 +590,122 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
     VLOST += kb0 * DV
     KST = (kb0 * 0 + NKEYS) * D                                            # digit-plane strides
     VST = (kb0 * 0 + NKEYS) * DV
-    kvl = tl.load(KVLEN + rows, mask=rmask, other=0)
-    dd = tl.arange(0, D)
-    cc = pid_c * BLOCK_DV + tl.arange(0, BLOCK_DV)
-    qb = tl.load(Q + rows[:, None] * D + dd[None, :], mask=rmask[:, None], other=0)
-    qm, qe, qbad = _decode_bf16(qb)
-    flag = tl.max(qbad.to(tl.int32), axis=1)
-    if USE_TC:
-        q0, q1, q2, q3, qlsb, ql1s, qlost = _slice_q(qm, qe, SQ, PACK, BLOCK_M, D)
-        qerr, qbig = _l1_ceil(ql1s)
-    PRr = tl.full((BLOCK_M,), NEG, tl.int64)
-    PZr = tl.zeros((BLOCK_M,), tl.int64)
-    PZEr = tl.zeros((BLOCK_M,), tl.int64)
-    PNRr = tl.full((BLOCK_M, BLOCK_DV), NEG, tl.int64)
-    PNr = tl.zeros((BLOCK_M, BLOCK_DV), tl.int64)
-    PNEr = tl.zeros((BLOCK_M, BLOCK_DV), tl.int64)
-    k0 = pid_s * SPLIT_LEN
-    kmax = tl.max(kvl, axis=0)
-    k1 = tl.minimum(k0 + SPLIT_LEN, kmax)
+    go = True
     if RERUN:
-        # Tier 2 (DESIGN D12): recompute only the (row, channel block) pairs in NEED. A program
-        # with none walks zero tiles, so the launch is cheap and its grid is fixed (graph-safe).
+        # Tier 2 (DESIGN D12, D20): recompute only the (row, channel block) pairs in NEED. Its grid
+        # is fixed (graph-safe) and almost all of it has nothing to do, so a program checks NEED
+        # first and exits before loading or slicing q.
         need = (tl.load(NEED + rows * tl.num_programs(2) + pid_c, mask=rmask, other=0) != 0) & rmask
-        k1 = k0 + (k1 - k0) * (tl.max(need.to(tl.int32), axis=0) > 0).to(tl.int32)
-    for n0 in range(k0, k1, BLOCK_N):
-        nn = n0 + tl.arange(0, BLOCK_N)
-        vis = (nn[None, :] < kvl[:, None]) & rmask[:, None]              # (M, N)
-        # ---- scores ----
+        go = tl.max(need.to(tl.int32), axis=0) > 0
+    if go:
+        kvl = tl.load(KVLEN + rows, mask=rmask, other=0)
+        dd = tl.arange(0, D)
+        cc = pid_c * BLOCK_DV + tl.arange(0, BLOCK_DV)
+        qb = tl.load(Q + rows[:, None] * D + dd[None, :], mask=rmask[:, None], other=0)
+        qm, qe, qbad = _decode_bf16(qb)
+        flag = tl.max(qbad.to(tl.int32), axis=1)
         if USE_TC:
-            # Tensor cores: int8 slice products, certified. The bf16 K tile is read and decoded
-            # only for tiles that contain an uncertified score (windowed recompute); NaN/inf
-            # keys come from a flag made at cache write.
-            t, unc, kbad = _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nn < kmax, KST,
-                                      KLSB, KL1S, KLOST, AM, AE, D, SQ, SK, PACK, BLOCK_M)
-            flag = tl.maximum(flag, tl.max((vis & kbad[None, :]).to(tl.int32), axis=1))
-            if TC_FALLBACK and tl.max(tl.max((unc & vis).to(tl.int32), axis=1), axis=0) > 0:
-                t_w, unc_w = _windowed_logits(Q, rows * D, rmask, K, nn, nn < kmax, AM, AE, D, WDC, FS)
-                t = tl.where(unc, t_w, t)
-                unc = unc & unc_w
+            q0, q1, q2, q3, qlsb, ql1s, qlost = _slice_q(qm, qe, SQ, PACK, BLOCK_M, D)
+            qerr, qbig = _l1_ceil(ql1s)
+        PRr = tl.full((BLOCK_M,), NEG, tl.int64)
+        PZr = tl.zeros((BLOCK_M,), tl.int64)
+        PZEr = tl.zeros((BLOCK_M,), tl.int64)
+        PNRr = tl.full((BLOCK_M, BLOCK_DV), NEG, tl.int64)
+        PNr = tl.zeros((BLOCK_M, BLOCK_DV), tl.int64)
+        PNEr = tl.zeros((BLOCK_M, BLOCK_DV), tl.int64)
+        k0 = pid_s * SPLIT_LEN
+        kmax = tl.max(kvl, axis=0)
+        k1 = tl.minimum(k0 + SPLIT_LEN, kmax)
+        for n0 in range(k0, k1, BLOCK_N):
+            nn = n0 + tl.arange(0, BLOCK_N)
+            vis = (nn[None, :] < kvl[:, None]) & rmask[:, None]              # (M, N)
+            # ---- scores ----
+            if USE_TC:
+                # Tensor cores: int8 slice products, certified. The bf16 K tile is read and decoded
+                # only for tiles that contain an uncertified score (windowed recompute); NaN/inf
+                # keys come from a flag made at cache write.
+                t, unc, kbad = _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nn < kmax, KST,
+                                          KLSB, KL1S, KLOST, AM, AE, D, SQ, SK, PACK, BLOCK_M)
+                flag = tl.maximum(flag, tl.max((vis & kbad[None, :]).to(tl.int32), axis=1))
+                if TC_FALLBACK and tl.max(tl.max((unc & vis).to(tl.int32), axis=1), axis=0) > 0:
+                    t_w, unc_w = _windowed_logits(Q, rows * D, rmask, K, nn, nn < kmax, AM, AE, D, WDC, FS)
+                    t = tl.where(unc, t_w, t)
+                    unc = unc & unc_w
+            else:
+                kb = tl.load(K + nn[:, None] * D + dd[None, :], mask=(nn < kmax)[:, None], other=0).to(tl.int32)
+                kbad = tl.max((((kb >> 7) & 0xFF) == 0xFF).to(tl.int32), axis=1)  # (N,) NaN/inf key
+                flag = tl.maximum(flag, tl.max((vis & (kbad != 0)[None, :]).to(tl.int32), axis=1))
+                t, unc = _windowed_logits(Q, rows * D, rmask, K, nn, nn < kmax, AM, AE, D, WDC, FS)
+            # ---- weights ----
+            if EXP2_INT:
+                Mw, Ew, risky = _exp2_weight(t, EXP2T)
+                if tl.max(tl.max((risky & vis).to(tl.int32), axis=1), axis=0) > 0:
+                    # Rare (about 2^-14 of weights): float64 exp2 for this tile.
+                    Mw2, Ew2, risky2 = _exp2_weight_f64(t, EXP2_MARGIN)
+                    Mw = tl.where(risky, Mw2, Mw)
+                    Ew = tl.where(risky, Ew2, Ew)
+                    risky = risky & risky2
+            else:
+                Mw, Ew, risky = _exp2_weight_f64(t, EXP2_MARGIN)
+            unc = unc | risky | (tl.abs(t) >= 1073741824.0)
+            flag = tl.maximum(flag, tl.max((vis & unc).to(tl.int32), axis=1))
+            # ---- tile partial ----
+            top = tl.where(vis, Ew + 23, NEG)
+            TR = tl.max(top, axis=1)                                           # (M,)
+            zt, zl = _floor_shift(Mw, Ew - (TR[:, None] - FZ))
+            TZ = tl.sum(tl.where(vis, zt, 0), axis=1)
+            TZE = tl.sum((zl & vis).to(tl.int64), axis=1)
+            if USE_TC_PV:
+                TNR, TN, TNE, vbad = _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nn < kmax, cc, VST, FN, DV,
+                                            SW, SV, ANCH, PACK, BLOCK_M)
+                flag = tl.maximum(flag, tl.max((vis & vbad[None, :]).to(tl.int32), axis=1))
+            else:
+                vb = tl.load(V + nn[:, None] * DV + cc[None, :], mask=(nn < kmax)[:, None], other=0)
+                vm, ve, vbad = _decode_bf16(vb)                                # (N, BDV)
+                flag = tl.maximum(flag, tl.max((vis & (tl.max(vbad.to(tl.int32), axis=1) != 0)[None, :]).to(tl.int32), axis=1))
+                lv = tl.where(vm != 0, ve + _bitlen(tl.abs(vm)) - 1, NEG)
+                valid = vis[:, :, None] & (vm != 0)[None, :, :]                # (M, N, BDV)
+                L = tl.where(valid, top[:, :, None] + 1 + lv[None, :, :], NEG)
+                TNR = tl.max(L, axis=1)                                        # (M, BDV)
+                nt, nl = _floor_shift(Mw[:, :, None] * vm[None, :, :],
+                                      Ew[:, :, None] + ve[None, :, :] - (TNR[:, None, :] - FN))
+                TN = tl.sum(tl.where(valid, nt, 0), axis=1)
+                TNE = tl.sum((nl & valid).to(tl.int64), axis=1)
+            # ---- merge into the running partial ----
+            nR = tl.maximum(PRr, TR)
+            a1, e1 = _rescale(PZr, PZEr, nR - PRr)
+            a2, e2 = _rescale(TZ, TZE, nR - TR)
+            PRr = nR
+            PZr = a1 + a2
+            PZEr = e1 + e2
+            nNR = tl.maximum(PNRr, TNR)
+            b1, f1 = _rescale(PNr, PNEr, nNR - PNRr)
+            b2, f2 = _rescale(TN, TNE, nNR - TNR)
+            PNRr = nNR
+            PNr = b1 + b2
+            PNEr = f1 + f2
+            flag = tl.maximum(flag, ((tl.abs(PZr) + PZEr) >= (1 << 62)).to(tl.int32))
+            flag = tl.maximum(flag, tl.max(((tl.abs(PNr) + PNEr) >= (1 << 62)).to(tl.int32), axis=1))
+        off = pid_s * ROWS + rows
+        wmask = rmask
+        if RERUN:
+            wmask = need          # tier 2 keeps tier 1's Z partials and rewrites only N for NEED pairs
         else:
-            kb = tl.load(K + nn[:, None] * D + dd[None, :], mask=(nn < kmax)[:, None], other=0).to(tl.int32)
-            kbad = tl.max((((kb >> 7) & 0xFF) == 0xFF).to(tl.int32), axis=1)  # (N,) NaN/inf key
-            flag = tl.maximum(flag, tl.max((vis & (kbad != 0)[None, :]).to(tl.int32), axis=1))
-            t, unc = _windowed_logits(Q, rows * D, rmask, K, nn, nn < kmax, AM, AE, D, WDC, FS)
-        # ---- weights ----
-        if EXP2_INT:
-            Mw, Ew, risky = _exp2_weight(t, EXP2T)
-            if tl.max(tl.max((risky & vis).to(tl.int32), axis=1), axis=0) > 0:
-                # Rare (about 2^-14 of weights): float64 exp2 for this tile.
-                Mw2, Ew2, risky2 = _exp2_weight_f64(t, EXP2_MARGIN)
-                Mw = tl.where(risky, Mw2, Mw)
-                Ew = tl.where(risky, Ew2, Ew)
-                risky = risky & risky2
+            zmask = rmask & ((rows * 0 + pid_c) == 0)  # only channel block 0 writes Z
+            tl.store(PR + off, PRr, mask=zmask)
+            tl.store(PZ + off, PZr, mask=zmask)
+            tl.store(PZE + off, PZEr, mask=zmask)
+        o2 = off[:, None] * DV + cc[None, :]
+        tl.store(PNR + o2, PNRr, mask=wmask[:, None])
+        tl.store(PN + o2, PNr, mask=wmask[:, None])
+        tl.store(PNE + o2, PNEr, mask=wmask[:, None])
+        # FLAG has FL_NCB channel blocks of tier 1's width; tier 2 runs FL_DIV narrower blocks per
+        # entry, so it takes the maximum (atomics: the result does not depend on their order).
+        fo = FLAG + (pid_s * ROWS + rows) * FL_NCB + pid_c // FL_DIV
+        if RERUN:
+            tl.atomic_max(fo, flag, mask=wmask)
         else:
-            Mw, Ew, risky = _exp2_weight_f64(t, EXP2_MARGIN)
-        unc = unc | risky | (tl.abs(t) >= 1073741824.0)
-        flag = tl.maximum(flag, tl.max((vis & unc).to(tl.int32), axis=1))
-        # ---- tile partial ----
-        top = tl.where(vis, Ew + 23, NEG)
-        TR = tl.max(top, axis=1)                                           # (M,)
-        zt, zl = _floor_shift(Mw, Ew - (TR[:, None] - FZ))
-        TZ = tl.sum(tl.where(vis, zt, 0), axis=1)
-        TZE = tl.sum((zl & vis).to(tl.int64), axis=1)
-        if USE_TC_PV:
-            TNR, TN, TNE, vbad = _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nn < kmax, cc, VST, FN, DV,
-                                        SW, SV, ANCH, PACK, BLOCK_M)
-            flag = tl.maximum(flag, tl.max((vis & vbad[None, :]).to(tl.int32), axis=1))
-        else:
-            vb = tl.load(V + nn[:, None] * DV + cc[None, :], mask=(nn < kmax)[:, None], other=0)
-            vm, ve, vbad = _decode_bf16(vb)                                # (N, BDV)
-            flag = tl.maximum(flag, tl.max((vis & (tl.max(vbad.to(tl.int32), axis=1) != 0)[None, :]).to(tl.int32), axis=1))
-            lv = tl.where(vm != 0, ve + _bitlen(tl.abs(vm)) - 1, NEG)
-            valid = vis[:, :, None] & (vm != 0)[None, :, :]                # (M, N, BDV)
-            L = tl.where(valid, top[:, :, None] + 1 + lv[None, :, :], NEG)
-            TNR = tl.max(L, axis=1)                                        # (M, BDV)
-            nt, nl = _floor_shift(Mw[:, :, None] * vm[None, :, :],
-                                  Ew[:, :, None] + ve[None, :, :] - (TNR[:, None, :] - FN))
-            TN = tl.sum(tl.where(valid, nt, 0), axis=1)
-            TNE = tl.sum((nl & valid).to(tl.int64), axis=1)
-        # ---- merge into the running partial ----
-        nR = tl.maximum(PRr, TR)
-        a1, e1 = _rescale(PZr, PZEr, nR - PRr)
-        a2, e2 = _rescale(TZ, TZE, nR - TR)
-        PRr = nR
-        PZr = a1 + a2
-        PZEr = e1 + e2
-        nNR = tl.maximum(PNRr, TNR)
-        b1, f1 = _rescale(PNr, PNEr, nNR - PNRr)
-        b2, f2 = _rescale(TN, TNE, nNR - TNR)
-        PNRr = nNR
-        PNr = b1 + b2
-        PNEr = f1 + f2
-        flag = tl.maximum(flag, ((tl.abs(PZr) + PZEr) >= (1 << 62)).to(tl.int32))
-        flag = tl.maximum(flag, tl.max(((tl.abs(PNr) + PNEr) >= (1 << 62)).to(tl.int32), axis=1))
-    off = pid_s * ROWS + rows
-    wmask = rmask
-    if RERUN:
-        wmask = need          # tier 2 keeps tier 1's Z partials and rewrites only N for NEED pairs
-    else:
-        zmask = rmask & ((rows * 0 + pid_c) == 0)  # only channel block 0 writes Z
-        tl.store(PR + off, PRr, mask=zmask)
-        tl.store(PZ + off, PZr, mask=zmask)
-        tl.store(PZE + off, PZEr, mask=zmask)
-    o2 = off[:, None] * DV + cc[None, :]
-    tl.store(PNR + o2, PNRr, mask=wmask[:, None])
-    tl.store(PN + o2, PNr, mask=wmask[:, None])
-    tl.store(PNE + o2, PNEr, mask=wmask[:, None])
-    # FLAG has FL_NCB channel blocks of tier 1's width; tier 2 runs FL_DIV narrower blocks per
-    # entry, so it takes the maximum (atomics: the result does not depend on their order).
-    fo = FLAG + (pid_s * ROWS + rows) * FL_NCB + pid_c // FL_DIV
-    if RERUN:
-        tl.atomic_max(fo, flag, mask=wmask)
-    else:
-        tl.store(fo, flag, mask=wmask)
+            tl.store(fo, flag, mask=wmask)
 
 
 @triton.jit
@@ -717,75 +720,77 @@ def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, O
     rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rmask = rows < ROWS
     cc = pid_c * BLOCK_DV + tl.arange(0, BLOCK_DV)
-    R = tl.full((BLOCK_M,), NEG, tl.int64)
-    Z = tl.zeros((BLOCK_M,), tl.int64)
-    ZE = tl.zeros((BLOCK_M,), tl.int64)
-    NR = tl.full((BLOCK_M, BLOCK_DV), NEG, tl.int64)
-    N = tl.zeros((BLOCK_M, BLOCK_DV), tl.int64)
-    NE = tl.zeros((BLOCK_M, BLOCK_DV), tl.int64)
-    flag = tl.zeros((BLOCK_M,), tl.int32)
-    sflag = tl.zeros((BLOCK_M,), tl.int32)
-    nloop = NSPLIT
     wmask = rmask
+    go = True
     if RERUN:
+        # Tier 2's combine: only programs with a NEED pair merge and round again (DESIGN D20).
         wmask = (tl.load(NEED + rows * tl.num_programs(1) + pid_c, mask=rmask, other=0) != 0) & rmask
-        nloop = NSPLIT * (tl.max(wmask.to(tl.int32), axis=0) > 0).to(tl.int32)
-    for i in range(nloop):
-        s = tl.load(ORDER + i)
-        off = s * ROWS + rows
+        go = tl.max(wmask.to(tl.int32), axis=0) > 0
+    if go:
+        R = tl.full((BLOCK_M,), NEG, tl.int64)
+        Z = tl.zeros((BLOCK_M,), tl.int64)
+        ZE = tl.zeros((BLOCK_M,), tl.int64)
+        NR = tl.full((BLOCK_M, BLOCK_DV), NEG, tl.int64)
+        N = tl.zeros((BLOCK_M, BLOCK_DV), tl.int64)
+        NE = tl.zeros((BLOCK_M, BLOCK_DV), tl.int64)
+        flag = tl.zeros((BLOCK_M,), tl.int32)
+        sflag = tl.zeros((BLOCK_M,), tl.int32)
+        for i in range(NSPLIT):
+            s = tl.load(ORDER + i)
+            off = s * ROWS + rows
+            if WRITE_NEED:
+                sflag = tl.maximum(sflag, tl.load(FLAG + off * FL_NCB + pid_c // FL_DIV, mask=rmask, other=0))
+            sR = tl.load(PR + off, mask=rmask, other=NEG)
+            sZ = tl.load(PZ + off, mask=rmask, other=0)
+            sZE = tl.load(PZE + off, mask=rmask, other=0)
+            o2 = off[:, None] * DV + cc[None, :]
+            sNR = tl.load(PNR + o2, mask=rmask[:, None], other=NEG)
+            sN = tl.load(PN + o2, mask=rmask[:, None], other=0)
+            sNE = tl.load(PNE + o2, mask=rmask[:, None], other=0)
+            nR = tl.maximum(R, sR)
+            a1, e1 = _rescale(Z, ZE, nR - R)
+            a2, e2 = _rescale(sZ, sZE, nR - sR)
+            R = nR
+            Z = a1 + a2
+            ZE = e1 + e2
+            nNR = tl.maximum(NR, sNR)
+            b1, f1 = _rescale(N, NE, nNR - NR)
+            b2, f2 = _rescale(sN, sNE, nNR - sNR)
+            NR = nNR
+            N = b1 + b2
+            NE = f1 + f2
+            flag = tl.maximum(flag, ((tl.abs(Z) + ZE) >= (1 << 62)).to(tl.int32))
+            flag = tl.maximum(flag, tl.max(((tl.abs(N) + NE) >= (1 << 62)).to(tl.int32), axis=1))
+        has = R > NEG // 2
+        chan = NR > NEG // 2
+        zunit = R - FZ
+        Zlo = Z
+        Zhi = Z + ZE
+        Nlo = N
+        Nhi = N + NE
+        sh = tl.where(chan, (NR - FN) - zunit[:, None], 0)
+        lo_den = tl.where(Nlo >= 0, Zhi[:, None], Zlo[:, None])
+        hi_den = tl.where(Nhi <= 0, Zhi[:, None], Zlo[:, None])
+        lo_den = tl.maximum(lo_den, 1)
+        hi_den = tl.maximum(hi_den, 1)
+        ql, qel = _ratio_round(tl.abs(Nlo), lo_den, sh, P, QMIN, N_ITER)
+        qh, qeh = _ratio_round(tl.abs(Nhi), hi_den, sh, P, QMIN, N_ITER)
+        sl = tl.where(Nlo < 0, -1, 1)
+        shh = tl.where(Nhi < 0, -1, 1)
+        same = ((ql == 0) & (qh == 0)) | ((ql == qh) & (qel == qeh) & (sl == shh)) | (~chan)
+        flag = tl.maximum(flag, (has & (tl.min(same.to(tl.int32), axis=1) == 0)).to(tl.int32))
+        flag = tl.maximum(flag, (has & (Zlo <= 0)).to(tl.int32))
+        # fp32 bits of sl * ql * 2^qel (ql < 2^P, normalized unless qel == QMIN), built exactly.
+        q24 = ql << (24 - P)
+        qe24 = qel - (24 - P)
+        bits = _f32_bits(q24, qe24, Nlo < 0, qe24 > 104)
+        bits = tl.where(chan & has[:, None] & (ql != 0), bits, 0)
+        if not OUT_FP32:
+            bits = (bits >> 16) & 0xFFFF
+        tl.store(OUT + rows[:, None] * DV + cc[None, :], bits, mask=wmask[:, None])
+        tl.store(OFLAG + rows * tl.num_programs(1) + pid_c, flag, mask=wmask)
         if WRITE_NEED:
-            sflag = tl.maximum(sflag, tl.load(FLAG + off * FL_NCB + pid_c // FL_DIV, mask=rmask, other=0))
-        sR = tl.load(PR + off, mask=rmask, other=NEG)
-        sZ = tl.load(PZ + off, mask=rmask, other=0)
-        sZE = tl.load(PZE + off, mask=rmask, other=0)
-        o2 = off[:, None] * DV + cc[None, :]
-        sNR = tl.load(PNR + o2, mask=rmask[:, None], other=NEG)
-        sN = tl.load(PN + o2, mask=rmask[:, None], other=0)
-        sNE = tl.load(PNE + o2, mask=rmask[:, None], other=0)
-        nR = tl.maximum(R, sR)
-        a1, e1 = _rescale(Z, ZE, nR - R)
-        a2, e2 = _rescale(sZ, sZE, nR - sR)
-        R = nR
-        Z = a1 + a2
-        ZE = e1 + e2
-        nNR = tl.maximum(NR, sNR)
-        b1, f1 = _rescale(N, NE, nNR - NR)
-        b2, f2 = _rescale(sN, sNE, nNR - sNR)
-        NR = nNR
-        N = b1 + b2
-        NE = f1 + f2
-        flag = tl.maximum(flag, ((tl.abs(Z) + ZE) >= (1 << 62)).to(tl.int32))
-        flag = tl.maximum(flag, tl.max(((tl.abs(N) + NE) >= (1 << 62)).to(tl.int32), axis=1))
-    has = R > NEG // 2
-    chan = NR > NEG // 2
-    zunit = R - FZ
-    Zlo = Z
-    Zhi = Z + ZE
-    Nlo = N
-    Nhi = N + NE
-    sh = tl.where(chan, (NR - FN) - zunit[:, None], 0)
-    lo_den = tl.where(Nlo >= 0, Zhi[:, None], Zlo[:, None])
-    hi_den = tl.where(Nhi <= 0, Zhi[:, None], Zlo[:, None])
-    lo_den = tl.maximum(lo_den, 1)
-    hi_den = tl.maximum(hi_den, 1)
-    ql, qel = _ratio_round(tl.abs(Nlo), lo_den, sh, P, QMIN, N_ITER)
-    qh, qeh = _ratio_round(tl.abs(Nhi), hi_den, sh, P, QMIN, N_ITER)
-    sl = tl.where(Nlo < 0, -1, 1)
-    shh = tl.where(Nhi < 0, -1, 1)
-    same = ((ql == 0) & (qh == 0)) | ((ql == qh) & (qel == qeh) & (sl == shh)) | (~chan)
-    flag = tl.maximum(flag, (has & (tl.min(same.to(tl.int32), axis=1) == 0)).to(tl.int32))
-    flag = tl.maximum(flag, (has & (Zlo <= 0)).to(tl.int32))
-    # fp32 bits of sl * ql * 2^qel (ql < 2^P, normalized unless qel == QMIN), built exactly.
-    q24 = ql << (24 - P)
-    qe24 = qel - (24 - P)
-    bits = _f32_bits(q24, qe24, Nlo < 0, qe24 > 104)
-    bits = tl.where(chan & has[:, None] & (ql != 0), bits, 0)
-    if not OUT_FP32:
-        bits = (bits >> 16) & 0xFFFF
-    tl.store(OUT + rows[:, None] * DV + cc[None, :], bits, mask=wmask[:, None])
-    tl.store(OFLAG + rows * tl.num_programs(1) + pid_c, flag, mask=wmask)
-    if WRITE_NEED:
-        tl.store(NEED + rows * tl.num_programs(1) + pid_c, ((flag != 0) & (sflag == 0)).to(tl.int32), mask=rmask)
+            tl.store(NEED + rows * tl.num_programs(1) + pid_c, ((flag != 0) & (sflag == 0)).to(tl.int32), mask=rmask)
 
 
 # ---------------------------------------------------------------------------
