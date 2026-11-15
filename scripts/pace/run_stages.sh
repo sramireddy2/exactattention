@@ -34,8 +34,6 @@ FIX="python scripts/fixture.py check"
 PYT="python -m pytest -q -p no:cacheprovider"
 PART=""     # sbatch -p for successors; a plan may pin one
 PROBED=0    # gpu_ok has run in this job
-PART=""                                # sbatch -p override for successors (a plan may pin one)
-PROBED=0
 
 # name | per-stage cap in seconds | command
 STAGES=(
@@ -67,7 +65,6 @@ if [ "${EA_PLAN:-gpu_check}" = "flash" ]; then
   # The comparison is on the RTX PRO 6000 (sm_120), never an L40S. Submission adds gpu-v100 to
   # any -p list, so pin the GPU type in the gres as well.
   PART="-p gpu-rtxpro-blackwell --gres=gpu:rtx_pro_6000_blackwell:1"
-  PART="-p gpu-rtxpro-blackwell"         # the comparison is on the RTX PRO 6000 (sm_120); never an L40S
   # FlashInfer JIT needs nvcc matching torch's CUDA (13.2); PACE modules stop at 12.8, so use the
   # pip nvidia-cuda-nvcc in the venv (pip install "nvidia-cuda-nvcc>=13.2,<13.3").
   SP=$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
