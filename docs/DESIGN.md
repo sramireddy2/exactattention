@@ -776,6 +776,43 @@ failure that names the error. On an unusable GPU it:
   submission excludes it;
 - exits, so the successor reruns the stage elsewhere.
 
+## D21. Registers
+
+Every tensor-core split kernel uses all 255 registers, so an 8-warp program has an SM to itself.
+`scripts/sm120_sass_profile.py` measured where the pressure comes from (with the GPU's hints;
+"spill ops" are spill loads and stores in the key loop, per 32 keys):
+
+| variant | 16-row verify, tcpv 128/8 | 2-row decode, tcpv 128/8 | 16-row verify, tc 64/8 |
+|---|---|---|---|
+| baseline (4901277) | 580, 22.7K instructions | 32, 13.7K | 8144, 161K |
+| windowed fallback compiled out | 500 | 0 | |
+| 128-register cap, depth 1 | 3032 | 336, 15.3K | |
+| int32 running exponent (kept) | 668, 23.2K | 8, 13.7K | 4048, 160K |
+| plus int32 error counts (dropped) | 532, 23.9K | 12, 13.9K | 7168 |
+| plus int32 weights (dropped) | 524, 24.7K | 12, 14.0K | 6480 |
+
+The windowed fallback is not what holds the registers. The live state that does is the
+(row, channel) running partial: three (16 × 128) int64 arrays, 48 registers per thread at 8
+warps.
+
+**Kept: the running exponent in int32.** NEG32 = −2^30 marks "empty", and the store widens it
+to the int64 NEG, so the partial format the combine kernel reads is unchanged. Spill traffic
+halves for tc and falls 4× at decode, for no extra instructions. ptxas places spills a little
+worse for tcpv 128/8 verify; 64/8 improves.
+
+**Dropped: error counts in int32.** This broke the tier-2 test. On wide-exponent V, tier-1
+tensor-core counts legitimately pass 2^30, so a sound saturation has to flag the row, and a
+split flag stops tier 2 from recovering it. Doing this soundly would need a "rerun me" marker
+that sends the pair to tier 2. That costs more code than the 8 registers it saves.
+
+**Dropped: int32 weights.** They saved nothing.
+
+**Register cap, for the GPU to decide.** A 128-register cap lets two 8-warp programs share an SM
+at pipelining depth 1 (16 KB of shared memory). At decode it costs about 40× the spill traffic
+and 11% more instructions, for twice the warps to hide latency. `launch` takes `maxnreg`, and the
+benchmark carries `r128` A/Bs for tcpv 128/8 and 64/8. A register cap is a tiling choice, so the
+benchmark's bit check covers it. Tier 2 keeps its own registers.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model

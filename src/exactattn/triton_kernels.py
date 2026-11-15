@@ -34,6 +34,7 @@ from .reference import attention_row
 from .slices import slice_rows
 
 NEG = tl.constexpr(-(1 << 60))  # "empty" sentinel for reference exponents
+NEG32 = tl.constexpr(-(1 << 30))  # the same, for exponents held in int32 (DESIGN D21)
 _LAST_DEBUG: dict = {}  # last call's intermediate buffers, for debugging
 SCORE_FS = 63 - 1 - 7  # d <= 128
 _L31 = tl.constexpr(EXP2_L31)
@@ -487,7 +488,7 @@ def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nmask, cc, VST, FN, DV: tl.constexp
     sl = tl.minimum(tl.maximum(-sr, 0), 62)
     TN = tl.where(sr >= 0, TN_r, lo << sl)
     TNE = tl.where(sr >= 0, TNE_r, wid << sl)
-    TNR = tl.where(chan, base[:, None] + ANCH, NEG)
+    TNR = tl.where(chan, (base[:, None] + ANCH).to(tl.int32), NEG32)
     TN = tl.where(chan, TN, 0)
     TNE = tl.where(chan, TNE, 0)
     return TNR, TN, TNE, vbad
@@ -610,7 +611,9 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
         PRr = tl.full((BLOCK_M,), NEG, tl.int64)
         PZr = tl.zeros((BLOCK_M,), tl.int64)
         PZEr = tl.zeros((BLOCK_M,), tl.int64)
-        PNRr = tl.full((BLOCK_M, BLOCK_DV), NEG, tl.int64)
+        # The (row, channel) running partial is the loop's largest live state. Its exponent is held
+        # in int32 (DESIGN D21); the value and the error count need int64.
+        PNRr = tl.full((BLOCK_M, BLOCK_DV), NEG32, tl.int32)
         PNr = tl.zeros((BLOCK_M, BLOCK_DV), tl.int64)
         PNEr = tl.zeros((BLOCK_M, BLOCK_DV), tl.int64)
         k0 = pid_s * SPLIT_LEN
@@ -667,6 +670,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                 valid = vis[:, :, None] & (vm != 0)[None, :, :]                # (M, N, BDV)
                 L = tl.where(valid, top[:, :, None] + 1 + lv[None, :, :], NEG)
                 TNR = tl.max(L, axis=1)                                        # (M, BDV)
+                TNR = tl.where(TNR > NEG // 2, TNR, NEG32).to(tl.int32)
                 nt, nl = _floor_shift(Mw[:, :, None] * vm[None, :, :],
                                       Ew[:, :, None] + ve[None, :, :] - (TNR[:, None, :] - FN))
                 TN = tl.sum(tl.where(valid, nt, 0), axis=1)
@@ -679,8 +683,8 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
             PZr = a1 + a2
             PZEr = e1 + e2
             nNR = tl.maximum(PNRr, TNR)
-            b1, f1 = _rescale(PNr, PNEr, nNR - PNRr)
-            b2, f2 = _rescale(TN, TNE, nNR - TNR)
+            b1, f1 = _rescale(PNr, PNEr, (nNR - PNRr).to(tl.int64))
+            b2, f2 = _rescale(TN, TNE, (nNR - TNR).to(tl.int64))
             PNRr = nNR
             PNr = b1 + b2
             PNEr = f1 + f2
@@ -696,7 +700,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
             tl.store(PZ + off, PZr, mask=zmask)
             tl.store(PZE + off, PZEr, mask=zmask)
         o2 = off[:, None] * DV + cc[None, :]
-        tl.store(PNR + o2, PNRr, mask=wmask[:, None])
+        tl.store(PNR + o2, tl.where(PNRr > NEG32, PNRr.to(tl.int64), NEG), mask=wmask[:, None])
         tl.store(PN + o2, PNr, mask=wmask[:, None])
         tl.store(PNE + o2, PNEr, mask=wmask[:, None])
         # FLAG has FL_NCB channel blocks of tier 1's width; tier 2 runs FL_DIV narrower blocks per
@@ -931,7 +935,8 @@ def _exp2_table_dev(dev):
 def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int = 4, block_m: int | None = None,
            block_n: int = 16, block_dv: int = 32, merge_order=None, exp2_margin: float = 2.0 ** -26,
            q_tc=None, k_tc=None, tc_fallback: bool = True, v_tc=None, sw: int = 5, pv_tier2: bool = True,
-           sq: int = 4, num_warps: int = 4, exp2: str = "int", num_stages: int | None = None):
+           sq: int = 4, num_warps: int = 4, exp2: str = "int", num_stages: int | None = None,
+           maxnreg: int | None = None):
     """Device-level launch with no host transfers and no sync.
 
     Qt (R, d), Kt (n, d), Vt (n, dv) are int16 views of bf16 on the device; KL (R,) is int32.
@@ -1022,6 +1027,10 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     if num_stages is None and use_tc_pv and block_n >= 64:
         num_stages = 2
     stages = {} if num_stages is None else {"num_stages": num_stages}
+    if maxnreg is not None:
+        # A register cap for the tier-1 split kernel: 128 lets two 8-warp programs share an SM
+        # (more latency hiding, more spills). A tiling choice, so it cannot change bits.
+        stages["maxnreg"] = maxnreg
 
     def split(need, rerun, bn, pv, v_args, sw_, sv_, anch_, bm, bdv, nw):
         nrb_ = triton.cdiv(r_seg, bm)
@@ -1036,6 +1045,7 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
             EXP2T=exp2t, EXP2_INT=(exp2 == "int"), WDC=wdc, FL_DIV=block_dv // bdv, num_warps=nw, **stages)
 
     ck = split(z32, False, block_n, use_tc_pv, vtc, sw, sv, anch, block_m, block_dv, num_warps)
+    stages.pop("maxnreg", None)                                  # tier 2 keeps its own registers
     # Registers and spills of the compiled split kernel (None under the CPU interpreter).
     _LAST_DEBUG.update(n_regs=getattr(ck, "n_regs", None), n_spills=getattr(ck, "n_spills", None))
     if merge_order is None:

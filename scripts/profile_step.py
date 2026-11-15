@@ -70,7 +70,7 @@ def main():
     for T, B, n, mode, bdv, nw, bm, bn, sq in CASES:
         case = bench.Case(B, n, T)
         try:
-            fn, unc, bad, _, _, regs = case.exact(mode, sms, bdv, nw, bm, "int", bn, sq)
+            fn, unc, bad, _, _, regs = case.exact(mode, sms, bdv, nw, bm, "int", bn, sq, None)
             share = tier2_share()
             kt = kernel_times(fn, a.iters)
         except Exception as ex:  # noqa: BLE001

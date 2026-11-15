@@ -36,6 +36,8 @@ CONFIGS = {
     "tcpv m2 64/8": {**DECODE, "BLOCK_DV": 64, "num_warps": 8},
     "tcpv m2 128/8": {**DECODE, "BLOCK_DV": 128, "num_warps": 8},
     "tcpv m2 128/8 n32": {**DECODE, "BLOCK_DV": 128, "num_warps": 8, "BLOCK_N": 32},
+    "tcpv m2 128/8 r128": {**DECODE, "BLOCK_DV": 128, "num_warps": 8, "maxnreg": 128, "num_stages": 1},
+    "tcpv m2 64/8 r128": {**DECODE, "BLOCK_DV": 64, "num_warps": 8, "maxnreg": 128, "num_stages": 1},
     "tcpv m16 32/4": {},
     "tcpv m16 128/8": {"BLOCK_DV": 128, "num_warps": 8},     # verify steps (T = 8: 16 rows)
     "tcpv m16 128/8 q3": {"BLOCK_DV": 128, "num_warps": 8, "SQ": 3},
@@ -54,6 +56,7 @@ def kernel_config(over):
     cfg = {**BASE, **over, "FS": SCORE_FS}
     nw = cfg.pop("num_warps")
     ns = cfg.pop("num_stages", None)
+    cfg.pop("maxnreg", None)
     if ns is None and cfg["USE_TC_PV"] and cfg["BLOCK_N"] >= 64:
         ns = 2                                                  # as launch picks it
     if not cfg["USE_TC_PV"]:
@@ -85,7 +88,10 @@ def build_ptx(over, ttgir_out=None):
     src = ASTSource(_ea_split_kernel, sig, {a: cfg[a] for a in _ea_split_kernel.arg_names if a in cfg}, attrs)
     target = GPUTarget("cuda", 120, 32)
     be = CUDABackend(target)
-    opts = be.parse_options({"num_warps": nw, **({} if ns is None else {"num_stages": ns})})
+    extra = {} if ns is None else {"num_stages": ns}
+    if over.get("maxnreg"):
+        extra["maxnreg"] = over["maxnreg"]                     # register cap (launch's maxnreg)
+    opts = be.parse_options({"num_warps": nw, **extra})
     ctx = ir.context()
     ir.load_dialects(ctx)
     be.load_dialects(ctx)
