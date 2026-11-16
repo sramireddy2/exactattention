@@ -1260,6 +1260,40 @@ The decision this serves:
   launch, or a split whose keys straddle a slow region. The start times and SMs will show
   which.
 
+**Run 1125-flash** (1f99a95; all bits checked, 0 uncertified rows, fixture SHA-256 match;
+timers bits equal to the plain build in all 6 cases). Benchmark times match run 1124. The
+stragglers are the windowed score fallback:
+
+| tcpv 128/8 n64 q4 | decode B=1 16K | decode B=8 16K | verify B=1 16K | verify B=8 4K |
+|---|---|---|---|---|
+| tiles with the windowed fallback | 22 / 2048 | 154 / 16384 | 22 / 2048 | 34 / 4096 |
+| tiles with float64 exp2 | 23 | 112 | 133 | 260 |
+| program µs, with / without any fallback | 57.9 / 46.5 | 219 / 200 | 137 / 101 | 168 / 134 |
+| longest tile, µs (median program's longest) | 38.4 (11.6) | 43.9 (11.1) | 213 (23.6) | 213 (25.1) |
+
+- **Every one of the 8 slowest programs has a windowed tile**, in every case. At m16 that tile
+  takes about 200 µs, against about 24 µs for a normal tile, because it recomputes all 16 rows
+  × 64 keys exactly. At m2, with fewer rows, it costs about 30 µs.
+- **The windowed tiles set verify's launch time.** At verify B=1 16K the slowest program has 2
+  windowed tiles. It starts at 109 µs and runs 475 µs, so it ends at 584 µs, the end of the
+  launch. Programs without a fallback average 101 µs. At 2.72 waves the launch would take
+  about 0.30 ms without the windowed tiles, against 0.56 ms now. That is 1% of tiles costing
+  about 45% of the tier-1 split launch.
+- **The same tiles fall back in decode and verify** (for example pid_m 2, pid_s 33). The cause
+  is in K, not Q: those keys' scores cannot be certified with 4 q digits on the tensor cores.
+- **The fallback's time is not in the scores clock.** It lands in "rest": scores sum to only
+  2–5 µs per slow program. So the scores clock does not bound the branch. Why is not settled.
+  The longest-tile column spans whole tiles and is the reliable measure.
+- **q3 explained.** With 3 q digits, 1033 of 2048 verify tiles take the windowed fallback. Its
+  programs average 664 µs with a fallback and 97 µs without.
+- **float64 exp2 is minor.** It costs about 7 µs per tile at m16 and about 4 µs at m2. At
+  verify B=1 16K, 133 such tiles add about 5 µs per SM.
+
+So tier 1 should not run the windowed fallback (D28): it should flag the rows and let tier 2
+recompute them. Tier 2 runs one row per program (`block_m_t2 = 1`), so the same fallback there
+costs 1/16 of the m16 work per tile. The cost moves to tier 2's work list: a flagged row
+reruns every channel block over every KV split. Whether that is cheaper is an A/B question.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
