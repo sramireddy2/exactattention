@@ -85,12 +85,15 @@ def _floor_shift(m, sh):
 
 @triton.jit
 def _rescale(acc, err, s):
-    """[acc, acc + err] re-expressed in units 2^s larger (s >= 0)."""
-    v, lost = _floor_shift(acc, -s)
-    sc = tl.minimum(tl.maximum(s, 0), 62)
-    mask = (tl.full(err.shape, 1, tl.int64) << sc) - 1
-    e = tl.where(s >= 63, (err > 0).to(tl.int64), (err >> sc) + ((err & mask) != 0).to(tl.int64))
-    return v, e + lost.to(tl.int64)
+    """[acc, acc + err] re-expressed in units 2^s larger: (floor(acc / 2^s),
+    ceil(err / 2^s) + [acc lost bits]), for s >= 0 and err >= 0 (every caller shifts by a maximum
+    minus its own exponent). Clamping s at 63 is exact: for |acc| < 2^63 and 0 <= err < 2^63,
+    acc >> 63 is floor(acc / 2^s) and -((-err) >> 63) is ceil(err / 2^s) for every s >= 63, so
+    no s >= 63 case and no left-shift branch are needed (DESIGN D25)."""
+    sc = tl.minimum(s, 63).to(tl.int64)
+    v = acc >> sc
+    lost = (v << sc) != acc
+    return v, (-((-err) >> sc)) + lost.to(tl.int64)
 
 
 @triton.jit
@@ -446,7 +449,7 @@ def _pv_group(Wlo, Whi, lw, vis, g: tl.constexpr, PACK: tl.constexpr, BM: tl.con
 
 
 @triton.jit
-def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nmask, cc, VST, FN, DV: tl.constexpr, SW: tl.constexpr,
+def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, VBAD, nn, nmask, cc, VST, FN, DV: tl.constexpr, SW: tl.constexpr,
            SV: tl.constexpr, ANCH: tl.constexpr, PACK: tl.constexpr, BM: tl.constexpr):
     """One tile's P·V on tensor cores (DESIGN D9/D10, D24). Returns (TNR, TN, TNE) in the partial
     format: value N_c lies in [TN, TN + TNE] * 2^(TNR - FN).
@@ -478,9 +481,8 @@ def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nmask, cc, VST, FN, DV: tl.constexp
     # The int32 MMA sums below are exact: a digit-product sum is below BN * 127^2, at most SV of
     # them share a weight, and a pair S_u + (S_(u+1) << 7) stays below 2^31.
     tl.static_assert(BN * 16129 * SV * 129 < 2147483648)
-    vw = tl.load(VLOST + nn[:, None] * DV + cc[None, :], mask=nmask[:, None], other=0)
-    vl = vw & 1
-    vbad = tl.max((vw >> 1).to(tl.int32), axis=1) != 0                    # (N,) NaN/inf in this channel block
+    vl = tl.load(VLOST + nn[:, None] * DV + cc[None, :], mask=nmask[:, None], other=0)   # 0/1
+    vbad = tl.load(VBAD + nn, mask=nmask, other=0) != 0                   # (N,) key has a NaN/inf
     nlost = tl.sum(lw.to(tl.int32), axis=1).to(tl.int64)                   # (M,) lost weights
     if PACK == 1:
         # One slot per MMA. Weight digit j times V digit b has weight 7(j + b): products of equal
@@ -650,7 +652,7 @@ def _exp2_weight_f64(t, EXP2_MARGIN: tl.constexpr):
 def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
                    PR, PZ, PZE, PNR, PN, PNE, FLAG,
                    SPLIT_LEN, FZ, FN,
-                   KX, KLSB, KL1S, KLOST, NKEYS, VX, VLSB, VLOST,
+                   KX, KLSB, KL1S, KLOST, NKEYS, VX, VLSB, VLOST, VBAD,
                    R_SEG, NK_SEG, NRB, FL_NCB,
                    D: tl.constexpr, DV: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                    BLOCK_DV: tl.constexpr, FS: tl.constexpr, EXP2_MARGIN: tl.constexpr,
@@ -678,6 +680,7 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
     VX += kb0 * DV
     VLSB += kb0
     VLOST += kb0 * DV
+    VBAD += kb0
     KST = (kb0 * 0 + NKEYS) * D                                            # digit-plane strides
     VST = (kb0 * 0 + NKEYS) * DV
     kvl = tl.load(KVLEN + rows, mask=rmask, other=0)
@@ -740,7 +743,7 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
         TZ = tl.sum(tl.where(vis, zt, 0), axis=1)
         TZE = tl.sum((zl & vis).to(tl.int64), axis=1)
         if USE_TC_PV:
-            TNR, TN, TNE, vbad = _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, nn, nn < kmax, cc, VST, FN, DV,
+            TNR, TN, TNE, vbad = _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, VBAD, nn, nn < kmax, cc, VST, FN, DV,
                                         SW, SV, ANCH, PACK, BLOCK_M)
             flag = tl.maximum(flag, tl.max((vis & vbad[None, :]).to(tl.int32), axis=1))
         else:
@@ -795,7 +798,7 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
 def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                      PR, PZ, PZE, PNR, PN, PNE, FLAG,
                      SPLIT_LEN, FZ, FN,
-                     KX, KLSB, KL1S, KLOST, NKEYS, VX, VLSB, VLOST,
+                     KX, KLSB, KL1S, KLOST, NKEYS, VX, VLSB, VLOST, VBAD,
                      R_SEG, NK_SEG, NRB, FL_NCB, CNT, WL, NCCB,
                      D: tl.constexpr, DV: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                      BLOCK_DV: tl.constexpr, FS: tl.constexpr, EXP2_MARGIN: tl.constexpr,
@@ -814,7 +817,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
         for it in range(tl.program_id(0), cnt, tl.num_programs(0)):
             item = tl.load(WL + it)
             _split_program(item // NCCB, pid_s, item % NCCB, Q, K, V, KVLEN, ROWS, AM, AE, PR, PZ, PZE, PNR, PN, PNE,
-                           FLAG, SPLIT_LEN, FZ, FN, KX, KLSB, KL1S, KLOST, NKEYS, VX, VLSB, VLOST, R_SEG, NK_SEG, NRB,
+                           FLAG, SPLIT_LEN, FZ, FN, KX, KLSB, KL1S, KLOST, NKEYS, VX, VLSB, VLOST, VBAD, R_SEG, NK_SEG, NRB,
                            FL_NCB, D, DV, BLOCK_M, BLOCK_N, BLOCK_DV, FS, EXP2_MARGIN, USE_TC, SQ, SK, TC_FALLBACK,
                            USE_TC_PV, SW, SV, ANCH, RERUN, PACK, EXP2T, EXP2_INT, WDC, FL_DIV)
     else:
@@ -823,7 +826,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
             if (tl.program_id(0) == 0) & (pid_s == 0) & (tl.program_id(2) == 0):
                 tl.store(CNT, 0)
         _split_program(tl.program_id(0), pid_s, tl.program_id(2), Q, K, V, KVLEN, ROWS, AM, AE, PR, PZ, PZE, PNR, PN,
-                       PNE, FLAG, SPLIT_LEN, FZ, FN, KX, KLSB, KL1S, KLOST, NKEYS, VX, VLSB, VLOST, R_SEG, NK_SEG, NRB,
+                       PNE, FLAG, SPLIT_LEN, FZ, FN, KX, KLSB, KL1S, KLOST, NKEYS, VX, VLSB, VLOST, VBAD, R_SEG, NK_SEG, NRB,
                        FL_NCB, D, DV, BLOCK_M, BLOCK_N, BLOCK_DV, FS, EXP2_MARGIN, USE_TC, SQ, SK, TC_FALLBACK,
                        USE_TC_PV, SW, SV, ANCH, RERUN, PACK, EXP2T, EXP2_INT, WDC, FL_DIV)
 
@@ -1012,17 +1015,19 @@ def tc_v_slices_device(v: torch.Tensor, S: int) -> list:
     """tc_v_slices for V rows already on the device."""
     bad = _bad_dev(v)
     X, lsb, _, lost = _slice_rows_chunked(torch.where(bad, torch.zeros_like(v), v), S)
-    return [X, lsb, (lost.to(torch.int8) | (bad.to(torch.int8) << 1)).contiguous()]
+    return [X, lsb, lost.to(torch.int8).contiguous(), bad.any(dim=1).to(torch.int8).contiguous()]
 
 
 def tc_v_slices(v_bits: np.ndarray, S: int, dev) -> list:
     """int8 slices of V rows for tensor-core P·V: [X (S, n, dv) int8, lsb (n,) int64,
-    lost | NaN/inf << 1 (n, dv) int8]. Done once when the KV cache is written."""
+    lost (n, dv) int8 0/1, key has a NaN/inf (n,) int8]. Done once when the KV cache is written.
+    The lost plane is an MMA operand as stored; NaN/inf is per key, since flags are per row
+    (DESIGN D25)."""
     bad = _bad_np(v_bits)
     X, lsb, _, lost = slice_rows(np.where(bad, 0, v_bits).astype(np.uint16), S)
-    w = lost.astype(np.int8) | (bad.astype(np.int8) << 1)
     return [torch.from_numpy(np.ascontiguousarray(X)).to(dev), torch.from_numpy(lsb.astype(np.int64)).to(dev),
-            torch.from_numpy(np.ascontiguousarray(w)).to(dev)]
+            torch.from_numpy(np.ascontiguousarray(lost.astype(np.int8))).to(dev),
+            torch.from_numpy(np.ascontiguousarray(bad.any(axis=1).astype(np.int8))).to(dev)]
 
 
 _EXP2_TABLES: dict = {}
@@ -1138,7 +1143,7 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     if use_tc_pv:
         vtc, sv = list(v_tc), v_tc[0].shape[0]
     else:
-        vtc, sv, sw = [dz[torch.int8], dz[torch.int64], dz[torch.int8]], 1, 1
+        vtc, sv, sw = [dz[torch.int8], dz[torch.int64], dz[torch.int8], dz[torch.int8]], 1, 1
     anch = 7 * sw + 7 * sv + int(np.ceil(np.log2(block_n)))
     if use_tc_pv:
         # The digit pairs of a tile combine to sum_keys Wf * Vfix with Wf < 2^(7 sw) and
@@ -1233,7 +1238,7 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
         # each program strides over the work list (DESIGN D23). A grid over every row block would
         # be mostly empty programs, and at large batch their launch cost would exceed the work.
         progs = max(1, min(R * nccb, -(-2 * _sm_count(dev) // nsplit)))
-        split(True, block_n_t2, False, [dz[torch.int8], dz[torch.int64], dz[torch.int8]], 1, 1, 0,
+        split(True, block_n_t2, False, [dz[torch.int8], dz[torch.int64], dz[torch.int8], dz[torch.int8]], 1, 1, 0,
               block_m_t2, cbdv, 8, progs, {"num_stages": 2})
         combine(NEED, True, False)
     _LAST_DEBUG.update(block_m=block_m, block_m_t2=block_m_t2, pack=pack, split_flags=FL, combine_flags=OF, tier2_need=NEED, tier2_cnt=CNT, tier2_wl=WL, PR=PR_, PZ=PZ_, PZE=PZE_, PNR=PNR_, PN=PN_, PNE=PNE_,

@@ -56,8 +56,9 @@ PAGE = 16
 # the old float64 one. block_n is the key tile: tensor-core P·V takes 64 (DESIGN D18), 32 is the
 # old one. sq is q's digit count: 4 (D18), 3 the old one. regs 128 caps the split kernel's
 # registers (with pipelining depth 1, so two 8-warp programs fit an SM; DESIGN D21); None is
-# Triton's choice (255). The last configs are A/Bs, and cross-checks that none of these choices
-# can change bits.
+# Triton's choice (255); "s1" is pipelining depth 1 at 255 registers (half the shared memory, so
+# more L1 for spills) and "h" half the KV splits (longer programs), both diagnostics (DESIGN D25).
+# The last configs are A/Bs, and cross-checks that none of these choices can change bits.
 CONFIGS = {"int64": [(32, 4, None, "int", 16, 4, None), (32, 4, None, "f64", 16, 4, None)],
            "tc": [(32, 4, None, "int", 16, 4, None), (64, 8, None, "int", 16, 4, None),
                   (64, 8, None, "int", 16, 3, None), (32, 4, 16, "int", 16, 4, None),
@@ -65,7 +66,8 @@ CONFIGS = {"int64": [(32, 4, None, "int", 16, 4, None), (32, 4, None, "f64", 16,
            "tcpv": [(64, 8, None, "int", 64, 4, None), (128, 8, None, "int", 64, 4, None),
                     (64, 8, None, "int", 64, 4, 128), (128, 8, None, "int", 64, 4, 128),
                     (128, 8, None, "int", 64, 3, None), (128, 8, None, "int", 32, 4, None),
-                    (32, 4, 16, "int", 32, 4, None)]}
+                    (32, 4, 16, "int", 32, 4, None), (128, 8, None, "int", 64, 4, "s1"),
+                    (128, 8, None, "int", 64, 4, "h")]}
 
 
 def time_step(fn, iters: int, warmup: int = 3):
@@ -211,9 +213,13 @@ class Case:
         ncb = D // block_dv
         progs = G * -(-r_seg // bm) * ncb
         splits = int(max(1, min(n // 256, -(-4 * sms // progs))))
+        if regs == "h":
+            splits = max(1, splits // 2)
         kw = dict(splits=splits, block_m=block_m, block_n=block_n, block_dv=block_dv,
                   num_warps=num_warps, exp2=exp2)
-        if regs:
+        if regs == "s1":
+            kw.update(num_stages=1)
+        elif isinstance(regs, int):
             kw.update(maxnreg=regs, num_stages=1)
         if mode != "int64":
             if getattr(self, "_k_tc", None) is None:
@@ -292,7 +298,7 @@ def main():
                 for m in modes:
                     best, first, note_u = None, None, ""
                     for bdv, nw, bm, x2, bn, sq, rg in CONFIGS[m]:
-                        rt = f"/r{rg}" if rg else ""
+                        rt = f"/{rg}" if isinstance(rg, str) else f"/r{rg}" if rg else ""
                         try:
                             fn, u, bad, out, flg, (nr, ns, bmr) = case.exact(m, sms, bdv, nw, bm, x2, bn, sq, rg)
                             ms, gmode = time_step(fn, args.iters)
@@ -329,7 +335,7 @@ def main():
     lines.insert(4, "Exact cells: `ms mode [block_dv/num_warps/mBLOCK_M/exp2/nBLOCK_N/qSQ rREGS spillBYTES]` for the fastest tile config.")
     lines.insert(5, "")
     if all_cfg:
-        lines += ["", "All exact configs (the A/Bs: m16 = padded rows, f64 = float64 exp2, n32 = 32-key tiles, q3 = 3 q digits, r128 = 128-register cap):", ""]
+        lines += ["", "All exact configs (the A/Bs: m16 = padded rows, f64 = float64 exp2, n32 = 32-key tiles, q3 = 3 q digits, r128 = 128-register cap, s1 = pipelining depth 1, h = half the KV splits):", ""]
         lines += [f"- {c}" for c in all_cfg]
     if errors:
         lines += ["", "Backend errors (first per backend and error type):", ""]

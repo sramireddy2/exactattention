@@ -47,7 +47,7 @@ CONFIGS = {
 }
 PTR = {"Q": "*i16", "K": "*i16", "V": "*i16", "KVLEN": "*i32", "PR": "*i64", "PZ": "*i64", "PZE": "*i64",
        "PNR": "*i64", "PN": "*i64", "PNE": "*i64", "FLAG": "*i32", "KX": "*i8", "KLSB": "*i64",
-       "KL1S": "*fp64", "KLOST": "*i32", "VX": "*i8", "VLSB": "*i64", "VLOST": "*i8", "CNT": "*i32",
+       "KL1S": "*fp64", "KLOST": "*i32", "VX": "*i8", "VLSB": "*i64", "VLOST": "*i8", "VBAD": "*i8", "CNT": "*i32",
        "WL": "*i32", "EXP2T": "*i64"}
 
 

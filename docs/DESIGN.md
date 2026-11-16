@@ -975,6 +975,12 @@ comment per level, and work-list loops are skipped when it looks for the key loo
 `test_fused_need_equals_torch_formula` checks that the list holds each NEED pair exactly once.
 Under the interpreter the SM count is 2, so the tier-2 tests run several items per program.
 
+Run 1121-flash (a6369f8; all bits checked, 0 uncertified rows, fixture SHA-256 match). The
+tier-2 split launch fell from 0.139 to 0.051 ms at verify B=1 16K and from 0.189 to 0.062 ms at
+verify B=8 4K. Decode B=32 16K fell from 6.26 to 4.54 ms; no profile case covers it, but tier 2
+is the only kernel change between the runs, and its old grid there was 3,072 mostly empty
+programs. Results by shape are in D25's table.
+
 ## D24. Tier-1 P·V: a dropped-channel fix, a top-digit weight-loss bound, equal-weight MMA sums
 
 After D22 and D23, the tier-1 split kernel is almost the whole step. Offline sm_120 SASS put
@@ -1039,6 +1045,70 @@ warp-instructions per 32 keys, then spill ops per 32 keys (64-key tiles):
 left: `_tc_logits` (554 decode, 1296 verify), the merge of the tile partial into the running
 one (about 290 decode, 834 verify; at verify that is about 100 instructions per element for two
 general int64 rescales), and `_exp2_weight` (221, 423).
+
+## D25. Runs 1121–1122: the split kernel is not bound by its instructions
+
+Runs 1121-flash (a6369f8, D23) and 1122-flash (3cacec5, D24) ran at the same time on one node
+(separate GPUs). Every stage passed: all bits were checked, 0 rows were uncertified, and the
+fixture SHA-256 matched. Best exact config, ms:
+
+| shape | 1120 | 1121 (D23) | 1122 (D24) | × FlashInfer (1122) |
+|---|---|---|---|---|
+| decode B=1 4K | 0.076 | 0.076 | 0.073 | 7.0× |
+| decode B=1 16K | 0.205 | 0.198 | 0.193 | 9.3× |
+| decode B=1 64K | 0.559 | 0.551 | 0.534 | 2.8× |
+| decode B=8 16K | 1.008 | 0.967 | 0.950 | 2.6× |
+| decode B=32 16K | 6.261 | 4.535 | 4.301 | 3.1× |
+| verify T=8 B=1 4K | 0.297 | 0.303 | 0.303 | 24.1× |
+| verify T=8 B=1 16K | 0.765 | 0.691 | 0.686 | 31.4× |
+| verify T=8 B=8 4K | 0.998 | 0.888 | 0.859 | 24.7× |
+| verify T=8 B=8 16K | 3.092 | 2.595 | 2.591 | 7.1× |
+
+D24 cut the tier-1 key loop by 15–21% of its instructions, but the tier-1 split launch barely
+moved: 0.176 → 0.170 ms at decode B=1 16K, 0.995 → 0.945 at decode B=8 16K, 0.581 → 0.586 at
+verify B=1 16K and 0.778 → 0.763 at verify B=8 4K. Instruction count is not the limit. The
+slices are about 1053 bytes per key and KV head (K: 4 × 128 digits and 20 bytes of metadata; V:
+3 × 128 digits, the 128-byte lost plane and 9 bytes), against 512 for bf16 K and V:
+
+- **Decode, B ≥ 8.** The split kernel moves about 1.2 TB/s (B=8 16K) and 1.0 TB/s (B=32 16K).
+  FlashInfer reaches about 1.5 TB/s at B=32. B=8 16K is 4.08 waves of one program per SM, and
+  per tile its full waves run near 1.5 TB/s. These shapes are close to bound by bytes and wave
+  quantization, so the next levers there are bytes per key and the split count.
+- **Decode, B=1 16K.** 512 programs of 4 tiles each in 2.72 waves, about 0.8 TB/s. A program
+  costs about 57 µs, against 4 × 8.6 µs for tiles at B=8's rate, so per-program latency (load
+  the first tile, prologue, store) is a large share.
+- **Verify.** About 0.36 TB/s, and 30–45 µs per tile against about 3 µs to issue it. The
+  suspect is register spills: about 800 bytes per thread at 255 registers. With 84 KB of shared
+  memory for depth-2 pipelining, L1 has too little room to hold them, so they likely go to L2.
+
+The installed Nsight Compute (2024.3, CUDA 12.6 module) predates sm_120. So run 1123 tests the
+two hypotheses with benchmark A/Bs on tcpv 128/8: `s1` (pipelining depth 1 at 255 registers,
+about half the shared memory) and `h` (half the KV splits).
+
+**Two cheaper per-tile pieces, same bits.** They are kept, because they shorten the chains even
+if they do not show in time.
+
+- `_rescale` shifts right only (every caller passes a maximum minus its own exponent), so the
+  left-shift branch and the s ≥ 63 cases go. For |acc| < 2^63 and 0 ≤ err < 2^63, clamping s at
+  63 is exact: acc >> 63 is floor(acc / 2^s), and −((−err) >> 63) is ceil(err / 2^s), for every
+  s ≥ 63. The result equals the old one bit for bit, and `test_rescale_is_exact` checks it
+  against Python integers, including s = 0, s ≥ 63 and empty-partial shifts near 2^31. This
+  serves the tile merge and the combine kernel's merge. The merge went from about 290 to 112
+  instructions per decode tile, and from 834 to 232 per verify tile.
+- V's NaN/inf flag is one byte per key (`VBAD`), not a second bit of every lost-plane element.
+  The lost plane is then a 0/1 MMA operand as stored, with no `& 1`, and the per-tile reduction
+  over channels is gone. Flags are reported per row, and a row is flagged if any visible key
+  has a NaN/inf in any channel either way, so row flags do not change. A pair in a clean channel
+  block of such a row is now split-flagged too, so tier 2 no longer reruns it; its row stays
+  flagged.
+
+| key loop, sm_120 SASS per warp per tile | D24 (3cacec5) | D25 |
+|---|---|---|
+| decode m2 128/8 | 2522 | 2128 |
+| decode m2 64/8 | 1840 | 1618 |
+| decode m2 32/4 | 2807 | 2600 |
+| verify m16 128/8 | 4619 (408 spill ops / 32 keys) | 3832 (412) |
+| verify m16 32/4 | 5579 (124) | 5214 (202) |
 
 ## Open questions
 

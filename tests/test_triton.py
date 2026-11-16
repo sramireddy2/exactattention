@@ -20,7 +20,7 @@ triton = pytest.importorskip("triton")
 from exactattn import attention_row, default_alpha  # noqa: E402
 import triton.language as tl  # noqa: E402
 
-from exactattn.triton_kernels import _bitlen, _exp2_weight, _f32_bits, _ratio_round, attention_triton  # noqa: E402
+from exactattn.triton_kernels import _bitlen, _exp2_weight, _f32_bits, _ratio_round, _rescale, attention_triton  # noqa: E402
 from gen import KINDS, bf16  # noqa: E402
 
 
@@ -424,6 +424,40 @@ def test_kernel_integer_helpers_match_numpy():
         ref = (q24.astype(np.float64) * np.exp2(qes.astype(np.float64))).astype(np.float32)
     ref = np.where((qs & 1) != 0, -ref, ref)
     assert np.array_equal(Fb, ref.view(np.int32))
+
+
+@triton.jit
+def _rescale_probe(A, E, S, OV, OE, NB: tl.constexpr):
+    i = tl.arange(0, NB)
+    v, e = _rescale(tl.load(A + i), tl.load(E + i), tl.load(S + i))
+    tl.store(OV + i, v)
+    tl.store(OE + i, e)
+
+
+def test_rescale_is_exact():
+    """_rescale(acc, err, s) is (floor(acc / 2^s), ceil(err / 2^s) + [acc mod 2^s != 0]) for every
+    s >= 0, including s = 0, s >= 63 and s near 2^31 (an empty partial's NEG exponent), checked
+    with Python integers (DESIGN D25)."""
+    import torch
+
+    rng = np.random.default_rng(25)
+    NB = 2048
+    la, le = rng.integers(0, 63, NB), rng.integers(0, 63, NB)
+    acc = np.array([int(rng.integers(0, 1 << x)) if x else 0 for x in la], dtype=np.int64)
+    acc = np.where(rng.random(NB) < 0.5, -acc, acc)
+    err = np.array([int(rng.integers(0, 1 << x)) if x else 0 for x in le], dtype=np.int64)
+    s = rng.integers(0, 70, NB).astype(np.int64)
+    s[:64] = 0
+    s[64:128] = rng.integers(1 << 30, 1 << 31, 64)
+    dev = torch.device(DEVICE)
+    ov = torch.empty(NB, dtype=torch.int64, device=dev)
+    oe = torch.empty(NB, dtype=torch.int64, device=dev)
+    _rescale_probe[(1,)](*(torch.from_numpy(x).to(dev) for x in (acc, err, s)), ov, oe, NB=NB)
+    v, e = ov.cpu().numpy(), oe.cpu().numpy()
+    for i in range(NB):
+        A, Er, Sh = int(acc[i]), int(err[i]), int(s[i])
+        assert v[i] == A >> Sh, (A, Sh)
+        assert e[i] == -((-Er) >> Sh) + (A % (1 << Sh) != 0), (A, Er, Sh)
 
 
 @triton.jit
