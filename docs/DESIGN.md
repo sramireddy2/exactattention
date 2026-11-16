@@ -1294,6 +1294,73 @@ recompute them. Tier 2 runs one row per program (`block_m_t2 = 1`), so the same 
 costs 1/16 of the m16 work per tile. The cost moves to tier 2's work list: a flagged row
 reruns every channel block over every KV split. Whether that is cheaper is an A/B question.
 
+## D28. Deferring the windowed score recompute to tier 2
+
+`launch(..., defer_scores=True)` builds tier 1 without the windowed score fallback. It applies
+only with tensor-core scores, tensor-core P·V and tier 2 on; otherwise the flag is ignored.
+
+**Tier 1.** A row with an uncertified tensor-core score on any visible key is *deferred*:
+- The split kernel marks it in a new buffer `DFL (nsplit, R)`. Channel block 0 writes it, like Z,
+  so every entry is written each step and nothing needs zeroing.
+- The row's split flag is cleared. Its partials came from uncertified scores, so its tier-1
+  flags mean nothing; tier 2 recomputes them. The float64-exp2 and large-score checks also skip
+  uncertified scores, so an approximate score cannot raise a hard flag that would send the row to
+  the host fallback.
+
+**Combine.** The tier-1 combine reads `DFL` across the splits. A pair goes on tier 2's work list
+when its rounding failed **or** its row was deferred, and no split hard-flagged it (as before).
+Every channel block of a deferred row sees the mark, so the whole row is rerun.
+
+**Tier 2.** Unchanged apart from two things:
+- It keeps the windowed fallback (`TC_FALLBACK` is now per tier). At one row per program, a
+  windowed tile is 1/16 of tier 1's m16 work.
+- It rewrites the Z partials too, not only N, because a deferred row's tier-1 Z is not an
+  enclosure. All channel blocks of a row compute the same Z with the same tiling, so the
+  duplicate stores write the same bits.
+
+Tier 2 detects bad inputs (NaN/inf q, k, v), overflow and uncertified weights itself, and
+writes its flags with `atomic_max` into entries tier 1 left at 0. So the final flags cover every
+cause. A certified result is the same bits on either path (SPEC §5.3).
+
+**Two rerun scopes.** A deferred row is only wrong in the splits it was deferred in. In its
+other splits the scores were certified, and tier 1's partials are valid enclosures (and their
+flags stand).
+- `defer_scores="row"` (or True) reruns the whole row: every split, with int64 P·V.
+- `defer_scores="split"` reruns only the deferred splits. The tier-1 combine writes NEED = 2 for
+  a deferred row (1 for a rounding failure, as before). A tier-2 program skips a NEED-2 item in
+  any split where `DFL` is 0. The final combine then merges tier 2's partials for the deferred
+  splits with tier 1's tensor-core P·V partials for the rest.
+
+So the row scope does work ∝ deferred rows × all keys, and the split scope ∝ deferred
+(row, split) pairs × one split's keys. The split scope can leave a row flagged that the row
+scope would certify: its final rounding still uses tier 1's wider tensor-core P·V enclosures
+in the splits it kept. Such a row stays flagged and correct, never wrong.
+
+**Checks.**
+- Test: real Qwen3 rows, run twice. At 2 q digits every row is deferred. At 3 digits with one
+  q element of every other row scaled by 2^12, exactly those rows are deferred. In both cases
+  and both scopes, at block_m 16 and 2, the outputs and flags equal the non-deferred launch's
+  and certified rows equal the reference. Every row certifies.
+- Compile check (sm_120): without the windowed code, tier 1 at m2 128/8 needs 190 registers and
+  spills nothing, against 255 registers and 36 B of spill. At m16 128/8 it spills 452 B, against
+  816 B.
+
+**Run 1126** adds four A/Bs at 128/8 unless noted:
+- `d`: row scope;
+- `ds`: split scope;
+- `dsx2`: split scope at twice the KV splits;
+- `ds` at 64/8.
+
+The benchmark logs tier 2's work-item count for every tcpv config. `profile_step` times each
+tcpv case in split scope too: per-kernel times, and the tier-1 timers, where the windowed
+column then counts deferred tiles.
+
+Expected: verify B=1 16K tier 1 split from 0.56 ms toward 0.30 ms, plus tier 2's extra work.
+Each deferred row adds 4 work items (128 channels / 32). Verify B=1 has 128 rows (8 KV heads ×
+8 drafts × 2 query heads), so at most 512 items. The row scope runs each one over every KV
+split, which may cost more than it saves. The split scope runs each one only over its deferred
+splits: at most 22 tiles × 16 rows × 4 channel blocks, one split each.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model

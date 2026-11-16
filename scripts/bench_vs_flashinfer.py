@@ -57,7 +57,9 @@ PAGE = 16
 # old one. sq is q's digit count: 4 (D18), 3 the old one. regs 128 caps the split kernel's
 # registers (with pipelining depth 1, so two 8-warp programs fit an SM; DESIGN D21); None is
 # Triton's choice (255); "s1" is pipelining depth 1 at 255 registers (half the shared memory, so
-# more L1 for spills), "h" half and "x2" twice the KV splits, all diagnostics (DESIGN D25, D26).
+# more L1 for spills), "h" half and "x2" twice the KV splits, all diagnostics (DESIGN D25, D26);
+# "d" defers the windowed score recompute to tier 2 (which reruns the whole row), "ds" defers it
+# with tier 2 rerunning only the deferred splits, and "dsx2" is "ds" at twice the splits (D28).
 # The last configs are A/Bs, and cross-checks that none of these choices can change bits.
 CONFIGS = {"int64": [(32, 4, None, "int", 16, 4, None), (32, 4, None, "f64", 16, 4, None)],
            "tc": [(32, 4, None, "int", 16, 4, None), (64, 8, None, "int", 16, 4, None),
@@ -67,7 +69,9 @@ CONFIGS = {"int64": [(32, 4, None, "int", 16, 4, None), (32, 4, None, "f64", 16,
                     (64, 8, None, "int", 64, 4, 128), (128, 8, None, "int", 64, 4, 128),
                     (128, 8, None, "int", 64, 3, None), (128, 8, None, "int", 32, 4, None),
                     (32, 4, 16, "int", 32, 4, None), (128, 8, None, "int", 64, 4, "s1"),
-                    (128, 8, None, "int", 64, 4, "h"), (128, 8, None, "int", 64, 4, "x2")]}
+                    (128, 8, None, "int", 64, 4, "h"), (128, 8, None, "int", 64, 4, "x2"),
+                    (128, 8, None, "int", 64, 4, "d"), (128, 8, None, "int", 64, 4, "ds"),
+                    (128, 8, None, "int", 64, 4, "dsx2"), (64, 8, None, "int", 64, 4, "ds")]}
 
 
 def time_step(fn, iters: int, warmup: int = 3):
@@ -198,6 +202,9 @@ class Case:
     def exact(self, mode: str, sms: int, block_dv: int = 32, num_warps: int = 4, block_m=None, exp2="int",
               block_n: int = 16, sq: int = 4, regs=None, timers: bool = False):
         B, n, T = self.B, self.n, self.T
+        defer = {"d": "row", "ds": "split", "dsx2": "split"}.get(regs, False)
+        if defer:
+            regs = "x2" if regs == "dsx2" else None
         grp = HQ // HKV
         G, r_seg = B * HKV, T * grp
         # Rows of segment (b, h): draft t, query head h*grp + j  ->  row t*grp + j.
@@ -218,7 +225,7 @@ class Case:
         elif regs == "x2":
             splits = min(max(1, n // 128), 2 * splits)
         kw = dict(splits=splits, block_m=block_m, block_n=block_n, block_dv=block_dv,
-                  num_warps=num_warps, exp2=exp2, timers=timers)
+                  num_warps=num_warps, exp2=exp2, timers=timers, defer_scores=defer)
         if regs == "s1":
             kw.update(num_stages=1)
         elif isinstance(regs, int):
@@ -237,9 +244,11 @@ class Case:
             return launch(Qt, Kt, Vt, KL, n, alpha, **kw)
 
         OUT, FL, OF = fn()
-        regs = (_LAST_DEBUG.get("n_regs"), _LAST_DEBUG.get("n_spills"), _LAST_DEBUG.get("block_m"))
         if DEV == "cuda":
             torch.cuda.synchronize()
+        # Tier 2's work items (row x 32-channel pairs), the cost deferral moves there (DESIGN D28).
+        t2 = int(_LAST_DEBUG["tier2_cnt"].cpu()[0]) if mode == "tcpv" else None
+        regs = (_LAST_DEBUG.get("n_regs"), _LAST_DEBUG.get("n_spills"), _LAST_DEBUG.get("block_m"), t2)
         flagged = (FL.amax(dim=(0, 2)) > 0) | (OF.amax(dim=1) > 0)
         unc = int(flagged.sum())
         # Correctness gate: certified rows are correctly rounded bf16, so they lie within half a
@@ -302,7 +311,7 @@ def main():
                     for bdv, nw, bm, x2, bn, sq, rg in CONFIGS[m]:
                         rt = f"/{rg}" if isinstance(rg, str) else f"/r{rg}" if rg else ""
                         try:
-                            fn, u, bad, out, flg, (nr, ns, bmr) = case.exact(m, sms, bdv, nw, bm, x2, bn, sq, rg)
+                            fn, u, bad, out, flg, (nr, ns, bmr, t2) = case.exact(m, sms, bdv, nw, bm, x2, bn, sq, rg)
                             ms, gmode = time_step(fn, args.iters)
                         except Exception as ex:  # noqa: BLE001
                             errors.append((f"exact-{m}", f"{type(ex).__name__}: {ex} (T={T} B={B} n={n} cfg={bdv}/{nw}/{bm}/{x2}/n{bn}/q{sq}{rt})"))
@@ -320,7 +329,8 @@ def main():
                         if best is None or ms < best[0]:
                             sp = f" r{nr}" + (f" spill{ns}" if ns else "") if nr is not None else ""
                             best = (ms, f"{ms:.3f} {gmode[0]} [{bdv}/{nw}/m{bmr}/{x2}/n{bn}/q{sq}{rt}{sp}]")
-                        all_cfg.append(f"T={T} B={B} n={n} {m} {bdv}/{nw}/m{bmr}/{x2}/n{bn}/q{sq}{rt}: {ms:.3f} ms, {u} uncertified")
+                        all_cfg.append(f"T={T} B={B} n={n} {m} {bdv}/{nw}/m{bmr}/{x2}/n{bn}/q{sq}{rt}: {ms:.3f} ms, {u} uncertified"
+                                       + (f", {t2} tier-2 pairs" if t2 is not None else ""))
                         del fn, out, flg
                     res[f"exact-{m}"] = best if best else (None, "n/a")
                     if note_u:
@@ -337,7 +347,7 @@ def main():
     lines.insert(4, "Exact cells: `ms mode [block_dv/num_warps/mBLOCK_M/exp2/nBLOCK_N/qSQ rREGS spillBYTES]` for the fastest tile config.")
     lines.insert(5, "")
     if all_cfg:
-        lines += ["", "All exact configs (the A/Bs: m16 = padded rows, f64 = float64 exp2, n32 = 32-key tiles, q3 = 3 q digits, r128 = 128-register cap, s1 = pipelining depth 1, h = half and x2 = twice the KV splits):", ""]
+        lines += ["", "All exact configs (the A/Bs: m16 = padded rows, f64 = float64 exp2, n32 = 32-key tiles, q3 = 3 q digits, r128 = 128-register cap, s1 = pipelining depth 1, h = half and x2 = twice the KV splits, d = windowed score recompute deferred to tier 2 (whole rows rerun), ds = deferred with only the deferred splits rerun, dsx2 = ds at twice the splits):", ""]
         lines += [f"- {c}" for c in all_cfg]
     if errors:
         lines += ["", "Backend errors (first per backend and error type):", ""]

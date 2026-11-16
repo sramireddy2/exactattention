@@ -134,7 +134,7 @@ def main():
     for T, B, n, mode, bdv, nw, bm, bn, sq in CASES:
         case = bench.Case(B, n, T)
         try:
-            fn, unc, bad, out0, _, regs = case.exact(mode, sms, bdv, nw, bm, "int", bn, sq, None)
+            fn, unc, bad, out0, flg0, regs = case.exact(mode, sms, bdv, nw, bm, "int", bn, sq, None)
             share = tier2_share()
             kt = kernel_times(fn, a.iters)
         except Exception as ex:  # noqa: BLE001
@@ -158,7 +158,27 @@ def main():
                 del fn_t
             except Exception as ex:  # noqa: BLE001
                 lines += [f"Timers build failed: {type(ex).__name__}: {ex}", ""]
-        print("\n".join(lines[-40:]), flush=True)
+            # The same step with the windowed score recompute deferred to tier 2 (DESIGN D28).
+            try:
+                fn_d, unc_d, bad_d, out_d, flg_d, regs_d = case.exact(mode, sms, bdv, nw, bm, "int", bn, sq, "ds")
+                share_d = tier2_share()
+                kd = kernel_times(fn_d, a.iters)
+                both = ~(flg0 | flg_d)
+                same = bool(torch.equal(out0.reshape(-1, bench.D)[both], out_d.reshape(-1, bench.D)[both]))
+                lines += [f"### Deferred scores, deferred splits rerun (DESIGN D28): {sum(v[0] for v in kd.values()):.3f} ms, {unc_d} "
+                          f"uncertified, {bad_d} wrong, regs {regs_d[0]} spill {regs_d[1]}, certified bits "
+                          f"{'equal' if same else 'DIFFERENT'} to the plain build", "", share_d, "",
+                          "| launch (order: kernel) | ms |", "|---|---|"]
+                for k, (ms, _) in sorted(kd.items(), key=lambda kv: int(kv[0].split(":")[0])):
+                    lines.append(f"| {k[:70]} | {ms:.3f} |")
+                lines.append("")
+                del fn_d
+                fn_dt, _, _, _, _, _ = case.exact(mode, sms, bdv, nw, bm, "int", bn, sq, "ds", timers=True)
+                lines += ["Deferred timers build (windowed = tiles deferred):", ""] + timer_report(fn_dt, sms)
+                del fn_dt
+            except Exception as ex:  # noqa: BLE001
+                lines += [f"Deferred build failed: {type(ex).__name__}: {ex}", ""]
+        print("\n".join(lines[-90:]), flush=True)
         del case, fn
         torch.cuda.empty_cache()
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)

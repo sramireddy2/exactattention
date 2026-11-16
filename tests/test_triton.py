@@ -175,6 +175,47 @@ def test_tensor_core_pv_on_real_activations():
         r = int(rows[i])
         assert np.array_equal(got[i], attention_row(q[r], k[: r + 1], v[: r + 1, :32], alpha)), r
 
+@pytest.mark.parametrize("mode", ["row", "split"])
+@pytest.mark.parametrize("case", ["all", "mixed"])
+@pytest.mark.parametrize("block_m", [16, 2])
+def test_deferred_score_recompute_changes_no_bits(case, block_m, mode):
+    """DESIGN D28: tier 1 skips the windowed score recompute and tier 2 reruns those rows whole.
+    Outputs and flags must equal the non-deferred launch's and certified rows the reference.
+    Real Qwen3 rows: at 2 q digits every row has an uncertified score ("all"); at 3 digits none
+    does, so "mixed" scales one q element of every other row by 2^12, which costs those rows
+    their low bits. The rows deferred must be exactly those. "row" reruns a deferred row over
+    every split, "split" only over the splits it was deferred in."""
+    import os
+
+    from exactattn.triton_kernels import _LAST_DEBUG
+
+    z = np.load(os.path.join(os.path.dirname(__file__), "..", "fixtures", "qwen3_0.6b_heads.npz"))
+    q, k, v, alpha = z["q_27_11"], z["k_27_11"], z["v_27_11"][:, :32], np.float32(z["alpha_27_11"])
+    rows = np.arange(300, 316)
+    Q, kv_len = q[rows].copy(), rows + 1
+    K, V = k[: int(kv_len.max())], v[: int(kv_len.max())]
+    if case == "all":
+        sq, expect = 2, np.ones(len(rows), bool)
+    else:
+        sq, expect = 3, np.arange(len(rows)) % 2 == 0
+        e = (Q[::2, 0] >> 7) & 0xFF
+        assert ((e > 0) & (e + 12 < 255)).all()
+        Q[::2, 0] += np.uint16(12 << 7)
+    kw = dict(splits=2, block_m=block_m, block_n=32, block_dv=32, device=DEVICE, fallback=False, use_tc=True,
+              use_tc_pv=True, sq=sq)
+    ref_out, ref_flags = attention_triton(Q, K, V, alpha, kv_len, **kw)
+    got, flags = attention_triton(Q, K, V, alpha, kv_len, defer_scores=mode, **kw)
+    deferred = _LAST_DEBUG["defer_flags"].amax(dim=0).cpu().numpy() > 0
+    assert np.array_equal(deferred, expect), deferred
+    assert np.array_equal(flags, ref_flags)
+    ok = flags == 0
+    assert np.array_equal(got[ok], ref_out[ok])   # flagged rows' outputs are not defined
+    assert (flags == 0).sum() >= len(flags) // 2, flags
+    for i in np.flatnonzero(flags == 0):
+        L = int(kv_len[i])
+        assert np.array_equal(got[i], attention_row(Q[i], K[:L], V[:L], alpha)), i
+
+
 @pytest.mark.parametrize("block_m", [16, 4, 2])
 def test_pv_fully_lost_v_channel_is_not_dropped(block_m):
     """A V element far below its row's largest one loses every bit in block fixed point: all its
