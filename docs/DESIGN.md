@@ -1110,6 +1110,36 @@ if they do not show in time.
 | verify m16 128/8 | 4619 (408 spill ops / 32 keys) | 3832 (412) |
 | verify m16 32/4 | 5579 (124) | 5214 (202) |
 
+Run 1123-flash (bf0b59e; all bits checked, 0 uncertified rows, fixture SHA-256 match), same
+node as 1121–1122. tcpv 128/8 in ms: base, then the `s1` and `h` A/Bs:
+
+| shape | 1122 base | 1123 base | s1 (depth 1) | h (half splits) |
+|---|---|---|---|---|
+| decode B=1 16K | 0.193 | 0.179 | 0.179 | 0.187 |
+| decode B=1 64K | 0.534 | 0.512 | 0.561 | 0.488 |
+| decode B=8 16K | 0.950 | 0.919 | 1.061 | 1.089 |
+| decode B=32 16K | 4.301 | 4.199 | 4.926 | 5.969 |
+| verify T=8 B=1 16K | 0.686 | 0.660 | 0.628 | 0.645 |
+| verify T=8 B=8 4K | 0.859 | 0.818 | 0.821 | 0.889 |
+| verify T=8 B=8 16K | 2.591 | 2.352 | 2.498 | 2.610 |
+
+The tier-1 split launch: 0.170 → 0.156 ms at decode B=1 16K, 0.945 → 0.909 at decode B=8 16K,
+0.586 → 0.565 at verify B=1 16K and 0.763 → 0.716 at verify B=8 4K. So D25 gives 4–9%, more
+than D24's 15–21% instruction cut did. That fits shorter dependency chains (the merge's
+selects) mattering more than issue slots.
+
+- **Spills are not verify's main cost.** Depth 1 frees about 40 KB for L1. It helps verify at
+  B=1 by 5%, and costs time at B=8 16K and at large-batch decode, where the lost overlap of
+  loads matters more. It does not close a 10× gap.
+- **Per-program overhead is not the main cost either.** Half the splits is slower nearly
+  everywhere: 42% at decode B=32 16K, which drops to 1.36 waves. It is faster only at B=1 64K,
+  where each split is long anyway. More, shorter programs balance the last wave better, so a
+  split count chosen for whole waves (and an `x2` A/B) is a candidate.
+
+What is left is latency inside a tile with 8 warps per SM: long int64 chains and block-level
+reductions. Without an sm_120 profiler, the next measurement is in-kernel timers (clock64 at
+the tile's phase boundaries, written to a debug buffer).
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
