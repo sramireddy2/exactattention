@@ -692,6 +692,9 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
         T3 = T1
         T4 = T1
         NT = T1
+        WF = T1                     # tiles that took the windowed score fallback (DESIGN D27)
+        EF = T1                     # tiles that took the float64 exp2 fallback
+        MX = T1                     # longest tile, cycles from the previous tile's end
     seg = pid_m // NRB
     lrows = (pid_m % NRB) * BLOCK_M + tl.arange(0, BLOCK_M)
     rmask = lrows < R_SEG
@@ -736,6 +739,7 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
             cA = _clk(kmax + tl.max(qlsb, axis=0).to(tl.int32))
         else:
             cA = _clk(kmax)
+        tP = cA
     for n0 in range(k0, k1, BLOCK_N):
         if TIMERS:
             tA = _clk(n0)
@@ -753,11 +757,15 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
                 t_w, unc_w = _windowed_logits(Q, rows * D, rmask, K, nn, nn < kmax, AM, AE, D, WDC, FS)
                 t = tl.where(unc, t_w, t)
                 unc = unc & unc_w
+                if TIMERS:
+                    WF += 1
         else:
             kb = tl.load(K + nn[:, None] * D + dd[None, :], mask=(nn < kmax)[:, None], other=0).to(tl.int32)
             kbad = tl.max((((kb >> 7) & 0xFF) == 0xFF).to(tl.int32), axis=1)  # (N,) NaN/inf key
             flag = tl.maximum(flag, tl.max((vis & (kbad != 0)[None, :]).to(tl.int32), axis=1))
             t, unc = _windowed_logits(Q, rows * D, rmask, K, nn, nn < kmax, AM, AE, D, WDC, FS)
+            if TIMERS:
+                WF += 1
         if TIMERS:
             tB = _clk(tl.max(tl.max(t.to(tl.int32, bitcast=True), axis=1), axis=0))
         # ---- weights ----
@@ -769,6 +777,8 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
                 Mw = tl.where(risky, Mw2, Mw)
                 Ew = tl.where(risky, Ew2, Ew)
                 risky = risky & risky2
+                if TIMERS:
+                    EF += 1
         else:
             Mw, Ew, risky = _exp2_weight_f64(t, EXP2_MARGIN)
         unc = unc | risky | (tl.abs(t) >= 1073741824.0)
@@ -822,6 +832,8 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
             T3 += tD - tC
             T4 += tE - tD
             NT += 1
+            MX = tl.maximum(MX, tE - tP)
+            tP = tE
     if TIMERS:
         cB = _clk(tl.max(tl.max(PNEr, axis=1), axis=0).to(tl.int32) + tl.max(flag, axis=0))
     off = pid_s * ROWS + rows
@@ -844,11 +856,12 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
         tl.store(fo, flag, mask=wmask)
     if TIMERS:
         # Row per program: prologue, scores, weights, tile partial, merge (summed over tiles),
-        # tiles, key loop, whole program (cycles), start and end (ns), SM.
+        # tiles, key loop, whole program (cycles), start and end (ns), SM, then (DESIGN D27)
+        # windowed-fallback tiles, float64-exp2 tiles, longest tile (cycles), pid_m, pid_s.
         cZ = _clk(tl.max(flag, axis=0))
         g1 = _gtime(tl.max(flag, axis=0))
         sm = _smid(tl.max(flag, axis=0))
-        tb = TM + ((pid_m * tl.num_programs(1) + pid_s) * tl.num_programs(2) + pid_c).to(tl.int64) * 12
+        tb = TM + ((pid_m * tl.num_programs(1) + pid_s) * tl.num_programs(2) + pid_c).to(tl.int64) * 16
         tl.store(tb + 0, cA - c0)
         tl.store(tb + 1, T1)
         tl.store(tb + 2, T2)
@@ -860,6 +873,11 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
         tl.store(tb + 8, g0)
         tl.store(tb + 9, g1)
         tl.store(tb + 10, sm.to(tl.int64))
+        tl.store(tb + 11, WF)
+        tl.store(tb + 12, EF)
+        tl.store(tb + 13, MX)
+        tl.store(tb + 14, (pid_m + 0 * WF).to(tl.int64))
+        tl.store(tb + 15, (pid_s + 0 * WF).to(tl.int64))
 
 
 @triton.jit
@@ -1249,8 +1267,8 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     CNT = torch.empty(1, dtype=torch.int32, device=dev) if tier2 else z32
     WL = torch.empty(R * nccb, dtype=torch.int32, device=dev) if tier2 else z32
 
-    # Diagnostic phase clocks of the tier-1 split kernel (DESIGN D26): 12 int64 per program.
-    TMB = (torch.zeros((G * triton.cdiv(r_seg, block_m) * nsplit * (dv // block_dv), 12), dtype=torch.int64,
+    # Diagnostic phase clocks of the tier-1 split kernel (DESIGN D26): 16 int64 per program.
+    TMB = (torch.zeros((G * triton.cdiv(r_seg, block_m) * nsplit * (dv // block_dv), 16), dtype=torch.int64,
                        device=dev) if timers else None)
 
     def split(rerun, bn, pv, v_args, sw_, sv_, anch_, bm, bdv, nw, grid0, stg):

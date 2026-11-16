@@ -1233,6 +1233,33 @@ The next measurement is per-program counters in the timers build for the two fal
 that took the windowed score fallback, and tiles that took the float64 exp2 fallback. With a
 dump of the slowest programs, it should show whether the fallbacks make the verify stragglers.
 
+## D27. Fallback counters and the slowest programs
+
+The timers build now writes 16 int64 per program. The four new columns, after the SM:
+- the number of tiles that took the windowed score fallback;
+- the number that took the float64 exp2 fallback;
+- the longest tile, in cycles from the previous tile's end (or from the loop's start), so load
+  waits count toward the tile that waited;
+- the program's `pid_m` and `pid_s`.
+
+Each counter is incremented inside its fallback's runtime branch, so it counts exactly the
+tiles that ran it. The default build is unchanged.
+
+For every tcpv case, `profile_step` reports:
+- the fallback tile counts and how many programs had any;
+- the mean program time with and without a fallback;
+- the longest tile overall, against the median program's longest;
+- the 8 slowest programs: their position, SM, start, tile counts, longest tile, and every phase
+  summed over their tiles.
+
+The decision this serves:
+- **If the slow programs are the ones with fallbacks:** tier 1 can stop running fallbacks. It
+  would flag those rows and let tier 2 rerun them exactly, which keeps tier 1 uniform and does
+  not change the bits.
+- **If they are not:** the cause is placement or memory, such as an SM shared with another
+  launch, or a split whose keys straddle a slow region. The start times and SMs will show
+  which.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model

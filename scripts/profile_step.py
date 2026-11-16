@@ -58,7 +58,7 @@ def timer_report(fn, sms):
         fn()
     torch.cuda.synchronize()
     TM = _LAST_DEBUG["timers"].cpu().numpy().astype(np.float64)
-    pro, s1, s2, s3, s4, nt, loop, tot, g0, g1, sm = (TM[:, i] for i in range(11))
+    pro, s1, s2, s3, s4, nt, loop, tot, g0, g1, sm, wf, ef, mx, pm, ps = (TM[:, i] for i in range(16))
     dur = g1 - g0                                             # ns per program
     ghz = tot.sum() / dur.sum()
     span = g1.max() - g0.min()
@@ -85,6 +85,31 @@ def timer_report(fn, sms):
     epi = tot - pro - loop
     lines.append(f"| epilogue (per program) | {epi.mean():.0f} | {epi.mean() / ghz / 1e3:.2f} | "
                  f"{100 * epi.sum() / tot.sum():.1f}% |")
+    # Fallbacks and stragglers (DESIGN D27).
+    us = dur / 1e3
+    anyf = (wf + ef) > 0
+
+    def mean(x):
+        return f"{x.mean():.1f}" if len(x) else "n/a"
+
+    lines += ["", f"Fallbacks: windowed scores in {int(wf.sum())} of {int(tiles)} tiles "
+              f"({int((wf > 0).sum())} programs), float64 exp2 in {int(ef.sum())} tiles "
+              f"({int((ef > 0).sum())} programs). Program us mean: {mean(us[anyf])} with a fallback "
+              f"({int(anyf.sum())}), {mean(us[~anyf])} without ({int((~anyf).sum())}). "
+              f"Longest tile: {mx.max() / ghz / 1e3:.1f} us (median program's longest "
+              f"{np.median(mx) / ghz / 1e3:.1f}).", "",
+              "Slowest programs (us; phases summed over the program's tiles):", "",
+              "| pid_m | pid_s | SM | start | program | tiles | windowed | f64 exp2 | longest tile | "
+              "prologue | scores | weights | partial | merge | rest |", "|" + "---|" * 15]
+
+    def u(c):
+        return f"{c / ghz / 1e3:.1f}"
+
+    for i in np.argsort(-dur)[:8]:
+        rest = loop[i] - s1[i] - s2[i] - s3[i] - s4[i]
+        lines.append(f"| {int(pm[i])} | {int(ps[i])} | {int(sm[i])} | {(g0[i] - g0.min()) / 1e3:.1f} | "
+                     f"{us[i]:.1f} | {int(nt[i])} | {int(wf[i])} | {int(ef[i])} | {u(mx[i])} | {u(pro[i])} | "
+                     f"{u(s1[i])} | {u(s2[i])} | {u(s3[i])} | {u(s4[i])} | {u(rest)} |")
     return lines + [""]
 
 
@@ -133,7 +158,7 @@ def main():
                 del fn_t
             except Exception as ex:  # noqa: BLE001
                 lines += [f"Timers build failed: {type(ex).__name__}: {ex}", ""]
-        print("\n".join(lines[-24:]), flush=True)
+        print("\n".join(lines[-40:]), flush=True)
         del case, fn
         torch.cuda.empty_cache()
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
