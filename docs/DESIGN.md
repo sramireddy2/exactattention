@@ -1169,6 +1169,70 @@ the output bits are equal, then reports:
 The benchmark also gains an `x2` A/B, twice the KV splits (at least 128 keys each), for the
 wave-quantization question in D25.
 
+**Run 1124-flash** (13ec240; all bits checked, 0 uncertified rows, fixture SHA-256 match). In
+all 6 profiled tcpv cases the timers build gave the same output bits as the plain build, and
+its launch span was 2–3% longer than the plain split launch. The clock ran at 2.27–2.32 GHz on
+188 SMs. tcpv 128/8, n64, q4; µs per 64-key tile (cycles converted at the measured clock):
+
+| | decode B=1 16K | decode B=8 16K | verify B=1 16K | verify B=8 4K |
+|---|---|---|---|---|
+| scores | 0.39 | 0.37 | 0.64 | 0.63 |
+| weights | 0.63 | 0.60 | 1.66 | 1.63 |
+| tile partial (Z, `_tc_pv`) | 2.67 | 2.88 | 4.79 | 4.76 |
+| merge | 0.48 | 0.46 | 1.53 | 1.52 |
+| rest of the loop | 6.18 | 5.12 | 15.14 | 13.57 |
+| **tile total** | **10.3** | **9.4** | **23.7** | **22.1** |
+| prologue per program | 4.0 | 4.0 | 13.4 | 13.3 |
+| programs, tiles each | 512, 4.0 | 768, 21.3 | 512, 4.0 | 704, 5.8 |
+| program mean (min–max) | 45.8 (38.7–81.7) | 206 (116–273) | 110 (95–461) | 143 (94–519) |
+| SMs busy over the span | 79% | 90% | 53% | 73% |
+
+- **One program per SM, always.** At 255 registers × 256 threads a program fills the register
+  file, so each SM has 8 warps to hide latency with.
+- **Over half of every tile is outside the four phases.** "Rest" runs from the end of one
+  tile's merge to the start of the next tile's scores. That is where the pipeliner waits for
+  the next tile's copies and issues the ones after. The `_tc_pv` partial is the largest timed
+  phase (17–30%).
+- **Decode is close to its bytes.** A tile is 64 × 1053 bytes = 67 KB. One SM's share of
+  1.79 TB/s moves that in about 7.1 µs, and decode B=8 takes 9.4 µs per tile with the SMs 90%
+  busy. Bytes per key stay the decode lever (D25).
+- **Verify waits about twice as long as its bytes need.** Its tiles move the same 67 KB but
+  take 22–24 µs. That is 8.5 µs of timed phases and 13.6–15.1 µs of rest, against about
+  7.1 µs for the bytes. So verify's rest is not bandwidth alone.
+- **Verify's prologue** (Q decode and digit slicing for 16 rows) is 13.3 µs per program, 9–12%
+  of program time. Every KV split of a row block repeats it for the same rows.
+- **Verify has stragglers.** At B=1 16K the mean program takes 110 µs but the slowest takes
+  461 µs. The SMs are busy 53% of the span: about 299 µs of work per SM in a 569 µs launch.
+  Balanced, 2.72 waves of mean programs would take about 330 µs. The candidates are data
+  dependent: the windowed score fallback and the float64 exp2 fallback. The aggregates cannot
+  tell which. The q3 build, with more uncertified scores, puts 90% of its time in rest and has
+  programs from 91 to 836 µs. So a fallback's cost may land outside the clock meant to bound
+  it.
+
+The `x2` A/B (tcpv 128/8, ms):
+
+| shape | base | x2 |
+|---|---|---|
+| decode B=1 4K | 0.068 | 0.078 |
+| decode B=1 16K | 0.177 | 0.213 |
+| decode B=1 64K | 0.510 | 0.566 |
+| decode B=8 16K | 0.909 | 0.911 |
+| decode B=32 4K | 1.136 | 1.032 |
+| decode B=32 16K | 4.197 | 3.668 |
+| verify T=8 B=1 16K | 0.658 | 0.686 |
+| verify T=8 B=8 4K | 0.820 | 0.916 |
+| verify T=8 B=8 16K | 2.355 | 2.236 |
+
+Twice the splits helps at large batch: decode B=32 16K is 13% faster, now 2.6× FlashInfer. It
+also helps verify B=8 16K, which is 5% faster (6.2×). It hurts at B=1, where programs are
+already short. Best per shape in run 1124:
+- decode: B=1 16K 0.177 ms (8.5×), B=8 16K 0.909 (2.5×), B=32 16K 3.668 (2.6×);
+- verify: B=1 16K 0.617 with `s1` (27.9×), B=8 4K 0.820 (22.3×).
+
+The next measurement is per-program counters in the timers build for the two fallbacks: tiles
+that took the windowed score fallback, and tiles that took the float64 exp2 fallback. With a
+dump of the slowest programs, it should show whether the fallbacks make the verify stragglers.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
