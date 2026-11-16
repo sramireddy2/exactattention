@@ -1361,6 +1361,43 @@ Each deferred row adds 4 work items (128 channels / 32). Verify B=1 has 128 rows
 split, which may cost more than it saves. The split scope runs each one only over its deferred
 splits: at most 22 tiles × 16 rows × 4 channel blocks, one split each.
 
+**Run 1126-flash** (a737f84): every check passed: no config changed bits, no certified row was
+wrong, fixture SHA-256 matched, and the deferred builds' certified bits equal the plain build's.
+**Tier 1 sped up as predicted, but tier 2 cost far more than it saved**, so deferral loses
+almost everywhere. Profile (ms per launch; plain build vs split scope):
+
+| tcpv 128/8 n64 | tier-1 split | tier-2 split | step | tier-2 items |
+|---|---|---|---|---|
+| decode B=1 16K | 0.155 → 0.114 | 0.002 → 0.166 | 0.176 → 0.316 | 0 → 56 of 64 |
+| decode B=8 16K | 0.913 → 0.816 | 0.002 → 1.646 | 0.924 → 2.478 | 0 → 480 of 512 |
+| verify B=1 16K | 0.565 → 0.307 | 0.051 → 0.972 | 0.655 → 1.318 | 2 → 448 of 512 |
+| verify B=1 16K, q3 | 1.700 → 0.285 | 0.051 → 1.344 | 1.792 → 1.669 | 2 → 448 of 512 |
+| verify B=8 4K | 0.714 → 0.539 | 0.061 → 1.057 | 0.805 → 1.631 | 3 → 1473 of 4096 |
+
+- **Tier 1 hit the prediction.** At verify B=1 16K the split launch went from 0.565 to 0.307 ms.
+  The longest tile fell from 215 to 38 µs, and programs with and without a deferred tile now
+  average 103 and 98 µs. With q3, tier 1 is 6× faster (1.700 → 0.285 ms) and faster than q4.
+- **Almost every row gets deferred.** At verify B=1 16K, 22 deferred tiles mark 112 of 128
+  rows. An uncertified score is a property of a key (D27: the same tiles fall back in decode
+  and verify), so every row that sees that key is deferred.
+- **Tier 2 runs those rows slowly.** Its grid is sized for a few items spread over all splits:
+  about 2 × 188 / nsplit programs per split. In split scope the work sits in the deferred
+  splits, so a handful of programs per split each run about 10 one-row items in sequence. In
+  row scope every item covers every split: verify B=1 16K takes 6.8 ms, B=8 16K 42 ms.
+- **Split scope leaves rows uncertified**, as expected: 1–5 rows at the large shapes, where
+  the row scope and the plain build leave 0. They are flagged, never wrong.
+- **Bench.** Deferral wins only at 1K keys, where tier 2 is cheap: verify B=1 1K 0.248 → 0.135
+  ms (dsx2, now the best cell) and verify B=8 1K 0.467 → 0.437 (dsx2, but 128/8 n32 without
+  deferral is still faster at 0.384). Everywhere else it is 1.3–12× slower. The best cells are
+  otherwise unchanged from run 1125.
+
+So deferral stays off by default (`defer_scores=False`). The useful result is the cause. The
+windowed recompute costs 200 µs because it recomputes the whole 16 × 64 tile. The row counts
+suggest the bad scores sit in a few key columns, but that is not yet measured. If they do,
+recomputing only the key sub-blocks that contain one, in tier 1, should keep most of tier 1's
+gain without involving tier 2 (D29). The first step is to count uncertified keys per
+deferred tile.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
