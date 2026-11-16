@@ -5,6 +5,11 @@ Tier 2 recomputes, with int64 P·V, each (row, 32-channel block) pair the tensor
 not certify, over every KV split, from a work list the tier-1 combine appends to (DESIGN D23).
 So its cost follows the number of such pairs.
 
+For tcpv cases it also runs the tier-1 split kernel's diagnostic phase clocks (TIMERS, DESIGN
+D26): SM cycles per program in the prologue, in each phase of a key tile (scores, weights, tile
+partial, merge) and elsewhere in the loop, plus each program's start, end and SM. From those:
+cycles per tile by phase, how busy the SMs are, and how many programs share an SM.
+
     python scripts/profile_step.py --out results/profile_step.md
 """
 from __future__ import annotations
@@ -13,6 +18,7 @@ import argparse
 import os
 import sys
 
+import numpy as np
 import torch
 from torch.profiler import ProfilerActivity, profile
 
@@ -46,6 +52,42 @@ def kernel_times(fn, iters):
     return out
 
 
+def timer_report(fn, sms):
+    """Markdown lines from the split kernel's phase clocks (columns: see triton_kernels TIMERS)."""
+    for _ in range(3):
+        fn()
+    torch.cuda.synchronize()
+    TM = _LAST_DEBUG["timers"].cpu().numpy().astype(np.float64)
+    pro, s1, s2, s3, s4, nt, loop, tot, g0, g1, sm = (TM[:, i] for i in range(11))
+    dur = g1 - g0                                             # ns per program
+    ghz = tot.sum() / dur.sum()
+    span = g1.max() - g0.min()
+    conc = 0                                                  # most programs at once on one SM
+    for m in np.unique(sm):
+        ev = sorted([(a, 1) for a in g0[sm == m]] + [(b, -1) for b in g1[sm == m]])
+        c = 0
+        for _, d in ev:
+            c += d
+            conc = max(conc, c)
+    tiles = max(nt.sum(), 1.0)
+    ph = {"scores (_tc_logits, windowed fallback)": s1.sum(), "weights (exp2)": s2.sum(),
+          "tile partial (Z, _tc_pv)": s3.sum(), "merge": s4.sum()}
+    ph["rest of the loop (load waits, loop control)"] = loop.sum() - sum(ph.values())
+    lines = [f"Phase clocks (TIMERS build): {len(TM)} programs on {len(np.unique(sm))} SMs "
+             f"(at most {conc} at once per SM), {nt.mean():.1f} tiles each; clock {ghz:.2f} GHz; "
+             f"launch span {span / 1e3:.1f} us; SMs busy {100 * dur.sum() / (span * sms):.0f}% of the span; "
+             f"program {dur.mean() / 1e3:.1f} us mean ({dur.min() / 1e3:.1f}-{dur.max() / 1e3:.1f}).", "",
+             "| part | cycles per tile | us per tile | share of program time |", "|---|---|---|---|"]
+    for k, v in ph.items():
+        lines.append(f"| {k} | {v / tiles:.0f} | {v / tiles / ghz / 1e3:.2f} | {100 * v / tot.sum():.1f}% |")
+    lines.append(f"| prologue (per program) | {pro.mean():.0f} | {pro.mean() / ghz / 1e3:.2f} | "
+                 f"{100 * pro.sum() / tot.sum():.1f}% |")
+    epi = tot - pro - loop
+    lines.append(f"| epilogue (per program) | {epi.mean():.0f} | {epi.mean() / ghz / 1e3:.2f} | "
+                 f"{100 * epi.sum() / tot.sum():.1f}% |")
+    return lines + [""]
+
+
 def tier2_share():
     NEED = _LAST_DEBUG.get("tier2_need")
     if NEED is None:
@@ -67,7 +109,7 @@ def main():
     for T, B, n, mode, bdv, nw, bm, bn, sq in CASES:
         case = bench.Case(B, n, T)
         try:
-            fn, unc, bad, _, _, regs = case.exact(mode, sms, bdv, nw, bm, "int", bn, sq, None)
+            fn, unc, bad, out0, _, regs = case.exact(mode, sms, bdv, nw, bm, "int", bn, sq, None)
             share = tier2_share()
             kt = kernel_times(fn, a.iters)
         except Exception as ex:  # noqa: BLE001
@@ -81,7 +123,17 @@ def main():
         for k, (ms, _) in sorted(kt.items(), key=lambda kv: int(kv[0].split(":")[0])):
             lines.append(f"| {k[:70]} | {ms:.3f} |")
         lines.append("")
-        print("\n".join(lines[-12:]), flush=True)
+        if mode == "tcpv":
+            try:
+                fn_t, unc_t, bad_t, out_t, _, _ = case.exact(mode, sms, bdv, nw, bm, "int", bn, sq, None, timers=True)
+                same = bool(torch.equal(out_t, out0))
+                lines += [f"Timers build: {unc_t} uncertified, {bad_t} wrong, output bits "
+                          f"{'equal' if same else 'DIFFERENT'} to the plain build.", ""]
+                lines += timer_report(fn_t, sms)
+                del fn_t
+            except Exception as ex:  # noqa: BLE001
+                lines += [f"Timers build failed: {type(ex).__name__}: {ex}", ""]
+        print("\n".join(lines[-24:]), flush=True)
         del case, fn
         torch.cuda.empty_cache()
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)

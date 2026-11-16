@@ -57,7 +57,7 @@ PAGE = 16
 # old one. sq is q's digit count: 4 (D18), 3 the old one. regs 128 caps the split kernel's
 # registers (with pipelining depth 1, so two 8-warp programs fit an SM; DESIGN D21); None is
 # Triton's choice (255); "s1" is pipelining depth 1 at 255 registers (half the shared memory, so
-# more L1 for spills) and "h" half the KV splits (longer programs), both diagnostics (DESIGN D25).
+# more L1 for spills), "h" half and "x2" twice the KV splits, all diagnostics (DESIGN D25, D26).
 # The last configs are A/Bs, and cross-checks that none of these choices can change bits.
 CONFIGS = {"int64": [(32, 4, None, "int", 16, 4, None), (32, 4, None, "f64", 16, 4, None)],
            "tc": [(32, 4, None, "int", 16, 4, None), (64, 8, None, "int", 16, 4, None),
@@ -67,7 +67,7 @@ CONFIGS = {"int64": [(32, 4, None, "int", 16, 4, None), (32, 4, None, "f64", 16,
                     (64, 8, None, "int", 64, 4, 128), (128, 8, None, "int", 64, 4, 128),
                     (128, 8, None, "int", 64, 3, None), (128, 8, None, "int", 32, 4, None),
                     (32, 4, 16, "int", 32, 4, None), (128, 8, None, "int", 64, 4, "s1"),
-                    (128, 8, None, "int", 64, 4, "h")]}
+                    (128, 8, None, "int", 64, 4, "h"), (128, 8, None, "int", 64, 4, "x2")]}
 
 
 def time_step(fn, iters: int, warmup: int = 3):
@@ -196,7 +196,7 @@ class Case:
 
     # ---------------- ExactAttention ----------------
     def exact(self, mode: str, sms: int, block_dv: int = 32, num_warps: int = 4, block_m=None, exp2="int",
-              block_n: int = 16, sq: int = 4, regs=None):
+              block_n: int = 16, sq: int = 4, regs=None, timers: bool = False):
         B, n, T = self.B, self.n, self.T
         grp = HQ // HKV
         G, r_seg = B * HKV, T * grp
@@ -215,8 +215,10 @@ class Case:
         splits = int(max(1, min(n // 256, -(-4 * sms // progs))))
         if regs == "h":
             splits = max(1, splits // 2)
+        elif regs == "x2":
+            splits = min(max(1, n // 128), 2 * splits)
         kw = dict(splits=splits, block_m=block_m, block_n=block_n, block_dv=block_dv,
-                  num_warps=num_warps, exp2=exp2)
+                  num_warps=num_warps, exp2=exp2, timers=timers)
         if regs == "s1":
             kw.update(num_stages=1)
         elif isinstance(regs, int):
@@ -335,7 +337,7 @@ def main():
     lines.insert(4, "Exact cells: `ms mode [block_dv/num_warps/mBLOCK_M/exp2/nBLOCK_N/qSQ rREGS spillBYTES]` for the fastest tile config.")
     lines.insert(5, "")
     if all_cfg:
-        lines += ["", "All exact configs (the A/Bs: m16 = padded rows, f64 = float64 exp2, n32 = 32-key tiles, q3 = 3 q digits, r128 = 128-register cap, s1 = pipelining depth 1, h = half the KV splits):", ""]
+        lines += ["", "All exact configs (the A/Bs: m16 = padded rows, f64 = float64 exp2, n32 = 32-key tiles, q3 = 3 q digits, r128 = 128-register cap, s1 = pipelining depth 1, h = half and x2 = twice the KV splits):", ""]
         lines += [f"- {c}" for c in all_cfg]
     if errors:
         lines += ["", "Backend errors (first per backend and error type):", ""]

@@ -1140,6 +1140,35 @@ What is left is latency inside a tile with 8 warps per SM: long int64 chains and
 reductions. Without an sm_120 profiler, the next measurement is in-kernel timers (clock64 at
 the tile's phase boundaries, written to a debug buffer).
 
+## D26. Phase clocks in the split kernel
+
+`launch(..., timers=True)` builds the tier-1 split kernel with the constexpr `TIMERS`. The
+default build has no timer code; tier 2 never takes it. Each program writes 12 int64 to
+`_LAST_DEBUG["timers"]`:
+- SM cycles (`%clock64`) for the prologue;
+- for each key tile, cycles of each phase, summed over the program's tiles: scores
+  (`_tc_logits` and the windowed fallback), weights (exp2), the tile partial (Z and `_tc_pv`)
+  and the merge;
+- its tile count, and its key loop and whole-program cycles;
+- its start and end in `%globaltimer` nanoseconds, which every SM shares;
+- `%smid`.
+
+Inline PTX reads each clock, with an int32 input taken from a block-wide reduction of the
+phase's result. So the read cannot be scheduled before the phase ends, and the reduction's
+barrier lines the warps up. That perturbs the kernel. Offline sm_120 SASS: +19 instructions per
+decode tile (2147 against 2128), and +104 per verify tile (3936 against 3832) with more spills.
+Shared memory is the same, so the loads are still pipelined.
+
+`profile_step` runs the timers build next to the plain one for every tcpv case. It checks that
+the output bits are equal, then reports:
+- cycles and µs per tile for each phase, and the rest of the loop (load waits, loop control);
+- prologue and epilogue per program;
+- the clock rate (cycles over nanoseconds);
+- the launch span, how busy the SMs were over it, and the most programs at once on one SM.
+
+The benchmark also gains an `x2` A/B, twice the KV splits (at least 128 keys each), for the
+wave-quantization question in D25.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
