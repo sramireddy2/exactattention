@@ -695,6 +695,11 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
         WF = T1                     # tiles that took the windowed score fallback (DESIGN D27)
         EF = T1                     # tiles that took the float64 exp2 fallback
         MX = T1                     # longest tile, cycles from the previous tile's end
+        UC = T1                     # key columns with an uncertified tensor-core score (DESIGN D29)
+        UL = T1                     # ... of which the key lost bits when sliced (KLOST)
+        UE = T1                     # uncertified (row, key) scores
+        UV = T1                     # visible rows in those key columns
+        UX = T1                     # most uncertified key columns in one tile
     seg = pid_m // NRB
     lrows = (pid_m % NRB) * BLOCK_M + tl.arange(0, BLOCK_M)
     rmask = lrows < R_SEG
@@ -756,6 +761,17 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
             t, unc, kbad = _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nn < kmax, KST,
                                       KLSB, KL1S, KLOST, AM, AE, D, SQ, SK, PACK, BLOCK_M)
             flag = tl.maximum(flag, tl.max((vis & kbad[None, :]).to(tl.int32), axis=1))
+            if TIMERS:
+                # Where the uncertified scores sit, before any fallback (DESIGN D29).
+                uu = (unc & vis).to(tl.int32)
+                ucol = tl.max(uu, axis=0)                                  # (N,)
+                klb = tl.load(KLOST + nn, mask=nn < kmax, other=0) & 1
+                nuc = tl.sum(ucol, axis=0).to(tl.int64)
+                UC += nuc
+                UL += tl.sum(ucol * klb, axis=0).to(tl.int64)
+                UE += tl.sum(tl.sum(uu, axis=1), axis=0).to(tl.int64)
+                UV += tl.sum(ucol * tl.sum(vis.to(tl.int32), axis=0), axis=0).to(tl.int64)
+                UX = tl.maximum(UX, nuc)
             if DEFER and not RERUN:
                 usc = (unc & vis).to(tl.int32)
                 dfl = tl.maximum(dfl, tl.max(usc, axis=1))
@@ -883,11 +899,13 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
     if TIMERS:
         # Row per program: prologue, scores, weights, tile partial, merge (summed over tiles),
         # tiles, key loop, whole program (cycles), start and end (ns), SM, then (DESIGN D27)
-        # windowed-fallback tiles, float64-exp2 tiles, longest tile (cycles), pid_m, pid_s.
+        # windowed-fallback tiles, float64-exp2 tiles, longest tile (cycles), pid_m, pid_s, then
+        # (DESIGN D29) uncertified key columns, of them lossy keys, uncertified scores, visible rows
+        # in those columns, most uncertified columns in one tile.
         cZ = _clk(tl.max(flag, axis=0))
         g1 = _gtime(tl.max(flag, axis=0))
         sm = _smid(tl.max(flag, axis=0))
-        tb = TM + ((pid_m * tl.num_programs(1) + pid_s) * tl.num_programs(2) + pid_c).to(tl.int64) * 16
+        tb = TM + ((pid_m * tl.num_programs(1) + pid_s) * tl.num_programs(2) + pid_c).to(tl.int64) * 24
         tl.store(tb + 0, cA - c0)
         tl.store(tb + 1, T1)
         tl.store(tb + 2, T2)
@@ -904,6 +922,11 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
         tl.store(tb + 13, MX)
         tl.store(tb + 14, (pid_m + 0 * WF).to(tl.int64))
         tl.store(tb + 15, (pid_s + 0 * WF).to(tl.int64))
+        tl.store(tb + 16, UC)
+        tl.store(tb + 17, UL)
+        tl.store(tb + 18, UE)
+        tl.store(tb + 19, UV)
+        tl.store(tb + 20, UX)
 
 
 @triton.jit
@@ -1317,8 +1340,8 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     defer_split = defer and defer_scores == "split"
     DFL = torch.empty((nsplit, R), dtype=torch.int32, device=dev) if defer else z32   # all written
 
-    # Diagnostic phase clocks of the tier-1 split kernel (DESIGN D26): 16 int64 per program.
-    TMB = (torch.zeros((G * triton.cdiv(r_seg, block_m) * nsplit * (dv // block_dv), 16), dtype=torch.int64,
+    # Diagnostic phase clocks of the tier-1 split kernel (DESIGN D26): 24 int64 per program.
+    TMB = (torch.zeros((G * triton.cdiv(r_seg, block_m) * nsplit * (dv // block_dv), 24), dtype=torch.int64,
                        device=dev) if timers else None)
 
     def split(rerun, bn, pv, v_args, sw_, sv_, anch_, bm, bdv, nw, grid0, stg):

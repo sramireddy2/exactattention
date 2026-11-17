@@ -61,7 +61,8 @@ STAGES=(
 # (scripts/bench_vs_flashinfer.py). FlashInfer JIT-compiles its kernels on first use into
 # ~/.cache/flashinfer, which persists across jobs, so a preempted warmup is not lost.
 BF="python scripts/bench_vs_flashinfer.py"
-if [ "${EA_PLAN:-gpu_check}" = "flash" ]; then
+# EA_PLAN=profile: the same environment, but only the step profile (DESIGN D29).
+if [ "${EA_PLAN:-gpu_check}" = "flash" ] || [ "${EA_PLAN:-gpu_check}" = "profile" ]; then
   # The comparison is on the RTX PRO 6000 (sm_120), never an L40S. Submission adds gpu-v100 to
   # any -p list, so pin the GPU type in the gres as well.
   PART="-p gpu-rtxpro-blackwell --gres=gpu:rtx_pro_6000_blackwell:1"
@@ -82,6 +83,9 @@ if [ "${EA_PLAN:-gpu_check}" = "flash" ]; then
     "verify_t8|1500|$BF --batch 1,8 --keys 1024,4096,16384 --drafts 8 --modes tc,tcpv --out $OUT/verify_t8.md"
     "profile_steps|1200|python scripts/profile_step.py --out $OUT/profile_steps.md"
   )
+  if [ "$EA_PLAN" = "profile" ]; then
+    STAGES=("${STAGES[0]}" "${STAGES[-1]}")
+  fi
 fi
 
 stage_name() { echo "${1%%|*}"; }

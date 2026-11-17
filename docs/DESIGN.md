@@ -1398,6 +1398,34 @@ recomputing only the key sub-blocks that contain one, in tier 1, should keep mos
 gain without involving tier 2 (D29). The first step is to count uncertified keys per
 deferred tile.
 
+## D29. Where the uncertified tensor-core scores sit
+
+Before changing the windowed fallback, measure its input. The timers build now writes 24 int64
+per program. Five new columns are summed over the program's tiles, taken right after the
+tensor-core scores and before any fallback:
+- key columns with at least one uncertified visible score;
+- how many of those keys lost bits when K was sliced (`KLOST` bit 0);
+- uncertified (row, key) scores;
+- visible rows in those key columns, so the share of them that are uncertified;
+- the most uncertified key columns in any one tile.
+
+`profile_step` prints, per tcpv case:
+- columns per tile that has any uncertified score, and the maximum;
+- the share of those columns that are lossy keys;
+- the share of their visible rows that are uncertified;
+- how many keys in the cache lost bits when sliced.
+
+The deferred-scope pass is dropped from the profile; D28 answered it.
+
+What each outcome means for the fallback:
+- **A few columns per tile, mostly lossy keys, most of their rows uncertified.** The cause is
+  K's slicing. A windowed recompute over just those key columns, in sub-blocks of about 8
+  keys, skips the rest of the tile. Lossy keys are known when the cache is written, so they
+  could also get a 5th digit or an exact side path instead.
+- **Many columns, or uncertified scores spread across rows.** The cause is in q, or in the
+  bound itself, and slicing by key will not help. Look at the q rows and the error bound
+  instead.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model

@@ -58,7 +58,8 @@ def timer_report(fn, sms):
         fn()
     torch.cuda.synchronize()
     TM = _LAST_DEBUG["timers"].cpu().numpy().astype(np.float64)
-    pro, s1, s2, s3, s4, nt, loop, tot, g0, g1, sm, wf, ef, mx, pm, ps = (TM[:, i] for i in range(16))
+    pro, s1, s2, s3, s4, nt, loop, tot, g0, g1, sm, wf, ef, mx, pm, ps, uc, ul, ue, uv, ux = (
+        TM[:, i] for i in range(21))
     dur = g1 - g0                                             # ns per program
     ghz = tot.sum() / dur.sum()
     span = g1.max() - g0.min()
@@ -98,6 +99,11 @@ def timer_report(fn, sms):
               f"({int(anyf.sum())}), {mean(us[~anyf])} without ({int((~anyf).sum())}). "
               f"Longest tile: {mx.max() / ghz / 1e3:.1f} us (median program's longest "
               f"{np.median(mx) / ghz / 1e3:.1f}).", "",
+              # Where the uncertified scores sit (DESIGN D29): key columns per tile that has any.
+              f"Uncertified scores: {int(ue.sum())} in {int(uc.sum())} key columns of {int(wf.sum())} tiles "
+              f"({uc.sum() / max(1, wf.sum()):.2f} columns per such tile, at most {int(ux.max())}); "
+              f"{int(ul.sum())} of the columns are keys that lost bits when sliced; the columns' "
+              f"visible rows are {100 * ue.sum() / max(1, uv.sum()):.0f}% uncertified.", "",
               "Slowest programs (us; phases summed over the program's tiles):", "",
               "| pid_m | pid_s | SM | start | program | tiles | windowed | f64 exp2 | longest tile | "
               "prologue | scores | weights | partial | merge | rest |", "|" + "---|" * 15]
@@ -134,7 +140,7 @@ def main():
     for T, B, n, mode, bdv, nw, bm, bn, sq in CASES:
         case = bench.Case(B, n, T)
         try:
-            fn, unc, bad, out0, flg0, regs = case.exact(mode, sms, bdv, nw, bm, "int", bn, sq, None)
+            fn, unc, bad, out0, _, regs = case.exact(mode, sms, bdv, nw, bm, "int", bn, sq, None)
             share = tier2_share()
             kt = kernel_times(fn, a.iters)
         except Exception as ex:  # noqa: BLE001
@@ -152,33 +158,15 @@ def main():
             try:
                 fn_t, unc_t, bad_t, out_t, _, _ = case.exact(mode, sms, bdv, nw, bm, "int", bn, sq, None, timers=True)
                 same = bool(torch.equal(out_t, out0))
+                kl = case._k_tc[3] & 1                                   # KLOST bit 0, per key
                 lines += [f"Timers build: {unc_t} uncertified, {bad_t} wrong, output bits "
-                          f"{'equal' if same else 'DIFFERENT'} to the plain build.", ""]
+                          f"{'equal' if same else 'DIFFERENT'} to the plain build. Keys that lost bits "
+                          f"when sliced: {int(kl.sum())} of {kl.numel()} in the cache.", ""]
                 lines += timer_report(fn_t, sms)
                 del fn_t
             except Exception as ex:  # noqa: BLE001
                 lines += [f"Timers build failed: {type(ex).__name__}: {ex}", ""]
-            # The same step with the windowed score recompute deferred to tier 2 (DESIGN D28).
-            try:
-                fn_d, unc_d, bad_d, out_d, flg_d, regs_d = case.exact(mode, sms, bdv, nw, bm, "int", bn, sq, "ds")
-                share_d = tier2_share()
-                kd = kernel_times(fn_d, a.iters)
-                both = ~(flg0 | flg_d)
-                same = bool(torch.equal(out0.reshape(-1, bench.D)[both], out_d.reshape(-1, bench.D)[both]))
-                lines += [f"### Deferred scores, deferred splits rerun (DESIGN D28): {sum(v[0] for v in kd.values()):.3f} ms, {unc_d} "
-                          f"uncertified, {bad_d} wrong, regs {regs_d[0]} spill {regs_d[1]}, certified bits "
-                          f"{'equal' if same else 'DIFFERENT'} to the plain build", "", share_d, "",
-                          "| launch (order: kernel) | ms |", "|---|---|"]
-                for k, (ms, _) in sorted(kd.items(), key=lambda kv: int(kv[0].split(":")[0])):
-                    lines.append(f"| {k[:70]} | {ms:.3f} |")
-                lines.append("")
-                del fn_d
-                fn_dt, _, _, _, _, _ = case.exact(mode, sms, bdv, nw, bm, "int", bn, sq, "ds", timers=True)
-                lines += ["Deferred timers build (windowed = tiles deferred):", ""] + timer_report(fn_dt, sms)
-                del fn_dt
-            except Exception as ex:  # noqa: BLE001
-                lines += [f"Deferred build failed: {type(ex).__name__}: {ex}", ""]
-        print("\n".join(lines[-90:]), flush=True)
+        print("\n".join(lines[-40:]), flush=True)
         del case, fn
         torch.cuda.empty_cache()
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
