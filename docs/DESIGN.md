@@ -1426,6 +1426,32 @@ What each outcome means for the fallback:
   bound itself, and slicing by key will not help. Look at the q rows and the error bound
   instead.
 
+**Run 1127-profile** (26bb145; output bits of the timers build equal the plain build's in
+every case, 0 uncertified rows). With 4 q digits the answer is the first outcome, without
+exception:
+
+| tcpv n64 q4 | windowed tiles | uncertified key columns | of them lossy keys | rows of those columns uncertified | lossy keys in the cache |
+|---|---|---|---|---|---|
+| decode B=1 16K (m2) | 22 | 22 (1 per tile, max 1) | 22 | 100% | 22 of 131,072 |
+| decode B=8 16K (m2) | 154 | 154 (1 per tile, max 1) | 154 | 100% | 154 of 1,048,576 |
+| verify B=1 16K (m16) | 22 | 22 (1 per tile, max 1) | 22 | 100% | 22 of 131,072 |
+| verify B=1 16K (m16, n32) | 22 of 4096 | 22 (1 per tile, max 1) | 22 | 100% | 22 of 131,072 |
+| verify B=8 4K (m16) | 34 | 34 (1 per tile, max 1) | 34 | 100% | 34 of 262,144 |
+
+- **Every windowed tile is one lossy key.** Each key that lost bits when sliced into 4 int8
+  digits makes exactly one tile fall back. Every row that sees that key is uncertified, and no
+  other key in the tile is. About 1.7 keys in 10,000 are lossy here, and that is all of the
+  windowed work at q4.
+- **So the windowed recompute does 64× the work it needs.** It recomputes all 64 key columns
+  of a tile to fix one.
+- **q3 is the other outcome.** 1033 of 2048 tiles have about 63 uncertified columns each
+  (max 64), but only 6% of the visible rows in those columns. That is q losing bits at 3
+  digits, spread across keys. Slicing by key cannot help it, so q stays at 4 digits.
+
+A 5th K digit for lossy keys does not fit: 7 × (4 + 5) + 7 = 70 bits exceeds int64's 63. But
+lossy keys are marked when the cache is written, so tier 1 can recompute just their columns:
+16 rows × 1 key exactly, in place of 16 × 64 (D30).
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
