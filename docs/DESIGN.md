@@ -1452,6 +1452,45 @@ A 5th K digit for lossy keys does not fit: 7 × (4 + 5) + 7 = 70 bits exceeds in
 lossy keys are marked when the cache is written, so tier 1 can recompute just their columns:
 16 rows × 1 key exactly, in place of 16 × 64 (D30).
 
+## D30. Recomputing uncertified scores by key column
+
+D29 showed that at 4 q digits each windowed tile has exactly one uncertified key column. So
+tier 1 now counts the key columns that hold an uncertified visible score. With up to
+`col_fallback` of them (default 4), it recomputes just those keys:
+- `_windowed_col` is `_windowed_logits` for one key j. It works on (rows, channels) products
+  instead of (rows, keys, channels). Its integer sums per (row, key) are the same, so it gives
+  the same bits as the whole-tile form's column j.
+- Columns are taken lowest key first. Each one replaces only the uncertified scores in its
+  column, as the whole-tile form does.
+- A tile with more uncertified columns recomputes the whole tile as before. So does every tile
+  when `col_fallback=0`. That covers q3, where tiles have about 63 such columns (D29).
+
+A certified result is the same bits either way, and so is every flag. A score that neither form
+can certify stays uncertified in both, with the same value.
+
+**Branch layout matters to ptxas.** The two recomputes are exclusive, and the obvious code nests
+the whole-tile one in an `else`. For 16-row blocks, ptxas then caps the split kernel at 128
+registers: 21 KB of spills instead of 816 B. Running the whole-tile recompute after the
+column branch, gated on the column count, keeps 255 registers and 936 B. Decode's 2-row blocks
+are the other way round. The sequential layout spills 2.5 KB and needs 95 KB of shared memory;
+the nested one spills 48 B and needs 84.7 KB, as before. So the layout is chosen by `BLOCK_M`,
+a compile-time constant. Every build in `sm120_compile_check` passes. The two checked against
+pre-D30 code are close: tcpv m16 128/8 spills 936 B (was 816), tc m16 1860 B (was 1732).
+
+Checks:
+- `test_column_score_recompute_changes_no_bits` (block_m 16 and 2) compares outputs and flags
+  with `col_fallback=0`, and certified rows with the reference.
+  - "few": 4 keys made lossy (one element 2^-40), two of them in one 32-key tile. Without any
+    recompute every row is flagged; with the column path every row is certified.
+  - "many": 2 q digits, so the tiles take the whole-tile path.
+- The timers build adds two columns: key columns recomputed one at a time, and the tiles they
+  were in. `profile_step` splits windowed tiles into by-column and whole-tile.
+- The bench adds an A/B config "w" (128/8 n64, `col_fallback=0`): the old whole-tile fallback.
+
+Expected: verify B=1 16K's tier 1 should fall from 0.565 ms toward the 0.307 ms it took with
+no score recompute at all (D28). Decode should gain a little: its 22 or 154 lossy keys each
+cost a whole-tile recompute.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model

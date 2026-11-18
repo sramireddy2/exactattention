@@ -58,8 +58,8 @@ def timer_report(fn, sms):
         fn()
     torch.cuda.synchronize()
     TM = _LAST_DEBUG["timers"].cpu().numpy().astype(np.float64)
-    pro, s1, s2, s3, s4, nt, loop, tot, g0, g1, sm, wf, ef, mx, pm, ps, uc, ul, ue, uv, ux = (
-        TM[:, i] for i in range(21))
+    pro, s1, s2, s3, s4, nt, loop, tot, g0, g1, sm, wf, ef, mx, pm, ps, uc, ul, ue, uv, ux, cf, ct = (
+        TM[:, i] for i in range(23))
     dur = g1 - g0                                             # ns per program
     ghz = tot.sum() / dur.sum()
     span = g1.max() - g0.min()
@@ -94,7 +94,8 @@ def timer_report(fn, sms):
         return f"{x.mean():.1f}" if len(x) else "n/a"
 
     lines += ["", f"Fallbacks: windowed scores in {int(wf.sum())} of {int(tiles)} tiles "
-              f"({int((wf > 0).sum())} programs), float64 exp2 in {int(ef.sum())} tiles "
+              f"({int((wf > 0).sum())} programs; {int(ct.sum())} of them by key column, {int(cf.sum())} "
+              f"columns, the other {int(wf.sum() - ct.sum())} whole tile), float64 exp2 in {int(ef.sum())} tiles "
               f"({int((ef > 0).sum())} programs). Program us mean: {mean(us[anyf])} with a fallback "
               f"({int(anyf.sum())}), {mean(us[~anyf])} without ({int((~anyf).sum())}). "
               f"Longest tile: {mx.max() / ghz / 1e3:.1f} us (median program's longest "

@@ -241,6 +241,67 @@ def _windowed_logits(Q, qoff, rmask, K, nn, nmask, AM, AE, D: tl.constexpr, DC: 
 
 
 @triton.jit
+def _qk_col(Q, qoff, rmask, K, j, c, D: tl.constexpr, DC: tl.constexpr):
+    """_qk_chunk for the single key j: channels [c, c + DC) of q_m,d * k_j,d, as (M, DC)."""
+    dc = c + tl.arange(0, DC)
+    qm, qe, _qb = _decode_bf16(tl.load(Q + qoff[:, None] + dc[None, :], mask=rmask[:, None], other=0))
+    km, ke, _kb = _decode_bf16(tl.load(K + j * D + dc))
+    return qm * km[None, :], qe + ke[None, :]
+
+
+@triton.jit
+def _windowed_col(Q, qoff, rmask, K, j, AM, AE, D: tl.constexpr, DC: tl.constexpr, FS: tl.constexpr):
+    """_windowed_logits for one key j: (t, uncertified), each (M,). The same exact integer sums per
+    (row, key), so the same bits as the whole-tile form's column j (DESIGN D30), from (M, DC)
+    products instead of (M, N, DC)."""
+    lmax = tl.full((qoff.shape[0],), NEG, tl.int64)
+    for c in range(0, D, DC):
+        P, E = _qk_col(Q, qoff, rmask, K, j, c, D, DC)
+        lead = tl.where(P != 0, E + _bitlen(tl.abs(P)) - 1, NEG)
+        lmax = tl.maximum(lmax, tl.max(lead, axis=1))                  # (M,)
+    base = lmax + 1 - FS
+    acc = tl.zeros((qoff.shape[0],), tl.int64)
+    err = tl.zeros((qoff.shape[0],), tl.int64)
+    for c in range(0, D, DC):
+        P, E = _qk_col(Q, qoff, rmask, K, j, c, D, DC)
+        nzp = P != 0
+        term, lost = _floor_shift(P, E - base[:, None])
+        acc += tl.sum(tl.where(nzp, term, 0), axis=1)
+        err += tl.sum((lost & nzp).to(tl.int64), axis=1)
+    anyp = lmax != NEG
+    big = (tl.abs(acc) + err) >= (1 << 62)
+    t_lo, ov1 = _rn32_product(AM, AE, acc, base)
+    t_hi, ov2 = _rn32_product(AM, AE, acc + err, base)
+    t = tl.where(anyp, t_lo, 0.0)
+    unc = anyp & ((t_lo != t_hi) | ov1 | ov2 | big)
+    return t, unc
+
+
+@triton.jit
+def _col_recompute(t, unc, ucol, nuc, Q, qoff, rmask, K, nn, AM, AE, D: tl.constexpr, DC: tl.constexpr,
+                   FS: tl.constexpr):
+    """Replace the uncertified scores in the nuc key columns marked in ucol with windowed ones,
+    one key at a time (DESIGN D30)."""
+    left = ucol
+    for _c in range(0, nuc):
+        j = tl.min(tl.where(left != 0, nn, 2147483647), axis=0)
+        t_c, unc_c = _windowed_col(Q, qoff, rmask, K, j, AM, AE, D, DC, FS)
+        sel = (nn == j)[None, :] & unc
+        t = tl.where(sel, t_c[:, None], t)
+        unc = tl.where(sel, unc_c[:, None], unc)
+        left = tl.where(nn == j, 0, left)
+    return t, unc
+
+
+@triton.jit
+def _tile_recompute(t, unc, Q, qoff, rmask, K, nn, kmax, AM, AE, D: tl.constexpr, DC: tl.constexpr,
+                    FS: tl.constexpr):
+    """Replace every uncertified score of the tile with a windowed one."""
+    t_w, unc_w = _windowed_logits(Q, qoff, rmask, K, nn, nn < kmax, AM, AE, D, DC, FS)
+    return tl.where(unc, t_w, t), unc & unc_w
+
+
+@triton.jit
 def _q_digit(fix, neg, s: tl.constexpr):
     d = (fix >> (7 * s)) & 127
     return tl.where(neg, -d, d).to(tl.int8)
@@ -677,7 +738,8 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
                    USE_TC: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr, TC_FALLBACK: tl.constexpr,
                    USE_TC_PV: tl.constexpr, SW: tl.constexpr, SV: tl.constexpr, ANCH: tl.constexpr,
                    RERUN: tl.constexpr, PACK: tl.constexpr, EXP2T, EXP2_INT: tl.constexpr,
-                   WDC: tl.constexpr, FL_DIV: tl.constexpr, TIMERS: tl.constexpr, DEFER: tl.constexpr):
+                   WDC: tl.constexpr, FL_DIV: tl.constexpr, TIMERS: tl.constexpr, DEFER: tl.constexpr,
+                   COLMAX: tl.constexpr, CDC: tl.constexpr):
     # One program's work: row block pid_m (segment-major), KV split pid_s, channel block pid_c.
     # Segments: G independent problems (e.g. sequence x KV head), each with R_SEG query rows
     # attending its own NK_SEG keys. Rows and keys are stored segment after segment, so
@@ -692,7 +754,9 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
         T3 = T1
         T4 = T1
         NT = T1
-        WF = T1                     # tiles that took the windowed score fallback (DESIGN D27)
+        WF = T1                     # tiles that took a windowed score fallback (DESIGN D27, D30)
+        CF = T1                     # key columns recomputed one at a time (DESIGN D30)
+        CT = T1                     # ... in this many tiles (the rest of WF took the whole tile)
         EF = T1                     # tiles that took the float64 exp2 fallback
         MX = T1                     # longest tile, cycles from the previous tile's end
         UC = T1                     # key columns with an uncertified tensor-core score (DESIGN D29)
@@ -777,12 +841,45 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
                 dfl = tl.maximum(dfl, tl.max(usc, axis=1))
                 if TIMERS:
                     WF += tl.max(tl.max(usc, axis=1), axis=0).to(tl.int64)
-            if TC_FALLBACK and tl.max(tl.max((unc & vis).to(tl.int32), axis=1), axis=0) > 0:
-                t_w, unc_w = _windowed_logits(Q, rows * D, rmask, K, nn, nn < kmax, AM, AE, D, WDC, FS)
-                t = tl.where(unc, t_w, t)
-                unc = unc & unc_w
-                if TIMERS:
-                    WF += 1
+            if TC_FALLBACK:
+                # Exact recompute of the uncertified scores. Nearly always they sit in one key column,
+                # a key that lost bits when sliced (DESIGN D29), so a tile with up to COLMAX such
+                # columns recomputes them one key at a time, and only a tile with more recomputes
+                # the whole tile (DESIGN D30). Each recomputed (row, key) gets the same windowed
+                # bits either way. The two branch layouts differ only in what ptxas makes of them:
+                # nested keeps small (decode) blocks' spills low, but caps 16-row blocks at 128
+                # registers, so those run the whole-tile recompute after, not inside, this branch.
+                if COLMAX > 0:
+                    ucol = tl.max((unc & vis).to(tl.int32), axis=0)             # (N,)
+                    nuc = tl.sum(ucol, axis=0)
+                    if BLOCK_M < 16:
+                        if nuc > 0:
+                            if nuc <= COLMAX:
+                                t, unc = _col_recompute(t, unc, ucol, nuc, Q, rows * D, rmask, K, nn, AM, AE,
+                                                        D, CDC, FS)
+                                if TIMERS:
+                                    CF += nuc.to(tl.int64)
+                                    CT += 1
+                            else:
+                                t, unc = _tile_recompute(t, unc, Q, rows * D, rmask, K, nn, kmax, AM, AE, D, WDC, FS)
+                            if TIMERS:
+                                WF += 1
+                    else:
+                        if (nuc > 0) & (nuc <= COLMAX):
+                            t, unc = _col_recompute(t, unc, ucol, nuc, Q, rows * D, rmask, K, nn, AM, AE, D,
+                                                    CDC, FS)
+                            if TIMERS:
+                                CF += nuc.to(tl.int64)
+                                CT += 1
+                                WF += 1
+                        whole = nuc > COLMAX
+                else:
+                    whole = tl.max(tl.max((unc & vis).to(tl.int32), axis=1), axis=0) > 0
+            if TC_FALLBACK and (COLMAX == 0 or BLOCK_M >= 16):
+                if whole:
+                    t, unc = _tile_recompute(t, unc, Q, rows * D, rmask, K, nn, kmax, AM, AE, D, WDC, FS)
+                    if TIMERS:
+                        WF += 1
         else:
             kb = tl.load(K + nn[:, None] * D + dd[None, :], mask=(nn < kmax)[:, None], other=0).to(tl.int32)
             kbad = tl.max((((kb >> 7) & 0xFF) == 0xFF).to(tl.int32), axis=1)  # (N,) NaN/inf key
@@ -901,7 +998,8 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
         # tiles, key loop, whole program (cycles), start and end (ns), SM, then (DESIGN D27)
         # windowed-fallback tiles, float64-exp2 tiles, longest tile (cycles), pid_m, pid_s, then
         # (DESIGN D29) uncertified key columns, of them lossy keys, uncertified scores, visible rows
-        # in those columns, most uncertified columns in one tile.
+        # in those columns, most uncertified columns in one tile, then (DESIGN D30) key columns
+        # recomputed one at a time and the tiles they were in.
         cZ = _clk(tl.max(flag, axis=0))
         g1 = _gtime(tl.max(flag, axis=0))
         sm = _smid(tl.max(flag, axis=0))
@@ -927,6 +1025,8 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
         tl.store(tb + 18, UE)
         tl.store(tb + 19, UV)
         tl.store(tb + 20, UX)
+        tl.store(tb + 21, CF)
+        tl.store(tb + 22, CT)
 
 
 @triton.jit
@@ -941,7 +1041,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                      USE_TC_PV: tl.constexpr, SW: tl.constexpr, SV: tl.constexpr, ANCH: tl.constexpr,
                      RERUN: tl.constexpr, PACK: tl.constexpr, EXP2T, EXP2_INT: tl.constexpr,
                      WDC: tl.constexpr, FL_DIV: tl.constexpr, RESET_CNT: tl.constexpr, TIMERS: tl.constexpr,
-                     DEFER: tl.constexpr, DEFER_SPLIT: tl.constexpr):
+                     DEFER: tl.constexpr, DEFER_SPLIT: tl.constexpr, COLMAX: tl.constexpr, CDC: tl.constexpr):
     pid_s = tl.program_id(1)
     if RERUN:
         # Tier 2 (DESIGN D12, D23): the tier-1 combine appended each (row, channel block) pair to
@@ -964,7 +1064,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                                NRB,
                                FL_NCB, TM, DFL, D, DV, BLOCK_M, BLOCK_N, BLOCK_DV, FS, EXP2_MARGIN, USE_TC, SQ, SK,
                                TC_FALLBACK, USE_TC_PV, SW, SV, ANCH, RERUN, PACK, EXP2T, EXP2_INT, WDC, FL_DIV, False,
-                               DEFER)
+                               DEFER, COLMAX, CDC)
     else:
         if RESET_CNT:
             # Tier 1 runs first in a step: zero tier 2's work-list count here, not with a fill launch.
@@ -973,7 +1073,8 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
         _split_program(tl.program_id(0), pid_s, tl.program_id(2), Q, K, V, KVLEN, ROWS, AM, AE, PR, PZ, PZE, PNR, PN,
                        PNE, FLAG, SPLIT_LEN, FZ, FN, KX, KLSB, KL1S, KLOST, NKEYS, VX, VLSB, VLOST, VBAD, R_SEG, NK_SEG, NRB,
                        FL_NCB, TM, DFL, D, DV, BLOCK_M, BLOCK_N, BLOCK_DV, FS, EXP2_MARGIN, USE_TC, SQ, SK,
-                       TC_FALLBACK, USE_TC_PV, SW, SV, ANCH, RERUN, PACK, EXP2T, EXP2_INT, WDC, FL_DIV, TIMERS, DEFER)
+                       TC_FALLBACK, USE_TC_PV, SW, SV, ANCH, RERUN, PACK, EXP2T, EXP2_INT, WDC, FL_DIV, TIMERS, DEFER,
+                       COLMAX, CDC)
 
 
 @triton.jit
@@ -1224,7 +1325,7 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
            block_n: int = 16, block_dv: int = 32, merge_order=None, exp2_margin: float = 2.0 ** -26,
            q_tc=None, k_tc=None, tc_fallback: bool = True, v_tc=None, sw: int = 5, pv_tier2: bool = True,
            sq: int = 4, num_warps: int = 4, exp2: str = "int", num_stages: int | None = None,
-           maxnreg: int | None = None, timers: bool = False, defer_scores=False):
+           maxnreg: int | None = None, timers: bool = False, defer_scores=False, col_fallback: int = 4):
     """Device-level launch with no host transfers and no sync.
 
     Qt (R, d), Kt (n, d), Vt (n, dv) are int16 views of bf16 on the device; KL (R,) is int32.
@@ -1244,6 +1345,8 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     the whole row, "split" only the KV splits it was deferred in. It needs tensor-core scores and
     P·V with tier 2. A certified result is the same bits; "split" may leave a row flagged that
     "row" would certify (its other splits keep tier 1's tensor-core P·V enclosures).
+    col_fallback (DESIGN D30): a tile whose uncertified tensor-core scores sit in at most this many
+    key columns recomputes just those keys; more, or 0, recomputes the whole tile. Same bits.
     Returns (OUT int32 (R, dv) or
     (G, R, dv), split_flags, combine_flags), all on the device; flags are per flattened row."""
     batched = Qt.dim() == 3
@@ -1348,6 +1451,7 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
         nrb_ = triton.cdiv(r_seg, bm)
         # Windowed-score channel chunk (DESIGN D17): about 16 int64 products per thread live at once.
         wdc = max(1, min(d, (512 * nw) // (bm * bn)))
+        cdc = max(1, min(d, (512 * nw) // bm))          # the same for one key column (DESIGN D30)
         grid = (grid0 or G * nrb_, nsplit, 1 if rerun else dv // bdv)
         tm = TMB if (timers and not rerun) else dz[torch.int64]
         return _ea_split_kernel[grid](
@@ -1359,7 +1463,7 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
             USE_TC_PV=pv, SW=sw_, SV=sv_, ANCH=anch_, RERUN=rerun, PACK=max(1, 16 // bm),
             EXP2T=exp2t, EXP2_INT=(exp2 == "int"), WDC=wdc, FL_DIV=block_dv // bdv,
             RESET_CNT=tier2 and not rerun, TIMERS=bool(timers and not rerun), DEFER=defer,
-            DEFER_SPLIT=bool(rerun and defer_split), num_warps=nw, **stg)
+            DEFER_SPLIT=bool(rerun and defer_split), COLMAX=int(col_fallback), CDC=cdc, num_warps=nw, **stg)
 
     ck = split(False, block_n, use_tc_pv, vtc, sw, sv, anch, block_m, block_dv, num_warps, 0, stages)
     # Registers and spills of the compiled split kernel (None under the CPU interpreter).
@@ -1420,7 +1524,8 @@ def attention_triton(q_bits, k_bits, v_bits, alpha, kv_len, out: str = "bf16", s
                      merge_order=None, device: str = "cpu", fallback: bool = True,
                      exp2_margin: float = 2.0 ** -26, use_tc: bool = False, sq: int = 4, sk: int = 4,
                      k_slices=None, tc_fallback: bool = True, use_tc_pv: bool = False, sw: int = 5,
-                     sv: int = 3, pv_tier2: bool = True, exp2: str = "int", defer_scores=False):
+                     sv: int = 3, pv_tier2: bool = True, exp2: str = "int", defer_scores=False,
+                     col_fallback: int = 4):
     """numpy-level API. q: (R, d), k: (n, d), v: (n, dv) bf16 bits (uint16). Row r attends keys
     [0, kv_len[r]): causal, decode, prefill and chunked prefill all have this shape.
     Returns (out, flags); flagged rows are recomputed exactly when fallback=True."""
@@ -1444,7 +1549,7 @@ def attention_triton(q_bits, k_bits, v_bits, alpha, kv_len, out: str = "bf16", s
                          block_n=block_n, block_dv=block_dv, merge_order=merge_order, exp2_margin=exp2_margin,
                          sq=sq, k_tc=k_tc, tc_fallback=tc_fallback,
                          v_tc=tc_v_slices(v_bits, sv, dev) if use_tc_pv else None, sw=sw, pv_tier2=pv_tier2,
-                         exp2=exp2, defer_scores=defer_scores)
+                         exp2=exp2, defer_scores=defer_scores, col_fallback=col_fallback)
     flags = np.maximum(FL.amax(dim=(0, 2)).cpu().numpy(), OF.amax(dim=1).cpu().numpy()).astype(np.uint8)
     o = OUT.cpu().numpy()
     res = (o.astype(np.uint32).view(np.float32) if out == "fp32" else (o & 0xFFFF).astype(np.uint16)).copy()

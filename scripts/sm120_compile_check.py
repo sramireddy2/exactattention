@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 BASE = dict(D=128, DV=128, BLOCK_M=16, BLOCK_N=64, BLOCK_DV=32, EXP2_MARGIN=2.0 ** -26, USE_TC=True,
             SQ=4, SK=4, TC_FALLBACK=True, USE_TC_PV=True, SW=5, SV=3, RERUN=False, PACK=1, RESET_CNT=True,
-            EXP2_INT=True, TIMERS=False, DEFER=False, DEFER_SPLIT=False, num_warps=4)
+            EXP2_INT=True, TIMERS=False, DEFER=False, DEFER_SPLIT=False, COLMAX=4, num_warps=4)
 INT64 = dict(USE_TC=False, USE_TC_PV=False, BLOCK_N=16, RESET_CNT=False)
 TC = dict(USE_TC_PV=False, BLOCK_N=16, RESET_CNT=False)
 DECODE = dict(BLOCK_M=2, PACK=8)
@@ -41,6 +41,8 @@ CONFIGS = {
     "tcpv m16 32/4": {},
     "tcpv m16 128/8": {"BLOCK_DV": 128, "num_warps": 8},     # verify steps (T = 8: 16 rows)
     "tcpv m16 128/8 q3": {"BLOCK_DV": 128, "num_warps": 8, "SQ": 3},
+    # Uncertified score tiles recomputed whole, not by key column (DESIGN D30).
+    "tcpv m16 128/8 whole": {"BLOCK_DV": 128, "num_warps": 8, "COLMAX": 0},
     # The diagnostic phase-clock build (DESIGN D26), as profile_step runs it.
     "tcpv m2 128/8 timers": {**DECODE, "BLOCK_DV": 128, "num_warps": 8, "TIMERS": True},
     "tcpv m16 128/8 timers": {"BLOCK_DV": 128, "num_warps": 8, "TIMERS": True},
@@ -77,6 +79,7 @@ def kernel_config(over):
         cfg.update(SW=1, SV=1)
     cfg["ANCH"] = 7 * cfg["SW"] + 7 * cfg["SV"] + (cfg["BLOCK_N"] - 1).bit_length()
     cfg["WDC"] = max(1, min(cfg["D"], (512 * nw) // (cfg["BLOCK_M"] * cfg["BLOCK_N"])))
+    cfg.setdefault("CDC", max(1, min(cfg["D"], (512 * nw) // cfg["BLOCK_M"])))
     cfg["FL_DIV"] = 1
     return cfg, nw, ns
 
