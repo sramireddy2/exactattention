@@ -1542,6 +1542,38 @@ The rest of the loop is 53% of program time, and the prologue (q slicing, first 
 12%. The score fallback no longer matters. Tier 2 is 0.062 ms for 2 work items, 15% of the
 step.
 
+## D31. What the key loop waits on: Nsight Compute
+
+The phase clocks put 53% of verify B=1 16K's tier-1 program time in the key loop, outside the
+four timed phases. They cannot say which loads that is, or whether DRAM, L2 or latency is the
+limit. A rough count says it is not DRAM bandwidth:
+- Per 64-key tile, tier 1 reads 4 K digit planes (32 KB), 3 V digit planes (24 KB) and the
+  V-lost mask (8 KB), about 64 KB.
+- For the step's 8 KV heads × 16K keys, that is about 128 MB in 0.314 ms: about 0.4 TB/s, a
+  fraction of the card's DRAM bandwidth.
+- FlashInfer reads 64 MB of bf16 K and V. That fits in the 128 MB L2 across steps.
+
+`scripts/ncu_step.py` runs Nsight Compute 2025.2 on one step per case. It is free with PACE's
+NVHPC 25.5 module tree. It profiles the step's two split-kernel launches (tier 1, tier 2), on
+decode B=1 16K, verify B=1 16K, verify B=8 4K and decode B=8 16K. It records:
+- duration, DRAM, L2 and L1 throughput, DRAM bytes read, and the hit rates;
+- achieved occupancy, registers, warp cycles per issued instruction, and scheduler stats;
+- the sampled warp-stall breakdown;
+- the 20 SASS lines with the most stall samples.
+
+The cache is not flushed between replay passes (`--cache-control none`), so L2 holds what
+earlier passes left, as in a decode loop. Raw reports (`.ncu-rep`) and CSVs stay in the run
+directory. `EA_PLAN=ncu` runs only the environment stage and this one.
+
+What each answer would point to:
+- **Long-scoreboard stalls on the digit-plane loads, low DRAM throughput:** latency with one
+  program per SM. Deeper pipelining of the K and V planes, or fewer bytes per key (packing the
+  V-lost mask into bits: 8 KB → 1 KB per tile).
+- **DRAM throughput near peak:** bytes. Cut the planes read per tile.
+- **Barrier or MMA-wait stalls:** the tile's own dependency chain, not memory.
+- **A large prologue share in the hot lines:** q slicing per program, which is repeated per KV
+  split.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model

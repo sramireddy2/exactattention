@@ -62,7 +62,9 @@ STAGES=(
 # ~/.cache/flashinfer, which persists across jobs, so a preempted warmup is not lost.
 BF="python scripts/bench_vs_flashinfer.py"
 # EA_PLAN=profile: the same environment, but only the step profile (DESIGN D29).
-if [ "${EA_PLAN:-gpu_check}" = "flash" ] || [ "${EA_PLAN:-gpu_check}" = "profile" ]; then
+# EA_PLAN=ncu: the environment and Nsight Compute on one step per case (DESIGN D31). ncu 2025.2
+# comes free with PACE's NVHPC 25.5 module tree; EA_NCU overrides the path.
+if [ "${EA_PLAN:-gpu_check}" = "flash" ] || [ "${EA_PLAN:-gpu_check}" = "profile" ] || [ "${EA_PLAN:-gpu_check}" = "ncu" ]; then
   # The comparison is on the RTX PRO 6000 (sm_120), never an L40S. Submission adds gpu-v100 to
   # any -p list, so pin the GPU type in the gres as well.
   PART="-p gpu-rtxpro-blackwell --gres=gpu:rtx_pro_6000_blackwell:1"
@@ -85,6 +87,11 @@ if [ "${EA_PLAN:-gpu_check}" = "flash" ] || [ "${EA_PLAN:-gpu_check}" = "profile
   )
   if [ "$EA_PLAN" = "profile" ]; then
     STAGES=("${STAGES[0]}" "${STAGES[-1]}")
+  fi
+  if [ "$EA_PLAN" = "ncu" ]; then
+    NCU="${EA_NCU:-/usr/local/pace-apps/manual/packages/nvhpc/25.5/Linux_x86_64/25.5/profilers/Nsight_Compute/ncu}"
+    STAGES=("${STAGES[0]}"
+            "ncu_steps|2700|python scripts/ncu_step.py --ncu $NCU --out $OUT/ncu_steps.md")
   fi
 fi
 
@@ -110,6 +117,7 @@ write_summary() {
     echo; cat "$OUT"/bench_n*.md 2>/dev/null | grep -E '^\| [0-9]' | sed 's/^/bench: /'
     for f in "$OUT"/decode_*.md "$OUT"/verify_*.md; do [ -f "$f" ] && { echo; tail -n +5 "$f"; }; done
     [ -f "$OUT/profile_steps.md" ] && { echo; tail -n +5 "$OUT/profile_steps.md"; }
+    [ -f "$OUT/ncu_steps.md" ] && { echo; tail -n +3 "$OUT/ncu_steps.md"; }
   } > "$OUT/summary.md"
 }
 
