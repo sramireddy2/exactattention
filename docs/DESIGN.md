@@ -1491,6 +1491,57 @@ Expected: verify B=1 16K's tier 1 should fall from 0.565 ms toward the 0.307 ms 
 no score recompute at all (D28). Decode should gain a little: its 22 or 154 lossy keys each
 cost a whole-tile recompute.
 
+**Run 1128** (9e41d4e). All checks passed:
+- the GPU test segments;
+- the Qwen3 fixture head, bit-identical (ALL MATCH, 0 fallback rows);
+- the timers build, whose output bits equal the plain build's in every profile case;
+- 0 uncertified rows in every benchmark cell.
+
+At q4, every windowed tile took the column path, with no whole-tile recompute: 22, 22, 34 and
+154 tiles of one column each. At q3, 1024 of 1033 tiles took the whole-tile path, as designed.
+
+Tier-1 split kernel (profile, ms). Run 1126's plain build is the "before":
+
+| case | run 1126 | run 1128 |
+|---|---|---|
+| decode B=1 16K | 0.155 | 0.128 |
+| decode B=8 16K | 0.913 | 0.843 |
+| verify B=1 16K | 0.565 | 0.314 |
+| verify B=8 4K | 0.714 | 0.568 |
+
+A program with a fallback tile now takes 113 µs against 107 µs without one, for verify B=1
+16K. In run 1127 such a tile alone cost about 200 µs.
+
+Whole step in the same run (bench, CUDA graph, 128/8 n64 q4; default against "w", the
+whole-tile recompute):
+
+| case | 1K | 4K | 16K | 64K |
+|---|---|---|---|---|
+| verify B=1 | 0.111 / 0.275 | 0.121 / 0.284 | 0.432 / 0.652 | |
+| verify B=8 | 0.220 / 0.460 | 0.675 / 0.804 | 2.075 / 2.352 | |
+| decode B=1 | 0.041 / 0.061 | 0.047 / 0.068 | 0.146 / 0.173 | 0.467 / 0.508 |
+| decode B=8 | 0.076 / 0.086 | 0.262 / 0.291 | 0.851 / 0.916 | |
+| decode B=32 | 0.337 / 0.362 | 1.118 / 1.153 | 4.129 / 4.201 | |
+
+The best exact config against FlashInfer is now:
+- verify B=1: 9.1×, 8.8× and 19.5× at 1K, 4K and 16K (0.078, 0.110 and 0.404 ms);
+- decode B=1: 3.6×, 4.5×, 7.3× and 2.4× at 1K to 64K.
+
+**Where verify B=1 16K's tier 1 goes now.** Its 512 programs run one per SM (255 registers)
+in about 2.7 waves. The SMs are busy 88% of the launch span. Per 64-key tile:
+
+| part | µs |
+|---|---|
+| scores | 1.5 |
+| weights | 1.8 |
+| tile partial | 4.5 |
+| merge | 1.3 |
+| rest of the loop (load waits) | 14.5 |
+
+The rest of the loop is 53% of program time, and the prologue (q slicing, first loads) another
+12%. The score fallback no longer matters. Tier 2 is 0.062 ms for 2 work items, 15% of the
+step.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
