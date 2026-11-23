@@ -7,7 +7,8 @@ profiles the step's two split-kernel launches (tier 1 and tier 2) and reports:
 - duration, DRAM / L2 / L1 throughput, bytes read from DRAM, L1 and L2 hit rates;
 - achieved occupancy, registers, warp cycles per issued instruction;
 - the warp-stall breakdown (sampled, per issued instruction);
-- the SASS instructions with the most stall samples, and their stall reasons.
+- per launch, stall samples by SASS opcode, the float64 share, and the hottest lines with
+  their main stall reasons.
 
 The cache is not flushed between replay passes (--cache-control none), as in a decode loop where
 the previous step leaves data in L2. Kernel replay saves and restores device memory, so L2
@@ -23,6 +24,7 @@ import argparse
 import csv
 import io
 import os
+import re
 import subprocess
 import sys
 import time
@@ -77,10 +79,10 @@ def csv_rows(text):
     return list(csv.reader(io.StringIO("\n".join(lines))))
 
 
-def run(cmd, timeout):
+def run(cmd, timeout, env=None):
     t0 = time.time()
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
         return r.returncode, r.stdout, r.stderr, time.time() - t0
     except subprocess.TimeoutExpired as ex:
         return -1, ex.stdout or "", f"timeout after {timeout}s", time.time() - t0
@@ -123,19 +125,58 @@ def raw_metrics(text):
     return out
 
 
-def source_hot(text, top=20):
-    """The SASS lines with the most warp-stall samples, from --page source --print-source sass."""
-    rows = csv_rows(text)
-    if not rows:
-        return [], []
-    h = rows[0]
-    samp = next((k for k in h if k.startswith("Warp Stall Sampling (All")), None)
-    if samp is None:
-        return h, []
-    si = h.index(samp)
-    body = [r for r in rows[1:] if len(r) == len(h) and fnum(r[si]) is not None]
-    body.sort(key=lambda r: -fnum(r[si]))
-    return h, body[:top]
+REASONS = ["barrier", "branch_resolving", "dispatch", "drain", "lg", "long_sb", "math", "membar", "mio", "misc",
+           "no_inst", "not_selected", "selected", "short_sb", "sleep", "tex", "wait"]
+F64 = re.compile(r"\b(DFMA|DADD|DMUL|DSETP|DMNMX)\b|\.F64\b")
+
+
+def source_report(text, top=20):
+    """Markdown from --page source --print-source sass (one CSV block per launch, each opened by a
+    "Kernel Name" line): per launch, stall samples by opcode, the float64 share, and the hottest
+    lines with their main stall reasons. Launch 1 is tier 1."""
+    blocks, cur = [], None
+    for r in csv_rows(text):
+        if r and r[0] == "Kernel Name":
+            cur = {"h": None, "rows": []}
+            blocks.append(cur)
+        elif cur is not None and cur["h"] is None:
+            cur["h"] = r
+        elif cur is not None:
+            cur["rows"].append(r)
+    out = []
+    for k, b in enumerate(blocks):
+        h = b["h"] or []
+        if "Warp Stall Sampling (All Samples)" not in h:
+            continue
+        si, ie = h.index("Warp Stall Sampling (All Samples)"), h.index("Instructions Executed")
+        ri = {x: h.index("stall_" + x) for x in REASONS if "stall_" + x in h}
+        rows = [r for r in b["rows"] if len(r) == len(h)]
+
+        def val(r, i):
+            return fnum(r[i]) or 0.0
+        tot = sum(val(r, si) for r in rows)
+        totx = sum(val(r, ie) for r in rows) or 1.0
+        if tot < 1:
+            continue
+        ops, opx = {}, {}
+        for r in rows:
+            m = re.match(r"\s*(@!?U?P\w+\s+)?([A-Z0-9_]+)", r[1])
+            o = m.group(2) if m else "?"
+            ops[o] = ops.get(o, 0.0) + val(r, si)
+            opx[o] = opx.get(o, 0.0) + val(r, ie)
+        f64 = sum(val(r, si) for r in rows if F64.search(r[1]))
+        out += [f"Launch {k + 1} ({'tier 1' if k == 0 else 'tier 2'}) SASS: {len(rows)} lines, {tot:.0f} stall "
+                f"samples; float64 instructions hold {100 * f64 / tot:.1f}% of them.", "",
+                "| opcode | stall samples | instructions |", "|---|---|---|"]
+        for o, v in sorted(ops.items(), key=lambda x: -x[1])[:15]:
+            out.append(f"| {o} | {100 * v / tot:.1f}% | {100 * opx[o] / totx:.1f}% |")
+        out += ["", "| samples | executed | SASS | main stalls |", "|---|---|---|---|"]
+        for r in sorted(rows, key=lambda r: -val(r, si))[:top]:
+            rs = sorted(((x, val(r, i)) for x, i in ri.items()), key=lambda x: -x[1])[:2]
+            why = ", ".join(f"{x} {100 * v / max(val(r, si), 1):.0f}%" for x, v in rs if v > 0)
+            out.append(f"| {100 * val(r, si) / tot:.1f}% | {int(val(r, ie))} | `{r[1].strip()[:60]}` | {why} |")
+        out.append("")
+    return out
 
 
 def main():
@@ -171,10 +212,13 @@ def main():
             print("\n".join(lines[-30:]), flush=True)
             open(a.out, "w").write("\n".join(lines) + "\n")
             continue
+        # Imports in a clean environment: under the job's venv and module paths, ncu's embedded
+        # Python (its rules, the source page) fails with an ImportError (run 1129).
         imp = [a.ncu, "--import", rep + ".ncu-rep", "--csv"]
-        _, det, _, _ = run(imp + ["--page", "details"], 300)
-        _, raw, _, _ = run(imp + ["--page", "raw"], 300)
-        _, src, srcerr, _ = run(imp + ["--page", "source", "--print-source", "sass"], 600)
+        env = {"HOME": os.environ.get("HOME", "/tmp"), "PATH": "/usr/bin:/bin"}
+        _, det, _, _ = run(imp + ["--page", "details"], 300, env)
+        _, raw, _, _ = run(imp + ["--page", "raw"], 300, env)
+        _, src, srcerr, _ = run(imp + ["--page", "source", "--print-source", "sass"], 600, env)
         open(rep + "_details.csv", "w").write(det)
         open(rep + "_raw.csv", "w").write(raw)
         open(rep + "_source.csv", "w").write(src)
@@ -196,18 +240,8 @@ def main():
                       "| reason | cycles | share |", "|---|---|---|"]
             lines += [f"| {r} | {v:.2f} | {100 * v / tot:.0f}% |" for r, v in st if v >= 0.005]
             lines.append("")
-        h, hot = source_hot(src)
-        if hot:
-            want = [c for c in h if c in ("Address", "Source") or c.startswith("Warp Stall Sampling")]
-            cols = [h.index(c) for c in want]
-            lines += ["Hottest SASS lines (both launches, by warp-stall samples):", "",
-                      "| " + " | ".join(want) + " |", "|" + "---|" * len(want)]
-            for r in hot:
-                lines.append("| " + " | ".join(r[i].replace("|", "/")[:90] for i in cols) + " |")
-            lines.append("")
-        else:
-            lines += [f"No source-page samples ({(srcerr.strip().splitlines() or ['no output'])[-1][:200]}); "
-                      f"source columns: {', '.join(h[:12])}", ""]
+        sr = source_report(src)
+        lines += sr or [f"No source-page samples ({(srcerr.strip().splitlines() or ['no output'])[-1][:200]}).", ""]
         print("\n".join(lines[-60:]), flush=True)
         open(a.out, "w").write("\n".join(lines) + "\n")      # after every case: a timeout keeps the rest
     open(a.out, "w").write("\n".join(lines) + "\n")

@@ -1574,6 +1574,52 @@ What each answer would point to:
 - **A large prologue share in the hot lines:** q slicing per program, which is repeated per KV
   split.
 
+**Run 1129-ncu** (259b6a5). ncu could read the GPU counters on embers, and all 4 cases
+profiled, with 0 uncertified and 0 wrong. ncu runs at its locked base clock, 1.85 GHz instead
+of about 2.33, so durations are about 1.3× the benchmark's.
+
+Two exports failed inside the job: the details page and the source page. ncu's embedded Python
+hit an ImportError under the job's venv and module paths. Re-importing the saved reports on the
+login node with a clean environment worked, and `ncu_step.py` now imports that way.
+
+Tier 1, verify B=1 16K (418 µs under ncu):
+- **Memory is not the limit.** DRAM throughput is 30% (483 GB/s), the L2 hit rate 76%, and
+  SM throughput 25%.
+- **Latency is.** One block per SM, limited by 255 registers and 84 KB of shared memory, gives
+  2 warps per scheduler. Only 0.26 of them are eligible on average, so 81% of cycles issue
+  nothing. A warp waits 10.6 cycles per issued instruction.
+- **Stall reasons:** short scoreboard 33%, long scoreboard 16%, fixed-latency wait 15%,
+  math-pipe throttle 7%, barrier 6%.
+
+Where the stalls are, from the source page's samples:
+- **float64 work: about 21% of tier 1's stall samples** (float64 instructions and their
+  selects). sm_120 runs float64 at a small fraction of float32 speed, and these are
+  short-scoreboard waits.
+  - 9.3% is per tile, run once per warp per tile: `_l1_ceil(kl1s)`, the integer bound on each
+    key's slicing error, recomputed in float64 on every tile from the stored float64 L1 norm.
+  - 11.8% is per program: q's L1 norm in `_slice_q`, a float64 sum over 128 channels per row,
+    plus its ceiling. It is redone by every KV split's program: 64 times for the same rows here.
+  - 1.4% is the float64 exp2 fallback (133 tiles).
+- **Spills:** STL and LDL hold 6.4% of samples (76–160 B of spill).
+- **Tensor-core waits:** IMMA holds 7%.
+- **The rest is the int64 arithmetic.** IADD, SHF, SEL and LOP3 together are 44% of the
+  instructions issued.
+
+Decode B=8 16K (898 µs) is different. L2 hits only 24%. The stalls are fixed-latency wait 19%,
+long scoreboard 17%, short scoreboard 14% and LSU throttle 10%. One instruction holds 11% of
+all samples: an `ISETP` per tile waiting on a global load (long scoreboard). The many 8-byte
+`LDGSTS.E.64` copies add LSU throttle. float64 is only 3% here: a 2-row block spreads the
+per-key work over fewer rows.
+
+Tier 2 is tiny in decode (2.7 µs). In verify B=1 16K it takes 70 µs under ncu, waiting mostly on
+short scoreboard and fixed latency.
+
+Next (D32): take float64 out of the hot path.
+- Store each key's integer L1 ceiling and its too-big bit when the cache is written. These are
+  the same values `_l1_ceil` computes, so outputs and flags are unchanged.
+- Bound q's L1 norm in integers instead of float64. Each element is an int8-range mantissa
+  shifted by at most 7 × sq bits, so the exact integer sum fits int64.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
