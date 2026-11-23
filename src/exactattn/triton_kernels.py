@@ -35,6 +35,8 @@ from .slices import slice_rows
 
 NEG = tl.constexpr(-(1 << 60))  # "empty" sentinel for reference exponents
 NEG32 = tl.constexpr(-(1 << 30))  # the same, for exponents held in int32 (DESIGN D21)
+QF = tl.constexpr(20)  # fraction bits of _slice_q's integer |q|_1 bound (DESIGN D32)
+QF_ULP = tl.constexpr((1 << 20) - 1)  # 2^QF - 1, for rounding up
 _LAST_DEBUG: dict = {}  # last call's intermediate buffers, for debugging
 SCORE_FS = 63 - 1 - 7  # d <= 128
 _L31 = tl.constexpr(EXP2_L31)
@@ -357,7 +359,8 @@ def _slot_err(R, PACK: tl.constexpr, BM: tl.constexpr, SW: tl.constexpr, SHA: tl
 def _slice_q(qm, qe, SQ: tl.constexpr, PACK: tl.constexpr, BM: tl.constexpr, D: tl.constexpr):
     """slices.slice_rows for the program's q rows, in registers (same digits as the numpy and
     torch slicers). Done once per program, so a decode step needs no separate slicing launches.
-    Returns up to 4 packed digit groups (_q_group; unused ones are zeros), lsb, l1 * 2^-lsb, lost."""
+    Returns up to 4 packed digit groups (_q_group; unused ones are zeros), lsb, an integer upper
+    bound on |q|_1 * 2^-lsb, lost."""
     am = tl.abs(qm)
     nz = am != 0
     lead = tl.where(nz, qe + _bitlen(am) - 1, NEG)
@@ -378,30 +381,31 @@ def _slice_q(qm, qe, SQ: tl.constexpr, PACK: tl.constexpr, BM: tl.constexpr, D: 
         q2 = _q_group(fix, neg, 2, PACK, BM, D, SQ)
     if NG > 3:
         q3 = _q_group(fix, neg, 3, PACK, BM, D, SQ)
-    l1 = tl.sum(am.to(tl.float64) * tl.exp2(qe.to(tl.float64)), axis=1) * (1.0 + 2.0 ** -40)
-    l1s = tl.where(l1 > 0, l1 * tl.exp2(-tl.minimum(tl.maximum(lsb, -1000), 1000).to(tl.float64)), 0.0)
+    # |q|_1 * 2^-lsb, rounded up to an integer, in integer arithmetic (DESIGN D32): each element
+    # am * 2^(qe - lsb) in fixed point with QF fraction bits, the tiny ones rounded up to one
+    # unit. Each is below 2^(7 SQ + QF) and D <= 128 of them sum below 2^(7 SQ + QF + 7) <= 2^55.
+    # The result is at most ceil(|q|_1 2^-lsb + D 2^-QF), never more than the float64 bound it
+    # replaces, so no score that bound certified becomes uncertified.
+    sh = qe - lsb[:, None] + QF
+    up = am << tl.minimum(tl.maximum(sh, 0), 62)
+    dn = ((am - 1) >> tl.minimum(tl.maximum(-sh, 0), 63)) + 1                 # ceil(am 2^sh), am >= 1
+    term = tl.where(nz, tl.where(sh >= 0, up, dn), 0)
+    qerr = (tl.sum(term, axis=1) + QF_ULP) >> QF
     qlost = tl.max(lost.to(tl.int32), axis=1) != 0
-    return q0, q1, q2, q3, lsb, l1s, qlost
+    return q0, q1, q2, q3, lsb, qerr, qlost
 
 
 @triton.jit
-def _l1_ceil(l1s):
-    """(ceil(l1s * (1 + 2^-40)) + 1 or 0, too big): an integer upper bound on a scaled L1 norm."""
-    big = l1s > 2.0 ** 59
-    e = tl.where(l1s > 0, tl.ceil(tl.minimum(l1s, 2.0 ** 59) * (1.0 + 2.0 ** -40)) + 1.0, 0.0).to(tl.int64)
-    return e, big
-
-
-@triton.jit
-def _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nmask, KST, KLSB, KL1S, KLOST,
+def _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nmask, KST, KLSB, KERR, KLOST,
                AM, AE, D: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr, PACK: tl.constexpr,
                BM: tl.constexpr):
     """Certified t = RN32(alpha * q.k) from int8 slices (slices.py) on tensor cores.
 
     q.k = 2^(qlsb + klsb) * (sum_{s,t} 2^(7(s+t)) Q[s].K[t] + truncation), where each Q[s].K[t] is
     an exact int8 x int8 -> int32 MMA (PACK q digits share one MMA, _q_group). The truncation
-    bound comes from per-row L1 norms, stored pre-scaled (l1 * 2^-lsb); q's arrives as an
-    integer ceiling (qerr, qbig from _l1_ceil). KX and the per-key pointers start at the segment,
+    bound comes from per-row L1 norms scaled by 2^-lsb, as integer ceilings: K's (KERR, with the
+    too-big bit 4 of KLOST) made at cache write, q's (qerr, qbig) by _slice_q. KX and the
+    per-key pointers start at the segment,
     nn is int32 within it and KST is the digit-plane stride (int64 scalar), so the per-element
     address math is 32-bit. Returns (t, uncertified, key has NaN/inf)."""
     NG: tl.constexpr = (SQ + PACK - 1) // PACK
@@ -465,13 +469,14 @@ def _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nmask, KST, KLSB
             if NG > 3:
                 acc += _slot_sum(tl.dot(q3, kt, out_dtype=tl.int32), 3, PACK, BM, 0, SQ, 7 * t_)
     klsb = tl.load(KLSB + nn, mask=nmask, other=0)
-    kl1s = tl.load(KL1S + nn, mask=nmask, other=0.0)
+    kerr = tl.load(KERR + nn, mask=nmask, other=0)
     kw = tl.load(KLOST + nn, mask=nmask, other=0)
     klost = (kw & 1) != 0
     kbad = (kw & 2) != 0
+    kbig = (kw & 4) != 0
     # Truncation bound qlost*|K|_1 + klost*|q|_1 (pre-scaled), as the sum of per-key and per-row
-    # integer ceilings, so the (row, key) work is integer: float64 only on (N,) per tile.
-    kerr, kbig = _l1_ceil(kl1s)
+    # integer ceilings, so it is all integer work. The key ceilings are made at cache write
+    # (DESIGN D32): on sm_120 the float64 ceiling here cost 9% of tier 1's stall samples.
     err = tl.where(qlost[:, None], kerr[None, :], 0) + tl.where(klost[None, :], qerr[:, None], 0)
     base = qlsb[:, None] + klsb[None, :]
     big = (qlost[:, None] & kbig[None, :]) | (klost[None, :] & qbig[:, None])
@@ -731,7 +736,7 @@ def _smid(dep):
 def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
                    PR, PZ, PZE, PNR, PN, PNE, FLAG,
                    SPLIT_LEN, FZ, FN,
-                   KX, KLSB, KL1S, KLOST, NKEYS, VX, VLSB, VLOST, VBAD,
+                   KX, KLSB, KERR, KLOST, NKEYS, VX, VLSB, VLOST, VBAD,
                    R_SEG, NK_SEG, NRB, FL_NCB, TM, DFL,
                    D: tl.constexpr, DV: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                    BLOCK_DV: tl.constexpr, FS: tl.constexpr, EXP2_MARGIN: tl.constexpr,
@@ -775,7 +780,7 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
     V += kb0 * DV
     KX += kb0 * D
     KLSB += kb0
-    KL1S += kb0
+    KERR += kb0
     KLOST += kb0
     VX += kb0 * DV
     VLSB += kb0
@@ -793,8 +798,8 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
         # Rows with a tensor-core score left uncertified (DESIGN D28): tier 2 recomputes them.
         dfl = tl.zeros((BLOCK_M,), tl.int32)
     if USE_TC:
-        q0, q1, q2, q3, qlsb, ql1s, qlost = _slice_q(qm, qe, SQ, PACK, BLOCK_M, D)
-        qerr, qbig = _l1_ceil(ql1s)
+        q0, q1, q2, q3, qlsb, qerr, qlost = _slice_q(qm, qe, SQ, PACK, BLOCK_M, D)
+        qbig = qerr < 0                                       # never: qerr < 2^35 (_slice_q)
     PRr = tl.full((BLOCK_M,), NEG, tl.int64)
     PZr = tl.zeros((BLOCK_M,), tl.int64)
     PZEr = tl.zeros((BLOCK_M,), tl.int64)
@@ -823,7 +828,7 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
             # only for tiles that contain an uncertified score (windowed recompute); NaN/inf
             # keys come from a flag made at cache write.
             t, unc, kbad = _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nn < kmax, KST,
-                                      KLSB, KL1S, KLOST, AM, AE, D, SQ, SK, PACK, BLOCK_M)
+                                      KLSB, KERR, KLOST, AM, AE, D, SQ, SK, PACK, BLOCK_M)
             flag = tl.maximum(flag, tl.max((vis & kbad[None, :]).to(tl.int32), axis=1))
             if TIMERS:
                 # Where the uncertified scores sit, before any fallback (DESIGN D29).
@@ -1033,7 +1038,7 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
 def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                      PR, PZ, PZE, PNR, PN, PNE, FLAG,
                      SPLIT_LEN, FZ, FN,
-                     KX, KLSB, KL1S, KLOST, NKEYS, VX, VLSB, VLOST, VBAD,
+                     KX, KLSB, KERR, KLOST, NKEYS, VX, VLSB, VLOST, VBAD,
                      R_SEG, NK_SEG, NRB, FL_NCB, CNT, WL, NCCB, TM, DFL, NEED,
                      D: tl.constexpr, DV: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                      BLOCK_DV: tl.constexpr, FS: tl.constexpr, EXP2_MARGIN: tl.constexpr,
@@ -1060,7 +1065,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                 go = (tl.load(NEED + item) != 2) | (tl.load(DFL + pid_s * ROWS + item // NCCB) != 0)
             if go:
                 _split_program(item // NCCB, pid_s, item % NCCB, Q, K, V, KVLEN, ROWS, AM, AE, PR, PZ, PZE, PNR, PN, PNE,
-                               FLAG, SPLIT_LEN, FZ, FN, KX, KLSB, KL1S, KLOST, NKEYS, VX, VLSB, VLOST, VBAD, R_SEG, NK_SEG,
+                               FLAG, SPLIT_LEN, FZ, FN, KX, KLSB, KERR, KLOST, NKEYS, VX, VLSB, VLOST, VBAD, R_SEG, NK_SEG,
                                NRB,
                                FL_NCB, TM, DFL, D, DV, BLOCK_M, BLOCK_N, BLOCK_DV, FS, EXP2_MARGIN, USE_TC, SQ, SK,
                                TC_FALLBACK, USE_TC_PV, SW, SV, ANCH, RERUN, PACK, EXP2T, EXP2_INT, WDC, FL_DIV, False,
@@ -1071,7 +1076,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
             if (tl.program_id(0) == 0) & (pid_s == 0) & (tl.program_id(2) == 0):
                 tl.store(CNT, 0)
         _split_program(tl.program_id(0), pid_s, tl.program_id(2), Q, K, V, KVLEN, ROWS, AM, AE, PR, PZ, PZE, PNR, PN,
-                       PNE, FLAG, SPLIT_LEN, FZ, FN, KX, KLSB, KL1S, KLOST, NKEYS, VX, VLSB, VLOST, VBAD, R_SEG, NK_SEG, NRB,
+                       PNE, FLAG, SPLIT_LEN, FZ, FN, KX, KLSB, KERR, KLOST, NKEYS, VX, VLSB, VLOST, VBAD, R_SEG, NK_SEG, NRB,
                        FL_NCB, TM, DFL, D, DV, BLOCK_M, BLOCK_N, BLOCK_DV, FS, EXP2_MARGIN, USE_TC, SQ, SK,
                        TC_FALLBACK, USE_TC_PV, SW, SV, ANCH, RERUN, PACK, EXP2T, EXP2_INT, WDC, FL_DIV, TIMERS, DEFER,
                        COLMAX, CDC)
@@ -1180,19 +1185,36 @@ def _bad_np(bits: np.ndarray) -> np.ndarray:
     return ((np.asarray(bits, dtype=np.uint16) >> 7) & 0xFF) == 0xFF          # NaN or inf
 
 
+def _l1_ceil_host(l1s, xp):
+    """(ceil(l1s * (1 + 2^-40)) + 1 or 0, too big): the integer upper bound the score error
+    bound uses for a key, from its scaled L1 norm l1s = l1 * 2^-lsb (float64). xp is numpy or
+    torch. Made once at cache write (DESIGN D32); the same float64 operations the kernel did per
+    tile before, so the same integers."""
+    big = l1s > 2.0 ** 59
+    if xp is np:
+        e = np.where(l1s > 0, np.ceil(np.minimum(l1s, 2.0 ** 59) * (1.0 + 2.0 ** -40)) + 1.0, 0.0)
+        return e.astype(np.int64), big
+    e = torch.where(l1s > 0, torch.ceil(torch.clamp(l1s, max=2.0 ** 59) * (1.0 + 2.0 ** -40)) + 1.0,
+                    torch.zeros_like(l1s))
+    return e.to(torch.int64), big
+
+
 def _k_meta_np(X, lsb, l1, lost, bad, dev) -> list:
-    """Kernel format for sliced K rows: [X, lsb, l1 * 2^-lsb, lost | bad << 1]. The scaled L1 is
-    what the score error bound uses, and the NaN/inf bit spares the kernel a bf16 decode of K."""
+    """Kernel format for sliced K rows: [X, lsb, kerr, lost | bad << 1 | big << 2]. kerr is an
+    integer upper bound on l1 * 2^-lsb, what the score error bound uses (big: too large for it),
+    and the NaN/inf bit spares the kernel a bf16 decode of K."""
     lsb = lsb.astype(np.int64)
     with np.errstate(over="ignore", invalid="ignore"):
         l1s = np.where(l1 > 0, l1 * np.exp2(-lsb.astype(np.float64)), 0.0)
-    w = lost.any(axis=1).astype(np.int32) | (bad.any(axis=1).astype(np.int32) << 1)
+    kerr, big = _l1_ceil_host(l1s.astype(np.float64), np)
+    w = (lost.any(axis=1).astype(np.int32) | (bad.any(axis=1).astype(np.int32) << 1)
+         | (big.astype(np.int32) << 2))
     return [torch.from_numpy(np.ascontiguousarray(X)).to(dev), torch.from_numpy(lsb).to(dev),
-            torch.from_numpy(l1s.astype(np.float64)).to(dev), torch.from_numpy(w).to(dev)]
+            torch.from_numpy(kerr).to(dev), torch.from_numpy(w).to(dev)]
 
 
 def tc_slices(bits: np.ndarray, S: int, dev) -> list:
-    """int8 slices of K rows, as device tensors: [X, lsb, l1 * 2^-lsb, lost | NaN/inf << 1].
+    """int8 slices of K rows, as device tensors: [X, lsb, kerr, lost | NaN/inf << 1 | big << 2] (_k_meta_np).
     Done once when the KV cache is written. (q is sliced inside the kernel.)"""
     bad = _bad_np(bits)
     X, lsb, l1, lost = slice_rows(np.where(bad, 0, bits).astype(np.uint16), S)   # bad rows are flagged anyway
@@ -1257,8 +1279,10 @@ def tc_slices_device(bits: torch.Tensor, S: int) -> list:
     bad = _bad_dev(bits)
     X, lsb, l1, lost = _slice_rows_chunked(torch.where(bad, torch.zeros_like(bits), bits), S)
     l1s = torch.where(l1 > 0, l1 * torch.exp2(-lsb.clamp(-2000, 2000).to(torch.float64)), torch.zeros_like(l1))
-    w = lost.any(dim=1).to(torch.int32) | (bad.any(dim=1).to(torch.int32) << 1)
-    return [X, lsb, l1s, w]
+    kerr, big = _l1_ceil_host(l1s, torch)
+    w = (lost.any(dim=1).to(torch.int32) | (bad.any(dim=1).to(torch.int32) << 1)
+         | (big.to(torch.int32) << 2))
+    return [X, lsb, kerr, w]
 
 
 def tc_v_slices_device(v: torch.Tensor, S: int) -> list:

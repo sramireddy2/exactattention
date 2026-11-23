@@ -21,6 +21,7 @@ from exactattn import attention_row, default_alpha  # noqa: E402
 import triton.language as tl  # noqa: E402
 
 from exactattn.triton_kernels import _bitlen, _exp2_weight, _f32_bits, _ratio_round, _rescale, attention_triton  # noqa: E402
+from exactattn.triton_kernels import _decode_bf16, _slice_q  # noqa: E402
 from gen import KINDS, bf16  # noqa: E402
 
 
@@ -376,11 +377,67 @@ def test_device_q_slicing_matches_numpy(kind):
         got = tc_slices_device(torch.from_numpy(x.view(np.int16)).to(DEVICE), S)
         assert torch.equal(got[0].cpu(), ref[0]) and torch.equal(got[1].cpu(), ref[1])
         assert torch.equal(got[3].cpu(), ref[3])
-        assert torch.allclose(got[2].cpu(), ref[2], rtol=1e-12, atol=0)
+        # got[2] is the integer error bound made from l1 (DESIGN D32): a 1e-12 difference in l1
+        # can move its ceiling by one.
+        assert (got[2].cpu() - ref[2]).abs().max() <= 1
         vref = tc_v_slices(x, S, torch.device("cpu"))
         vgot = tc_v_slices_device(torch.from_numpy(x.view(np.int16)).to(DEVICE), S)
         for a_, b_ in zip(vgot, vref):
             assert torch.equal(a_.cpu(), b_)
+
+
+@triton.jit
+def _q_bound_probe(Q, LSB, ERR, D: tl.constexpr, BM: tl.constexpr, SQ: tl.constexpr):
+    r = tl.arange(0, BM)
+    dd = tl.arange(0, D)
+    qm, qe, _qb = _decode_bf16(tl.load(Q + r[:, None] * D + dd[None, :]))
+    _q0, _q1, _q2, _q3, lsb, qerr, _ql = _slice_q(qm, qe, SQ, 1, BM, D)
+    tl.store(LSB + r, lsb)
+    tl.store(ERR + r, qerr)
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("sq", [3, 4])
+def test_q_l1_bound_is_tight_integer(kind, sq):
+    """DESIGN D32: _slice_q bounds |q|_1 * 2^-lsb in integer arithmetic. The bound must be at
+    least the exact value's ceiling, at most one more, and never above the float64 bound it
+    replaced (ceil(l1 * 2^-lsb * (1 + 2^-40)) + 1, with l1 from slices.slice_rows), so nothing that
+    bound certified becomes uncertified."""
+    from fractions import Fraction
+    from math import ceil
+
+    import torch
+
+    from exactattn.slices import slice_rows
+
+    rng = np.random.default_rng(zlib.crc32(f"qbound/{kind}/{sq}".encode()))
+    D, BM = 128, 32
+    x = bf16(rng, (BM, D), kind)
+    x[3] = 0                                                  # all-zero row
+    x[5, :] = 0
+    x[5, 7] = 0x0001                                          # one subnormal element
+    x[6, 1:] = x[6, 1:] >> 2 & 0x00FF                         # one large element, the rest tiny
+    lsb_t = torch.empty(BM, dtype=torch.int64, device=DEVICE)
+    err_t = torch.empty(BM, dtype=torch.int64, device=DEVICE)
+    _q_bound_probe[(1,)](torch.from_numpy(x.view(np.int16)).to(DEVICE), lsb_t, err_t, D=D, BM=BM, SQ=sq)
+    lsb, err = lsb_t.cpu().numpy(), err_t.cpu().numpy()
+    _, lsb_np, l1_np, _ = slice_rows(x, sq)
+    for r in range(BM):
+        b = x[r].astype(np.int64)
+        ex, fr = (b >> 7) & 0xFF, b & 0x7F
+        if (ex == 0xFF).any():
+            continue                                          # NaN/inf rows are flagged, not bounded
+        am = np.where(ex != 0, fr | 0x80, fr)
+        e = np.where(ex != 0, ex - 134, -133)
+        if not am.any():
+            assert err[r] == 0, r
+            continue
+        assert lsb[r] == lsb_np[r], r
+        exact = sum(Fraction(int(a)) * Fraction(2) ** int(s - lsb[r]) for a, s in zip(am, e) if a)
+        c = ceil(exact)
+        old = ceil(float(l1_np[r]) * 2.0 ** -int(lsb[r]) * (1.0 + 2.0 ** -40)) + 1
+        assert c <= err[r] <= c + 1, (r, c, err[r])
+        assert err[r] <= old, (r, err[r], old)
 
 
 def test_chunked_slicing_equals_one_piece():

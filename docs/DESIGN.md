@@ -1620,6 +1620,46 @@ Next (D32): take float64 out of the hot path.
 - Bound q's L1 norm in integers instead of float64. Each element is an int8-range mantissa
   shifted by at most 7 × sq bits, so the exact integer sum fits int64.
 
+## D32. No float64 in the score error bound
+
+The score error bound is qlost·|K|₁ + klost·|q|₁, each scaled by 2^-lsb and rounded up to an
+integer. D31 found its two float64 parts holding about 21% of verify B=1 16K's tier-1 stall
+samples. Both are now integer.
+
+**Keys: made at cache write.** `tc_slices` and `tc_slices_device` used to store the scaled L1
+norm (float64), and every tile recomputed `ceil(l1s · (1 + 2^-40)) + 1` from it. The cache now
+stores that integer, `KERR` (int64), plus a too-big bit as bit 2 of the per-key flag word. It is
+computed by `_l1_ceil_host` with the same float64 operations, in numpy or torch to match the
+writer. So the kernel sees the same integers: outputs and flags are unchanged. Per tile the
+kernel loads 8 bytes per key either way, and no longer does any float64 work.
+
+**q: an integer bound in `_slice_q`.** It was a float64 sum of |q|·2^e over the row times
+(1 + 2^-40), then a float64 ceiling, plus 1. It is now exact fixed point:
+- Each element am·2^(e − lsb) is held with QF = 20 fraction bits. An element smaller than one
+  unit is rounded up to one unit.
+- An element is below 2^(7·sq + 20). 128 of them sum below 2^55.
+- The bound is the sum rounded up to an integer. That is the exact ceiling, or one more when
+  the round-ups cross an integer.
+
+It is never larger than the old float64 bound, which was at least the exact ceiling plus 1. A
+smaller error interval can only keep a certified score certified, with the same bits. So
+results can only gain certified scores, never lose them.
+
+`qbig` is now always false: the bound is below 2^35.
+
+Checks:
+- `test_q_l1_bound_is_tight_integer` (every input kind, sq 3 and 4) runs `_slice_q` in a probe
+  kernel. The bound must lie between the exact value's ceiling (in Python fractions) and one
+  more, and must not exceed the old float64 bound. The inputs include an all-zero row, a lone
+  subnormal, and one large element among tiny ones.
+- The device and numpy key slicers may differ by one in the stored bound. They already differed
+  in l1 by about 1e-12 relative (summation order).
+- All 25 builds in `sm120_compile_check` pass, with slightly less spilling: tcpv m16 128/8
+  880 B (was 936), m16 32/4 1232 B (was 1536).
+
+Expected: up to about a fifth fewer stall samples in verify B=1 16K's tier 1, part of it in
+every program's prologue. Decode gains less: its float64 share was 3%.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
