@@ -1660,6 +1660,65 @@ Checks:
 Expected: up to about a fifth fewer stall samples in verify B=1 16K's tier 1, part of it in
 every program's prologue. Decode gains less: its float64 share was 3%.
 
+**Run 1130** (65514ed). All checks passed:
+- the GPU test segments, on the second attempt (the first hit the stage timeout);
+- the Qwen3 fixture head, bit-identical (ALL MATCH, 0 fallback rows);
+- the timers build, whose output bits equal the plain build's in every profile case;
+- 0 uncertified rows in every default-config benchmark cell.
+
+Fallback counts are the same as run 1128's: 22, 22, 34 and 154 windowed tiles, each with one
+column, and the same float64 exp2 tiles. So the speedup comes from the bound's arithmetic
+alone.
+
+Tier-1 split kernel (profile, ms):
+
+| case | run 1126 | run 1128 | run 1130 |
+|---|---|---|---|
+| decode B=1 16K | 0.155 | 0.128 | 0.119 |
+| decode B=8 16K | 0.913 | 0.843 | 0.828 |
+| verify B=1 16K | 0.565 | 0.314 | 0.236 |
+| verify B=8 4K | 0.714 | 0.568 | 0.436 |
+
+Verify tier 1 is about 24% faster, more than the 21% float64 share of stall samples. Decode
+moves 2–7%, as expected from its 3% share.
+
+Verify B=1 16K per 64-key tile (µs), run 1128 → run 1130:
+
+| part | run 1128 | run 1130 |
+|---|---|---|
+| scores | 1.5 | 1.32 |
+| weights | 1.8 | 1.63 |
+| tile partial | 4.5 | 4.38 |
+| merge | 1.3 | 1.34 |
+| rest of the loop | 14.5 | 11.03 |
+| prologue (per program) | 12% of program | 2.04 (2.5%) |
+
+The program mean is 82 µs (was about 107). The prologue gain is q's L1 bound. Most of the
+per-tile gain shows up in "rest of the loop", where the float64 waits of the key bound landed.
+
+Whole step (bench, CUDA graph, 128/8 n64 q4), run 1128 → run 1130:
+
+| case | 1K | 4K | 16K | 64K |
+|---|---|---|---|---|
+| verify B=1 | 0.111 → 0.087 | 0.121 → 0.096 | 0.432 → 0.354 | |
+| verify B=8 | 0.220 → 0.172 | 0.675 → 0.555 | 2.075 → 1.762 | |
+| decode B=1 | 0.041 → 0.037 | 0.047 → 0.043 | 0.146 → 0.142 | 0.467 → 0.452 |
+| decode B=8 | 0.076 → 0.068 | 0.262 → 0.248 | 0.851 → 0.833 | |
+| decode B=32 | 0.337 → 0.313 | 1.118 → 1.058 | 4.129 → 3.962 | |
+
+The best exact config against FlashInfer is now:
+- verify B=1: 6.9×, 6.9× and 15.9× at 1K, 4K and 16K (0.058, 0.085 and 0.329 ms);
+- verify B=8: 8.8×, 12.3× and 4.5×;
+- decode B=1: 3.2×, 4.1×, 7.0× and 2.3× at 1K to 64K.
+
+What is left in verify B=1 16K's step (0.330 ms profiled):
+- tier 1 is 0.236 ms, and 54% of its program time is still the rest of the loop;
+- tier 2 is 0.056 ms for 2 work items, plus 0.015 ms to combine. Together that is 21% of the
+  step, up from 15%.
+
+Decode B=8 16K barely moved. D31 put its time in a per-tile `ISETP` waiting on a global load,
+with a 24% L2 hit rate, not in float64.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
