@@ -176,6 +176,54 @@ def test_tensor_core_pv_on_real_activations():
         r = int(rows[i])
         assert np.array_equal(got[i], attention_row(q[r], k[: r + 1], v[: r + 1, :32], alpha)), r
 
+@pytest.mark.parametrize("block_m", [16, 4, 2])
+def test_lost_v_rows_read_only_for_flagged_keys(block_m):
+    """DESIGN D33: tensor-core P·V reads a key's lost-V mask row only when bit 1 of its V flag
+    word is set; every other key's row is all zero. Forcing bit 1 on for every key (read every
+    row) must give the same bits, flags and partials. Clearing it everywhere hides the lost
+    elements, so the P·V error widths must change: the rows really are read through the bit.
+    block_m 16, 4 and 2 cover the kernel's three P·V layouts (PACK 1, several groups, one group)."""
+    import torch
+
+    from exactattn.triton_kernels import _LAST_DEBUG, launch, tc_slices, tc_v_slices
+
+    rng = np.random.default_rng(zlib.crc32(f"vlost/{block_m}".encode()))
+    d, dv, R, n = 64, 32, 8, 96
+    Q, K, V = bf16(rng, (R, d)), bf16(rng, (n, d)), bf16(rng, (n, dv))
+    V[::5, 3] = V[::5, 3] + (20 << 7)          # 2^20 x one element: the key's small elements lose bits
+    kv_len = rng.integers(n // 2, n + 1, size=R).astype(np.int32)
+    alpha = default_alpha(d)
+    dev = torch.device(DEVICE)
+
+    def t16(x):
+        return torch.from_numpy(np.ascontiguousarray(x).view(np.int16)).to(dev)
+
+    v_tc = tc_v_slices(V, 3, dev)
+    lost_keys = v_tc[2].cpu().numpy().any(axis=1)
+    assert 0 < lost_keys.sum() < n, lost_keys.sum()
+    assert np.array_equal((v_tc[3].cpu().numpy() >> 1) & 1, lost_keys.astype(np.int8))
+    k_tc = tc_slices(K, 4, dev)
+
+    def run(w):
+        vt = list(v_tc)
+        vt[3] = w
+        OUT, FL, OF = launch(t16(Q), t16(K), t16(V), torch.from_numpy(kv_len).to(dev), n, alpha, splits=2,
+                             block_m=block_m, block_n=32, block_dv=32, k_tc=k_tc, v_tc=vt, pv_tier2=False)
+        return [OUT.cpu(), FL.cpu(), OF.cpu(), _LAST_DEBUG["PN"].cpu().clone(), _LAST_DEBUG["PNE"].cpu().clone()]
+
+    base = run(v_tc[3])
+    every = run(v_tc[3] | 2)
+    for a_, b_ in zip(base, every):
+        assert torch.equal(a_, b_)
+    hidden = run(v_tc[3] & 1)
+    assert not torch.equal(base[4], hidden[4])
+    flags = np.maximum(base[1].amax(dim=(0, 2)).numpy(), base[2].amax(dim=1).numpy())
+    got = (base[0].numpy() & 0xFFFF).astype(np.uint16)
+    for r in np.flatnonzero(flags == 0):
+        L = int(kv_len[r])
+        assert np.array_equal(got[r], attention_row(Q[r], K[:L], V[:L], alpha)), r
+
+
 @pytest.mark.parametrize("mode", ["row", "split"])
 @pytest.mark.parametrize("case", ["all", "mixed"])
 @pytest.mark.parametrize("block_m", [16, 2])

@@ -547,8 +547,11 @@ def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, VBAD, nn, nmask, cc, VST, FN, DV: tl.co
     # The int32 MMA sums below are exact: a digit-product sum is below BN * 127^2, at most SV of
     # them share a weight, and a pair S_u + (S_(u+1) << 7) stays below 2^31.
     tl.static_assert(BN * 16129 * SV * 129 < 2147483648)
-    vl = tl.load(VLOST + nn[:, None] * DV + cc[None, :], mask=nmask[:, None], other=0)   # 0/1
-    vbad = tl.load(VBAD + nn, mask=nmask, other=0) != 0                   # (N,) key has a NaN/inf
+    vw = tl.load(VBAD + nn, mask=nmask, other=0)          # (N,) bit 0: NaN/inf, bit 1: a lost V element
+    vbad = (vw & 1) != 0
+    # Only keys with a lost element read their mask row (DESIGN D33): about 2% of keys, while the
+    # row is 128 of the key's ~1050 bytes. Any other key's row is all zero, as the masked load gives.
+    vl = tl.load(VLOST + nn[:, None] * DV + cc[None, :], mask=(nmask & ((vw & 2) != 0))[:, None], other=0)
     nlost = tl.sum(lw.to(tl.int32), axis=1).to(tl.int64)                   # (M,) lost weights
     if PACK == 1:
         # One slot per MMA. Weight digit j times V digit b has weight 7(j + b): products of equal
@@ -1289,19 +1292,22 @@ def tc_v_slices_device(v: torch.Tensor, S: int) -> list:
     """tc_v_slices for V rows already on the device."""
     bad = _bad_dev(v)
     X, lsb, _, lost = _slice_rows_chunked(torch.where(bad, torch.zeros_like(v), v), S)
-    return [X, lsb, lost.to(torch.int8).contiguous(), bad.any(dim=1).to(torch.int8).contiguous()]
+    w = bad.any(dim=1).to(torch.int8) | (lost.any(dim=1).to(torch.int8) << 1)
+    return [X, lsb, lost.to(torch.int8).contiguous(), w.contiguous()]
 
 
 def tc_v_slices(v_bits: np.ndarray, S: int, dev) -> list:
     """int8 slices of V rows for tensor-core P·V: [X (S, n, dv) int8, lsb (n,) int64,
-    lost (n, dv) int8 0/1, key has a NaN/inf (n,) int8]. Done once when the KV cache is written.
-    The lost plane is an MMA operand as stored; NaN/inf is per key, since flags are per row
-    (DESIGN D25)."""
+    lost (n, dv) int8 0/1, per-key flags (n,) int8]. Done once when the KV cache is written.
+    The lost plane is an MMA operand as stored. Flag bit 0: the key has a NaN/inf (per key, since
+    flags are per row, DESIGN D25). Bit 1: the key has a lost element, so the kernel reads only
+    those keys' lost rows (DESIGN D33)."""
     bad = _bad_np(v_bits)
     X, lsb, _, lost = slice_rows(np.where(bad, 0, v_bits).astype(np.uint16), S)
+    w = bad.any(axis=1).astype(np.int8) | (lost.any(axis=1).astype(np.int8) << 1)
     return [torch.from_numpy(np.ascontiguousarray(X)).to(dev), torch.from_numpy(lsb.astype(np.int64)).to(dev),
             torch.from_numpy(np.ascontiguousarray(lost.astype(np.int8))).to(dev),
-            torch.from_numpy(np.ascontiguousarray(bad.any(axis=1).astype(np.int8))).to(dev)]
+            torch.from_numpy(np.ascontiguousarray(w)).to(dev)]
 
 
 _EXP2_TABLES: dict = {}

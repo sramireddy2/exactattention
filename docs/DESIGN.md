@@ -1775,6 +1775,48 @@ are as rare as lossy keys (about 1.7e-4 of keys). The first step is to measure t
 the bench and fixture caches. Packing the mask into bits instead (128 B to 16 B per key)
 saves the same bytes, but needs an unpack before the MMA.
 
+## D33. Read a key's lost-V row only if it has a lost element
+
+The lost-V mask is one int8 (0 or 1) per V element: 128 B of the ~1050 B that tier 1 reads
+per key. Decode B=8 16K runs at 82% of DRAM throughput (D32), so these bytes cost time.
+
+**How rare are lost V elements?** With 3 V digits, measured with `slice_rows` at 3 digits:
+
+| V rows | lost elements | keys with one | 64-key tiles with one |
+|---|---|---|---|
+| bench (randn bf16, 262144 keys) | 1.3e-4 | 1.6% | 66% |
+| Qwen3 layer 0 head 0 (2048 keys) | 1.8e-4 | 1.5% | 53% |
+| Qwen3 layer 27 head 11 (2048 keys) | 1.9e-4 | 2.4% | 75% |
+
+So the per-tile skip proposed above would rarely fire: most tiles hold such a key. A per-key
+skip does fire: about 98% of keys have an all-zero row.
+
+**Change.** The V flag word (`VBAD`, one int8 per key) gains bit 1: the key has a lost element.
+It is made at cache write by `tc_v_slices` and `tc_v_slices_device`, with bit 0 still the
+NaN/inf bit. `_tc_pv` loads the flag word first, and loads a key's mask row only when bit 1 is
+set. The other rows come back as the masked load's 0, which is what they hold. So every MMA
+operand is unchanged: same bits, flags and partials. A predicated-off load moves no bytes, so
+the mask costs about 2.6 B per key instead of 128 (about 12% of tier 1's DRAM bytes).
+
+The mask row's load address now depends on the flag word's load. The plain build already
+issued the mask as a synchronous load (D32's `STS.U16` waiting on long scoreboard), so this
+adds no new wait.
+
+Check: `test_lost_v_rows_read_only_for_flagged_keys`, at block_m 16, 4 and 2, which are the
+three P·V layouts. One key in 5 has an element scaled by 2^20, which makes its small elements
+lose bits.
+- The stored bit 1 must equal "the row has a lost element".
+- Forcing bit 1 on for every key (read every row) must give the same output, flags, and P·V
+  partials N and their error widths.
+- Clearing bit 1 everywhere must change the error widths. This shows the rows really are read
+  through the bit.
+
+All 25 builds in `sm120_compile_check` pass. tcpv m16 128/8 spills 836 B (was 880); tcpv m2
+128/8 spills 68 B.
+
+Expected: decode B=8 16K tier 1 down by up to about 10% (0.828 ms), and decode B=32 likewise.
+B=1 decode runs at 60% of DRAM and gains less. Verify is latency-bound and should not change.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
