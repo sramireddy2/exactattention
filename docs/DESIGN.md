@@ -1719,6 +1719,62 @@ What is left in verify B=1 16K's step (0.330 ms profiled):
 Decode B=8 16K barely moved. D31 put its time in a per-tile `ISETP` waiting on a global load,
 with a 24% L2 hit rate, not in float64.
 
+**Run 1131-ncu** (3e71506): Nsight Compute again, on the D32 build, with the same 4 cases as
+run 1129. All 4 cases had 0 uncertified and 0 wrong. Durations are under ncu's locked clock.
+
+| tier 1 | run 1129 | run 1131 |
+|---|---|---|
+| verify B=1 16K: µs | 418 | 314 |
+| verify B=1 16K: DRAM throughput | 30% | 40% |
+| verify B=1 16K: eligible warps per scheduler | 0.26 | 0.37 |
+| verify B=1 16K: float64 share of stall samples | about 21% | 1.9% |
+| verify B=1 16K: short-scoreboard stalls | 33% | 8% |
+| verify B=8 4K: µs | 717 | 546 |
+| decode B=1 16K: µs (DRAM) | 158 (57%) | 151 (60%) |
+| decode B=8 16K: µs (DRAM) | 898 (79%) | 870 (82%) |
+
+Verify issues about 4% fewer instructions but takes 25% less time: D32 removed latency, not
+work.
+
+**Verify tier 1 has no single hot spot left.**
+- The stalls are spread out: fixed-latency wait 17%, long scoreboard 17%, math-pipe throttle
+  9%, short scoreboard 8%, barrier 6%.
+- The hottest SASS line holds 2.5% of samples.
+- The int64 arithmetic (IADD, SHF, SEL, LOP3) is now the bulk of both instructions and stalls.
+- IMMA holds 9.7%.
+- The limit is still one 255-register block per SM: 2 warps per scheduler, with 74% of
+  cycles issuing nothing.
+
+**Decode B=8 16K is bound by DRAM bytes.** It runs at 82% of DRAM throughput (1.30 TB/s), so
+only fewer bytes per key can speed it up. Per key, tier 1 reads:
+- 512 B of K digits (4 planes);
+- 384 B of V digits (3 planes);
+- 128 B of lost-V mask (one int8 0/1 per element);
+- about 26 B of per-key metadata.
+
+That is about 1050 B per key. FlashInfer reads 512 B of bf16 K and V per key, which matches
+the 2.3× gap at this shape.
+
+The hottest lines fit this:
+- the `ISETP` (11.9%) and an `STS.U16` (4.5%) wait on plain synchronous global loads;
+- the `LDGSTS` copies wait on LSU throttle (8%).
+
+The `STS.U16` most likely stages the lost-V mask into shared memory as an MMA operand. This
+is inferred from the SASS; the run has no source-line mapping.
+
+**Verify tier 2 is latency.**
+- B=1 16K: 65 µs for 2 work items. Only 128 of its 384 programs do any work, each over one
+  row's 256 keys in its KV split, which is about 16 µs per 64-key tile on the int64 path.
+- DRAM is idle (0.2%) and L2 hits 99.8%.
+- The top line (7.2%) is a `LOP3` waiting on a global load.
+
+Next (D33): stop reading the lost-V mask when a tile has no lost V element. Store a per-key
+"has lost V" bit at cache write, next to `VBAD`. Only tiles with such a key load the 8 KB
+mask and run its MMA. That removes about 12% of decode's bytes per key, if lost V elements
+are as rare as lossy keys (about 1.7e-4 of keys). The first step is to measure that rate on
+the bench and fixture caches. Packing the mask into bits instead (128 B to 16 B per key)
+saves the same bytes, but needs an unpack before the MMA.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
