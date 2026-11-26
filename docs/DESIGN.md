@@ -1817,6 +1817,41 @@ All 25 builds in `sm120_compile_check` pass. tcpv m16 128/8 spills 836 B (was 88
 Expected: decode B=8 16K tier 1 down by up to about 10% (0.828 ms), and decode B=32 likewise.
 B=1 decode runs at 60% of DRAM and gains less. Verify is latency-bound and should not change.
 
+**Run 1132** (code 7ed913d). All stages passed. The fixture gives ALL MATCH with 0 fallback rows,
+and the fallback counts are those of run 1130. The first job landed on a node whose GPU failed
+CUDA init in every stage. `run_stages.sh` now treats that as a bad node (excluded and resubmitted)
+instead of finishing the chain.
+
+Tier-1 split kernel (ms, from `profile_steps`):
+
+| shape | 1130 | 1132 | change |
+|---|---|---|---|
+| decode B=1 16K | 0.119 | 0.103 | −13% |
+| decode B=8 16K | 0.828 | 0.763 | −8% |
+| verify B=1 16K (q4) | 0.236 | 0.243 | +3% |
+| verify B=8 4K | 0.436 | 0.442 | +1% |
+| verify B=1 16K (q3, windowed) | 1.652 | 1.635 | −1% |
+
+Best exact step (ms), with the ratio to FlashInfer:
+
+| shape | 1130 | 1132 |
+|---|---|---|
+| decode B=1 16K | 0.140 (7.0×) | 0.123 (6.0×) |
+| decode B=1 64K | 0.432 (2.3×) | 0.400 (2.1×) |
+| decode B=8 4K | 0.248 (8.0×) | 0.229 (7.3×) |
+| decode B=8 16K | 0.824 (2.3×) | 0.764 (2.1×) |
+| decode B=32 4K | 0.945 (2.6×) | 0.904 (2.5×) |
+| decode B=32 16K | 3.456 (2.5×) | 3.264 (2.3×) |
+| verify B=1 16K | 0.329 (15.9×) | 0.324 (14.9×) |
+| verify B=8 4K | 0.541 (12.3×) | 0.540 (12.6×) |
+
+Decode B=8 and B=32 gained 4–8%, about two thirds of the 12% cut in bytes. B=1 decode gained
+more than expected. Its program mean fell from 46.3 to 38.0 µs, mostly in the score phase
+(1.78 → 0.58 µs per tile), probably because the score phase had been absorbing the wait on the
+mask row's synchronous load. Verify did not change beyond 1–5%. Its program mean rose from
+82.3 to 86.6 µs at B=1 16K, which fits the dependent flag-then-row load in a latency-bound
+kernel. It is small enough that it may be noise.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
