@@ -1852,6 +1852,49 @@ mask row's synchronous load. Verify did not change beyond 1–5%. Its program me
 82.3 to 86.6 µs at B=1 16K, which fits the dependent flag-then-row load in a latency-bound
 kernel. It is small enough that it may be noise.
 
+## D34. How many K digit planes do keys use? (study)
+
+After D33, decode tier 1 reads about 925 B per key against FlashInfer's 512. The 4 K digit
+planes are 512 B of that. They sit in fixed point below each row's largest element
+(`slice_rows`), and plane 0 is the least significant. If a key's plane 0 is all zero, its
+digits are the same whether or not that plane is read. A per-key flag can then skip the load,
+the way D33 skips lost-V rows, with every bit unchanged.
+
+`scripts/k_digit_study.py` counts, for each key, the planes from its lowest nonzero plane up
+([results](../results/k_digit_study_qwen3-0.6b.md)):
+
+| keys | count | K: ≤2 planes | K: ≤3 planes | K: all 4 | 64-key tiles with K plane 0 unused | V: ≤2 of 3 planes | per-key skip saves |
+|---|---|---|---|---|---|---|---|
+| bench (randn bf16) | 262,144 | 11.8% | 98.4% | 1.6% | 34% | 11.7% | 156 B (17%) |
+| Qwen3-0.6B, all 28 layers | 458,752 | 0.3% | 92.1% | 7.9% | 11% | 7.9% | 128 B (14%) |
+
+Per layer, 75% (layer 0) to 99% (layer 11) of keys leave K plane 0 unused. Keys already lossy
+at 4 planes are 0.01%. The savings column counts K planes 0 and 1 and V plane 0, at 128 B per
+plane row.
+
+**Findings.**
+- Almost every key needs only 3 of its 4 K planes. The fourth is the margin for the real keys
+  whose element exponents spread over more than 13 bits: 8% overall, 1–25% by layer.
+- A per-tile skip would rarely fire: only 11% of real 64-key tiles qualify, as with lost V
+  (D33). A per-key skip saves the bytes but not the MMAs. That suits decode, which is
+  DRAM-bound; verify is latency-bound and would gain nothing.
+- Going from SK=4 to SK=3 everywhere would make 8% of real keys lossy. Each such key's score
+  then carries the |q|₁·2^klsb error bound, and many of those scores would fail to certify. The
+  per-key skip keeps 4 planes where they are needed, at no cost in certification.
+
+**Proposal (D35).**
+- Add KLOST bit 3, "K plane 0 is nonzero", and bit 4, "plane 1 is nonzero". Both are set at
+  cache write by `tc_slices` and `tc_slices_device`.
+- Add a V flag bit, "V plane 0 is nonzero", to VBAD.
+- In `_tc_logits`, load the flag word before the K planes and predicate the plane-0 and
+  plane-1 loads on it. The masked lanes return 0, which is what they hold.
+- Keep unconditional loads for the m16 verify build: the dependent flag load cost about 3%
+  there in run 1132.
+
+Expected: about 125 B fewer per key on the bench, 14% of tier 1's bytes. D33's 12% bought
+decode B=8/B=32 4–8% and B=1 13%, so this should buy about as much again. That would bring
+decode B=8 16K from 0.764 ms (2.1× FlashInfer) to about 0.70 ms (1.95×).
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
