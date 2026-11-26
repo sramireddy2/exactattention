@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,6 +7,8 @@ name = "exactattn"
 version = "0.0.1"
 description = "Attention that is bit-identical across splits, batches, draft trees and hardware, by definition."
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.26", "mpmath>=1.3"]
 

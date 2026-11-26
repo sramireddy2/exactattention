@@ -1,0 +1,9 @@
+ExactAttention
+Copyright 2026 Shashank Ramireddy
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Third-party data in fixtures/:
+- fixtures/qwen3_0.6b_heads.npz holds query, key and value activations from two attention
+  heads of Qwen3-0.6B (Qwen team, Alibaba Cloud; Apache License 2.0), computed on text from
+  WikiText-2 (Merity et al., 2016; Creative Commons Attribution-ShareAlike).

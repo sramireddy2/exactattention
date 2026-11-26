@@ -96,3 +96,11 @@ out_bits = attention(q, k, v, default_alpha(64))   # bf16 bit patterns, shape (2
 3. Draft-tree verification end to end: bit-identical speculative decoding.
 4. Spec v1: optionally a higher-precision logit, which removes the remaining amplification on
    heavily cancelling outputs (DESIGN D5).
+
+## License
+
+Apache License 2.0: see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+`fixtures/qwen3_0.6b_heads.npz` holds activations from two heads of
+[Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) (Apache-2.0), computed on text from
+WikiText-2 (CC BY-SA).
