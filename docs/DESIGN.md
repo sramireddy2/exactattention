@@ -1895,6 +1895,40 @@ Expected: about 125 B fewer per key on the bench, 14% of tier 1's bytes. D33's 1
 decode B=8/B=32 4–8% and B=1 13%, so this should buy about as much again. That would bring
 decode B=8 16K from 0.764 ms (2.1× FlashInfer) to about 0.70 ms (1.95×).
 
+## D35. Skip K and V digit planes that are all zero
+
+D34's proposal, built.
+- **Flags.** The K flag word (KLOST) gains bit 3, "digit plane 0 is all zero", and bit 4,
+  "planes 0 and 1 are". The V flag word (VBAD) gains bit 2, "V plane 0 is all zero". All three
+  are made at cache write by `tc_slices`, `tc_slices_device`, `tc_v_slices` and
+  `tc_v_slices_device` (`_zero_low_planes`). The bits only ever allow a skip, so a flag word
+  without them loads every plane, as before.
+- **K loads.** With the new constexpr `PSKIP`, `_tc_logits` loads the K flag word before the
+  planes. It predicates plane 0's load on bit 3 and plane 1's on bit 4.
+- **V loads.** `_tc_pv` predicates V plane 0's load on bit 2, in all three P·V layouts.
+- **Same bits.** A skipped row comes back as the masked load's 0, which is what it holds. So
+  every MMA operand, and every bit, is unchanged.
+- **Where it applies.** `launch(plane_skip=None)` turns `PSKIP` on for tier-1 row blocks under
+  16 rows (decode). It stays off for 16-row verify blocks and tier 2, which are latency-bound:
+  D33's dependent flag load cost verify about 3%. `plane_skip=True` or `False` forces it.
+
+**Checks.**
+- New test `test_zero_digit_planes_skipped_without_changing_bits`, at block_m 16, 4 and 2
+  (every P·V layout), with `plane_skip` forced both ways.
+  - The keys mix randn rows, rows with one element scaled by 2^8 (plane 0 in use), and rows
+    of 1, 1.5, 2 and 0.75 (top planes only).
+  - The stored bits must match the planes.
+  - Skipping must give the same outputs, flags and P·V partials and their widths as loading
+    every plane.
+  - Setting the K bits, or the V bit, on every key must change the partials. This shows the
+    planes really are skipped through the bits.
+  - Certified rows must equal the reference.
+- All 25 `sm120_compile_check` builds pass. tcpv m16 128/8 is unchanged (836 B spill), since
+  `PSKIP` is off there. tcpv m2 128/8 spills 72 B (was 68).
+
+Expected, from D34's bench rates: decode tier 1 reads about 155 B fewer per key, 17% of its
+bytes. Decode B=8 16K should drop from 0.763 ms toward 0.70, and verify should not change.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model

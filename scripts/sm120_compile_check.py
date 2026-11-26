@@ -80,6 +80,7 @@ def kernel_config(over):
     cfg["ANCH"] = 7 * cfg["SW"] + 7 * cfg["SV"] + (cfg["BLOCK_N"] - 1).bit_length()
     cfg["WDC"] = max(1, min(cfg["D"], (512 * nw) // (cfg["BLOCK_M"] * cfg["BLOCK_N"])))
     cfg.setdefault("CDC", max(1, min(cfg["D"], (512 * nw) // cfg["BLOCK_M"])))
+    cfg.setdefault("PSKIP", cfg["BLOCK_M"] < 16 and not cfg["RERUN"])   # as launch picks it (DESIGN D35)
     cfg["FL_DIV"] = 1
     return cfg, nw, ns
 

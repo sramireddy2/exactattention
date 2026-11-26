@@ -398,7 +398,7 @@ def _slice_q(qm, qe, SQ: tl.constexpr, PACK: tl.constexpr, BM: tl.constexpr, D: 
 @triton.jit
 def _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nmask, KST, KLSB, KERR, KLOST,
                AM, AE, D: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr, PACK: tl.constexpr,
-               BM: tl.constexpr):
+               BM: tl.constexpr, PSKIP: tl.constexpr):
     """Certified t = RN32(alpha * q.k) from int8 slices (slices.py) on tensor cores.
 
     q.k = 2^(qlsb + klsb) * (sum_{s,t} 2^(7(s+t)) Q[s].K[t] + truncation), where each Q[s].K[t] is
@@ -407,9 +407,15 @@ def _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nmask, KST, KLSB
     too-big bit 4 of KLOST) made at cache write, q's (qerr, qbig) by _slice_q. KX and the
     per-key pointers start at the segment,
     nn is int32 within it and KST is the digit-plane stride (int64 scalar), so the per-element
-    address math is 32-bit. Returns (t, uncertified, key has NaN/inf)."""
+    address math is 32-bit. With PSKIP, a key whose low digit planes are all zero (KLOST bits 3
+    and 4, DESIGN D35) does not load them: the masked load gives the zeros they hold, so the MMA
+    operands and the bits are unchanged. Returns (t, uncertified, key has NaN/inf)."""
     NG: tl.constexpr = (SQ + PACK - 1) // PACK
     dd = tl.arange(0, D)
+    if PSKIP:
+        kw = tl.load(KLOST + nn, mask=nmask, other=0)
+        km0 = nmask & ((kw & 8) == 0)
+        km1 = nmask & ((kw & 16) == 0)
     if PACK == 1:
         # One digit per MMA: products of equal weight u = s + t accumulate inside the int32 MMA
         # (|Q[s].K[t]| < d * 127^2 < 2^21, at most 4 per weight: < 2^23), and adjacent weights
@@ -425,7 +431,13 @@ def _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nmask, KST, KLSB
         S6 = S0
         S7 = S0
         for t_ in tl.static_range(SK):
-            kt = tl.trans(tl.load((KX + t_ * KST) + (nn[:, None] * D + dd[None, :]), mask=nmask[:, None], other=0))
+            km = nmask
+            if PSKIP:
+                if t_ == 0:
+                    km = km0
+                if t_ == 1:
+                    km = km1
+            kt = tl.trans(tl.load((KX + t_ * KST) + (nn[:, None] * D + dd[None, :]), mask=km[:, None], other=0))
             for s in tl.static_range(SQ):
                 qs = q0
                 if s == 1:
@@ -460,7 +472,13 @@ def _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nmask, KST, KLSB
     else:
         acc = tl.zeros((BM, nn.shape[0]), tl.int64)
         for t_ in tl.static_range(SK):
-            kt = tl.trans(tl.load((KX + t_ * KST) + (nn[:, None] * D + dd[None, :]), mask=nmask[:, None], other=0))
+            km = nmask
+            if PSKIP:
+                if t_ == 0:
+                    km = km0
+                if t_ == 1:
+                    km = km1
+            kt = tl.trans(tl.load((KX + t_ * KST) + (nn[:, None] * D + dd[None, :]), mask=km[:, None], other=0))
             acc += _slot_sum(tl.dot(q0, kt, out_dtype=tl.int32), 0, PACK, BM, 0, SQ, 7 * t_)
             if NG > 1:
                 acc += _slot_sum(tl.dot(q1, kt, out_dtype=tl.int32), 1, PACK, BM, 0, SQ, 7 * t_)
@@ -470,7 +488,8 @@ def _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nmask, KST, KLSB
                 acc += _slot_sum(tl.dot(q3, kt, out_dtype=tl.int32), 3, PACK, BM, 0, SQ, 7 * t_)
     klsb = tl.load(KLSB + nn, mask=nmask, other=0)
     kerr = tl.load(KERR + nn, mask=nmask, other=0)
-    kw = tl.load(KLOST + nn, mask=nmask, other=0)
+    if not PSKIP:
+        kw = tl.load(KLOST + nn, mask=nmask, other=0)
     klost = (kw & 1) != 0
     kbad = (kw & 2) != 0
     kbig = (kw & 4) != 0
@@ -516,7 +535,7 @@ def _pv_group(Wlo, Whi, lw, vis, g: tl.constexpr, PACK: tl.constexpr, BM: tl.con
 
 @triton.jit
 def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, VBAD, nn, nmask, cc, VST, FN, DV: tl.constexpr, SW: tl.constexpr,
-           SV: tl.constexpr, ANCH: tl.constexpr, PACK: tl.constexpr, BM: tl.constexpr):
+           SV: tl.constexpr, ANCH: tl.constexpr, PACK: tl.constexpr, BM: tl.constexpr, PSKIP: tl.constexpr):
     """One tile's P·V on tensor cores (DESIGN D9/D10, D24). Returns (TNR, TN, TNE) in the partial
     format: value N_c lies in [TN, TN + TNE] * 2^(TNR - FN).
 
@@ -552,6 +571,10 @@ def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, VBAD, nn, nmask, cc, VST, FN, DV: tl.co
     # Only keys with a lost element read their mask row (DESIGN D33): about 2% of keys, while the
     # row is 128 of the key's ~1050 bytes. Any other key's row is all zero, as the masked load gives.
     vl = tl.load(VLOST + nn[:, None] * DV + cc[None, :], mask=(nmask & ((vw & 2) != 0))[:, None], other=0)
+    # With PSKIP, a key whose V digit plane 0 is all zero (bit 2) does not load it (DESIGN D35).
+    vm0 = nmask
+    if PSKIP:
+        vm0 = nmask & ((vw & 4) == 0)
     nlost = tl.sum(lw.to(tl.int32), axis=1).to(tl.int64)                   # (M,) lost weights
     if PACK == 1:
         # One slot per MMA. Weight digit j times V digit b has weight 7(j + b): products of equal
@@ -568,7 +591,10 @@ def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, VBAD, nn, nmask, cc, VST, FN, DV: tl.co
         S7 = S0
         ea = S0
         for b in tl.static_range(SV):
-            vb = tl.load((VX + b * VST) + (nn[:, None] * DV + cc[None, :]), mask=nmask[:, None], other=0)
+            vm = nmask
+            if b == 0:
+                vm = vm0
+            vb = tl.load((VX + b * VST) + (nn[:, None] * DV + cc[None, :]), mask=vm[:, None], other=0)
             for j in tl.static_range(SW):
                 a = _pv_group(Wlo, Whi, lw, vis, j, PACK, BM, SW)
                 if j + b == 0:
@@ -613,7 +639,10 @@ def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, VBAD, nn, nmask, cc, VST, FN, DV: tl.co
         X = tl.zeros((PACK * BM, cc.shape[0]), tl.int64)
         ra = tl.zeros((PACK * BM, cc.shape[0]), tl.int32)
         for b in tl.static_range(SV):
-            vb = tl.load((VX + b * VST) + (nn[:, None] * DV + cc[None, :]), mask=nmask[:, None], other=0)
+            vm = nmask
+            if b == 0:
+                vm = vm0
+            vb = tl.load((VX + b * VST) + (nn[:, None] * DV + cc[None, :]), mask=vm[:, None], other=0)
             X += tl.dot(a, vb, out_dtype=tl.int32).to(tl.int64) << (7 * b)
             if b == SV - 1:
                 ra = tl.dot(a, tl.abs(vb), out_dtype=tl.int32)
@@ -625,7 +654,10 @@ def _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, VBAD, nn, nmask, cc, VST, FN, DV: tl.co
         acc = tl.zeros((BM, cc.shape[0]), tl.int64)
         e = tl.zeros((BM, cc.shape[0]), tl.int64)
         for b in tl.static_range(SV):
-            vb = tl.load((VX + b * VST) + (nn[:, None] * DV + cc[None, :]), mask=nmask[:, None], other=0)
+            vm = nmask
+            if b == 0:
+                vm = vm0
+            vb = tl.load((VX + b * VST) + (nn[:, None] * DV + cc[None, :]), mask=vm[:, None], other=0)
             for g in tl.static_range(NGW):
                 if g * PACK < SW:                                          # weight digits x V digit b
                     acc += _slot_sum(tl.dot(_pv_group(Wlo, Whi, lw, vis, g, PACK, BM, SW), vb, out_dtype=tl.int32),
@@ -747,7 +779,7 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
                    USE_TC_PV: tl.constexpr, SW: tl.constexpr, SV: tl.constexpr, ANCH: tl.constexpr,
                    RERUN: tl.constexpr, PACK: tl.constexpr, EXP2T, EXP2_INT: tl.constexpr,
                    WDC: tl.constexpr, FL_DIV: tl.constexpr, TIMERS: tl.constexpr, DEFER: tl.constexpr,
-                   COLMAX: tl.constexpr, CDC: tl.constexpr):
+                   COLMAX: tl.constexpr, CDC: tl.constexpr, PSKIP: tl.constexpr):
     # One program's work: row block pid_m (segment-major), KV split pid_s, channel block pid_c.
     # Segments: G independent problems (e.g. sequence x KV head), each with R_SEG query rows
     # attending its own NK_SEG keys. Rows and keys are stored segment after segment, so
@@ -831,7 +863,7 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
             # only for tiles that contain an uncertified score (windowed recompute); NaN/inf
             # keys come from a flag made at cache write.
             t, unc, kbad = _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nn < kmax, KST,
-                                      KLSB, KERR, KLOST, AM, AE, D, SQ, SK, PACK, BLOCK_M)
+                                      KLSB, KERR, KLOST, AM, AE, D, SQ, SK, PACK, BLOCK_M, PSKIP)
             flag = tl.maximum(flag, tl.max((vis & kbad[None, :]).to(tl.int32), axis=1))
             if TIMERS:
                 # Where the uncertified scores sit, before any fallback (DESIGN D29).
@@ -926,7 +958,7 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
         TZE = tl.sum((zl & vis).to(tl.int64), axis=1)
         if USE_TC_PV:
             TNR, TN, TNE, vbad = _tc_pv(Mw, Ew, vis, VX, VLSB, VLOST, VBAD, nn, nn < kmax, cc, VST, FN, DV,
-                                        SW, SV, ANCH, PACK, BLOCK_M)
+                                        SW, SV, ANCH, PACK, BLOCK_M, PSKIP)
             flag = tl.maximum(flag, tl.max((vis & vbad[None, :]).to(tl.int32), axis=1))
         else:
             vb = tl.load(V + nn[:, None] * DV + cc[None, :], mask=(nn < kmax)[:, None], other=0)
@@ -1049,7 +1081,8 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                      USE_TC_PV: tl.constexpr, SW: tl.constexpr, SV: tl.constexpr, ANCH: tl.constexpr,
                      RERUN: tl.constexpr, PACK: tl.constexpr, EXP2T, EXP2_INT: tl.constexpr,
                      WDC: tl.constexpr, FL_DIV: tl.constexpr, RESET_CNT: tl.constexpr, TIMERS: tl.constexpr,
-                     DEFER: tl.constexpr, DEFER_SPLIT: tl.constexpr, COLMAX: tl.constexpr, CDC: tl.constexpr):
+                     DEFER: tl.constexpr, DEFER_SPLIT: tl.constexpr, COLMAX: tl.constexpr, CDC: tl.constexpr,
+                     PSKIP: tl.constexpr):
     pid_s = tl.program_id(1)
     if RERUN:
         # Tier 2 (DESIGN D12, D23): the tier-1 combine appended each (row, channel block) pair to
@@ -1072,7 +1105,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                                NRB,
                                FL_NCB, TM, DFL, D, DV, BLOCK_M, BLOCK_N, BLOCK_DV, FS, EXP2_MARGIN, USE_TC, SQ, SK,
                                TC_FALLBACK, USE_TC_PV, SW, SV, ANCH, RERUN, PACK, EXP2T, EXP2_INT, WDC, FL_DIV, False,
-                               DEFER, COLMAX, CDC)
+                               DEFER, COLMAX, CDC, PSKIP)
     else:
         if RESET_CNT:
             # Tier 1 runs first in a step: zero tier 2's work-list count here, not with a fill launch.
@@ -1082,7 +1115,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                        PNE, FLAG, SPLIT_LEN, FZ, FN, KX, KLSB, KERR, KLOST, NKEYS, VX, VLSB, VLOST, VBAD, R_SEG, NK_SEG, NRB,
                        FL_NCB, TM, DFL, D, DV, BLOCK_M, BLOCK_N, BLOCK_DV, FS, EXP2_MARGIN, USE_TC, SQ, SK,
                        TC_FALLBACK, USE_TC_PV, SW, SV, ANCH, RERUN, PACK, EXP2T, EXP2_INT, WDC, FL_DIV, TIMERS, DEFER,
-                       COLMAX, CDC)
+                       COLMAX, CDC, PSKIP)
 
 
 @triton.jit
@@ -1202,16 +1235,30 @@ def _l1_ceil_host(l1s, xp):
     return e.to(torch.int64), big
 
 
+def _zero_low_planes(X):
+    """Per row of digit planes X (S, n, d), numpy or torch: (plane 0 is all zero, planes 0 and 1
+    are). A row whose low planes are zero reads the same digits without them (DESIGN D35)."""
+    if isinstance(X, np.ndarray):
+        nz = [(X[s] != 0).any(axis=1) for s in range(min(2, X.shape[0]))]
+    else:
+        nz = [(X[s] != 0).any(dim=1) for s in range(min(2, X.shape[0]))]
+    z0 = ~nz[0]
+    return z0, (z0 & ~nz[1]) if len(nz) > 1 else z0
+
+
 def _k_meta_np(X, lsb, l1, lost, bad, dev) -> list:
-    """Kernel format for sliced K rows: [X, lsb, kerr, lost | bad << 1 | big << 2]. kerr is an
-    integer upper bound on l1 * 2^-lsb, what the score error bound uses (big: too large for it),
-    and the NaN/inf bit spares the kernel a bf16 decode of K."""
+    """Kernel format for sliced K rows: [X, lsb, kerr, lost | bad << 1 | big << 2 | z0 << 3 | z01 << 4].
+    kerr is an integer upper bound on l1 * 2^-lsb, what the score error bound uses (big: too
+    large for it), and the NaN/inf bit spares the kernel a bf16 decode of K. Bits 3 and 4 say
+    digit plane 0, and planes 0 and 1, are all zero, so decode skips loading them (DESIGN D35).
+    They only ever allow a skip: a flag word without them loads every plane."""
     lsb = lsb.astype(np.int64)
     with np.errstate(over="ignore", invalid="ignore"):
         l1s = np.where(l1 > 0, l1 * np.exp2(-lsb.astype(np.float64)), 0.0)
     kerr, big = _l1_ceil_host(l1s.astype(np.float64), np)
+    z0, z01 = _zero_low_planes(X)
     w = (lost.any(axis=1).astype(np.int32) | (bad.any(axis=1).astype(np.int32) << 1)
-         | (big.astype(np.int32) << 2))
+         | (big.astype(np.int32) << 2) | (z0.astype(np.int32) << 3) | (z01.astype(np.int32) << 4))
     return [torch.from_numpy(np.ascontiguousarray(X)).to(dev), torch.from_numpy(lsb).to(dev),
             torch.from_numpy(kerr).to(dev), torch.from_numpy(w).to(dev)]
 
@@ -1283,8 +1330,9 @@ def tc_slices_device(bits: torch.Tensor, S: int) -> list:
     X, lsb, l1, lost = _slice_rows_chunked(torch.where(bad, torch.zeros_like(bits), bits), S)
     l1s = torch.where(l1 > 0, l1 * torch.exp2(-lsb.clamp(-2000, 2000).to(torch.float64)), torch.zeros_like(l1))
     kerr, big = _l1_ceil_host(l1s, torch)
+    z0, z01 = _zero_low_planes(X)
     w = (lost.any(dim=1).to(torch.int32) | (bad.any(dim=1).to(torch.int32) << 1)
-         | (big.to(torch.int32) << 2))
+         | (big.to(torch.int32) << 2) | (z0.to(torch.int32) << 3) | (z01.to(torch.int32) << 4))
     return [X, lsb, kerr, w]
 
 
@@ -1292,7 +1340,8 @@ def tc_v_slices_device(v: torch.Tensor, S: int) -> list:
     """tc_v_slices for V rows already on the device."""
     bad = _bad_dev(v)
     X, lsb, _, lost = _slice_rows_chunked(torch.where(bad, torch.zeros_like(v), v), S)
-    w = bad.any(dim=1).to(torch.int8) | (lost.any(dim=1).to(torch.int8) << 1)
+    w = (bad.any(dim=1).to(torch.int8) | (lost.any(dim=1).to(torch.int8) << 1)
+         | (_zero_low_planes(X)[0].to(torch.int8) << 2))
     return [X, lsb, lost.to(torch.int8).contiguous(), w.contiguous()]
 
 
@@ -1301,10 +1350,12 @@ def tc_v_slices(v_bits: np.ndarray, S: int, dev) -> list:
     lost (n, dv) int8 0/1, per-key flags (n,) int8]. Done once when the KV cache is written.
     The lost plane is an MMA operand as stored. Flag bit 0: the key has a NaN/inf (per key, since
     flags are per row, DESIGN D25). Bit 1: the key has a lost element, so the kernel reads only
-    those keys' lost rows (DESIGN D33)."""
+    those keys' lost rows (DESIGN D33). Bit 2: digit plane 0 is all zero, so decode skips
+    loading it (DESIGN D35)."""
     bad = _bad_np(v_bits)
     X, lsb, _, lost = slice_rows(np.where(bad, 0, v_bits).astype(np.uint16), S)
-    w = bad.any(axis=1).astype(np.int8) | (lost.any(axis=1).astype(np.int8) << 1)
+    w = (bad.any(axis=1).astype(np.int8) | (lost.any(axis=1).astype(np.int8) << 1)
+         | (_zero_low_planes(X)[0].astype(np.int8) << 2))
     return [torch.from_numpy(np.ascontiguousarray(X)).to(dev), torch.from_numpy(lsb.astype(np.int64)).to(dev),
             torch.from_numpy(np.ascontiguousarray(lost.astype(np.int8))).to(dev),
             torch.from_numpy(np.ascontiguousarray(w)).to(dev)]
@@ -1355,7 +1406,8 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
            block_n: int = 16, block_dv: int = 32, merge_order=None, exp2_margin: float = 2.0 ** -26,
            q_tc=None, k_tc=None, tc_fallback: bool = True, v_tc=None, sw: int = 5, pv_tier2: bool = True,
            sq: int = 4, num_warps: int = 4, exp2: str = "int", num_stages: int | None = None,
-           maxnreg: int | None = None, timers: bool = False, defer_scores=False, col_fallback: int = 4):
+           maxnreg: int | None = None, timers: bool = False, defer_scores=False, col_fallback: int = 4,
+           plane_skip: bool | None = None):
     """Device-level launch with no host transfers and no sync.
 
     Qt (R, d), Kt (n, d), Vt (n, dv) are int16 views of bf16 on the device; KL (R,) is int32.
@@ -1377,6 +1429,9 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     "row" would certify (its other splits keep tier 1's tensor-core P·V enclosures).
     col_fallback (DESIGN D30): a tile whose uncertified tensor-core scores sit in at most this many
     key columns recomputes just those keys; more, or 0, recomputes the whole tile. Same bits.
+    plane_skip (DESIGN D35): tier 1 does not load a key's K and V digit planes that its flags say
+    are all zero. Same bits. The default (None) skips in row blocks under 16 rows (decode), where
+    DRAM bytes bound the step; 16-row verify blocks and tier 2 are latency-bound and load them.
     Returns (OUT int32 (R, dv) or
     (G, R, dv), split_flags, combine_flags), all on the device; flags are per flattened row."""
     batched = Qt.dim() == 3
@@ -1493,7 +1548,8 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
             USE_TC_PV=pv, SW=sw_, SV=sv_, ANCH=anch_, RERUN=rerun, PACK=max(1, 16 // bm),
             EXP2T=exp2t, EXP2_INT=(exp2 == "int"), WDC=wdc, FL_DIV=block_dv // bdv,
             RESET_CNT=tier2 and not rerun, TIMERS=bool(timers and not rerun), DEFER=defer,
-            DEFER_SPLIT=bool(rerun and defer_split), COLMAX=int(col_fallback), CDC=cdc, num_warps=nw, **stg)
+            DEFER_SPLIT=bool(rerun and defer_split), COLMAX=int(col_fallback), CDC=cdc,
+            PSKIP=bool((bm < 16) if plane_skip is None else plane_skip) and not rerun, num_warps=nw, **stg)
 
     ck = split(False, block_n, use_tc_pv, vtc, sw, sv, anch, block_m, block_dv, num_warps, 0, stages)
     # Registers and spills of the compiled split kernel (None under the CPU interpreter).

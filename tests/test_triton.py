@@ -224,6 +224,67 @@ def test_lost_v_rows_read_only_for_flagged_keys(block_m):
         assert np.array_equal(got[r], attention_row(Q[r], K[:L], V[:L], alpha)), r
 
 
+@pytest.mark.parametrize("block_m", [16, 4, 2])
+def test_zero_digit_planes_skipped_without_changing_bits(block_m):
+    """DESIGN D35: with plane_skip, tier 1 does not load a key's K digit plane 0 (KLOST bit 3),
+    planes 0 and 1 (bit 4) or V digit plane 0 (V flag bit 2) when its flags say they are all zero.
+    The stored bits must say exactly that. Skipping must give the same bits, flags and P·V
+    partials as loading every plane. Setting the bits on every key must change the partials:
+    the planes really are skipped through the bits."""
+    import torch
+
+    from exactattn.triton_kernels import _LAST_DEBUG, launch, tc_slices, tc_v_slices
+
+    rng = np.random.default_rng(zlib.crc32(f"planes/{block_m}".encode()))
+    d, dv, R, n = 64, 32, 8, 96
+    Q, K, V = bf16(rng, (R, d)), bf16(rng, (n, d)), bf16(rng, (n, dv))
+    K[::7, 5] = K[::7, 5] + (8 << 7)           # 2^8 x one element: the key's small elements reach plane 0
+    short = np.array([0x3F80, 0x3FC0, 0x4000, 0x3F40], dtype=np.uint16)   # 1, 1.5, 2, 0.75
+    sign = (rng.integers(0, 2, size=(n, d)) << 15).astype(np.uint16)
+    K[3::6] = (short[rng.integers(0, 4, size=(n, d))] | sign)[3::6]       # these use only the top planes
+    V[3::6] = (short[rng.integers(0, 4, size=(n, dv))] | sign[:, :dv])[3::6]
+    kv_len = rng.integers(n // 2, n + 1, size=R).astype(np.int32)
+    alpha = default_alpha(d)
+    dev = torch.device(DEVICE)
+
+    def t16(x):
+        return torch.from_numpy(np.ascontiguousarray(x).view(np.int16)).to(dev)
+
+    k_tc, v_tc = tc_slices(K, 4, dev), tc_v_slices(V, 3, dev)
+    kx, vx = k_tc[0].cpu().numpy(), v_tc[0].cpu().numpy()
+    kz0, kz1 = ~(kx[0] != 0).any(axis=1), ~(kx[:2] != 0).any(axis=(0, 2))
+    vz0 = ~(vx[0] != 0).any(axis=1)
+    kw, vw = k_tc[3].cpu().numpy(), v_tc[3].cpu().numpy()
+    assert np.array_equal((kw >> 3) & 1, kz0.astype(np.int32))
+    assert np.array_equal((kw >> 4) & 1, kz1.astype(np.int32))
+    assert np.array_equal((vw >> 2) & 1, vz0.astype(np.int8))
+    assert 0 < kz0.sum() < n and 0 < kz1.sum() < kz0.sum() and 0 < vz0.sum() < n, (kz0.sum(), kz1.sum(), vz0.sum())
+
+    def run(skip, kflags=None, vflags=None):
+        kt, vt = list(k_tc), list(v_tc)
+        if kflags is not None:
+            kt[3] = kflags
+        if vflags is not None:
+            vt[3] = vflags
+        OUT, FL, OF = launch(t16(Q), t16(K), t16(V), torch.from_numpy(kv_len).to(dev), n, alpha, splits=2,
+                             block_m=block_m, block_n=32, block_dv=32, k_tc=kt, v_tc=vt, pv_tier2=False,
+                             plane_skip=skip)
+        return [OUT.cpu(), FL.cpu(), OF.cpu(), _LAST_DEBUG["PN"].cpu().clone(), _LAST_DEBUG["PNE"].cpu().clone()]
+
+    base = run(False)
+    skip = run(True)
+    for a_, b_ in zip(base, skip):
+        assert torch.equal(a_, b_)
+    assert not torch.equal(base[3], run(True, kflags=k_tc[3] | 24)[3])    # K planes 0 and 1 dropped
+    assert not torch.equal(base[3], run(True, vflags=v_tc[3] | 4)[3])     # V plane 0 dropped
+    flags = np.maximum(base[1].amax(dim=(0, 2)).numpy(), base[2].amax(dim=1).numpy())
+    got = (base[0].numpy() & 0xFFFF).astype(np.uint16)
+    assert (flags == 0).any()
+    for r in np.flatnonzero(flags == 0):
+        L = int(kv_len[r])
+        assert np.array_equal(got[r], attention_row(Q[r], K[:L], V[:L], alpha)), r
+
+
 @pytest.mark.parametrize("mode", ["row", "split"])
 @pytest.mark.parametrize("case", ["all", "mixed"])
 @pytest.mark.parametrize("block_m", [16, 2])
