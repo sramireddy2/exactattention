@@ -165,7 +165,7 @@ gpu_ok() {   # $1 = timeout in seconds
   out=$(timeout "${1:-600}" python -c "import torch; torch.zeros(1, device='cuda'); torch.cuda.synchronize(); print('GPU_OK')" 2>&1)
   case "$out" in
     *GPU_OK*) return 0 ;;
-    *"busy or unavailable"*|*"no CUDA-capable"*|*"CUDA error"*|*"NVIDIA driver"*)
+    *"busy or unavailable"*|*"no CUDA-capable"*|*"CUDA error"*|*"CUDA unknown error"*|*"NVIDIA driver"*)
       echo "$out" | tail -n 3 | sed 's/^/   probe: /'; return 1 ;;
     *) echo "   GPU probe inconclusive (timeout or import failure); running the stage anyway"; return 0 ;;
   esac
@@ -209,7 +209,9 @@ for e in "${STAGES[@]}"; do
     n=$(( $(cat "$OUT/$name.timeouts" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$OUT/$name.timeouts"
     echo "   timeout #$n"
     [ "$n" -ge "$MAX_TIMEOUTS" ] && echo "TIMEOUT" > "$OUT/$name.done"
-  elif [ "$rc" -ne 0 ] && grep -q "busy or unavailable" "$OUT/$name.log" && ! gpu_ok 300; then
+  elif [ "$rc" -ne 0 ] && grep -qE "busy or unavailable|CUDA unknown error|no CUDA-capable" "$OUT/$name.log" \
+       && ! gpu_ok 300; then
+    # run 1132: a faulted GPU failed CUDA init ("CUDA unknown error") in every stage, env included
     bad_node "$name"
   else
     echo "rc=$rc" > "$OUT/$name.done"; echo "   rc=$rc"
