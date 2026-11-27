@@ -101,7 +101,8 @@ time divided by FlashInfer's.
    goal covers every verify shape with n ≥ 4K, L2-resident ones included. Verify is the step
    speculative decoding adds, and its gap is largest on the small shapes.
 
-Status as of run 1133 (DESIGN D35). Verify ratios are the bench's, from unrounded times:
+Status as of run 1133 (DESIGN D35), still the best measured. Run 1134 (D36) was about 2%
+slower on decode (DESIGN D36). Verify ratios are the bench's, from unrounded times:
 
 | goal | shape | FlashInfer (ms) | exact (ms) | ratio | met |
 |---|---|---|---|---|---|

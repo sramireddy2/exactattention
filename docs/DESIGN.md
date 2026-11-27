@@ -1988,6 +1988,47 @@ Expected: the randn bench skips plane 0's MMAs in about 34% of 64-key tiles, abo
 score MMAs. Decode B=1 16K tier 1 (0.095 ms) and B=8 16K (step 0.734 ms) should drop a few
 percent; real Qwen3 tiles qualify about a third as often. Verify should not change.
 
+**Run 1134 (job 16208024): no gain, about 2% slower.** Every stage passed: tests, fixture
+ALL MATCH with 0 fallback rows, every bench row certified. But every DRAM-bound decode shape got
+slower than run 1133 (D35 alone), and the bench builds spill 40 B instead of 36:
+
+| decode shape | 1133 best step (ms) | 1134 best step (ms) | change | ratio vs FlashInfer |
+|---|---|---|---|---|
+| B=1, 64K | 0.393 | 0.402 | +2.3% | 2.15× |
+| B=8, 16K | 0.734 | 0.748 | +1.9% | 2.08× |
+| B=32, 4K | 0.869 | 0.883 | +1.6% | 2.46× |
+| B=32, 16K | 3.173 | 3.223 | +1.6% | 2.29× |
+
+Verify does not use D36, and it moved by −2% to +1% (B=8 4K: 0.540 → 0.529 ms), so that is the
+noise level. The decode losses are all the same sign and a little larger than that. Each of the
+two skipped MMAs is a small 16-row dot, while the branch and the two `tl.max` reductions run in
+every tile, and the extra live registers spill. D36 should be off by default (PSKIP 1). The code
+stays, because tiles where whole planes are zero (narrow-exponent K caches) could still use it.
+
+The resumable profile (`scripts/profile_step.py` at ca473d1) finished all eight cases in one
+attempt. It shows two things D35 and D36 did not address.
+
+- **Tier 2 costs about 10% at B=32.** About 0.2% of (row, channel block) pairs fail their final
+  rounding under tensor-core P·V enclosures (4 of 2048 at B=32 4K, 6 of 2048 at 16K). At B=32
+  there are enough pairs that some always fail; B=8 16K had none in this run. Each rerun item is
+  one row by 32 channels with int64 P·V, run over tier 1's KV splits: 6 splits at B=32, so 700
+  keys per program at 4K and 2,700 at 16K. With a handful of programs on the whole GPU, the
+  rerun is pure latency:
+
+  | shape | step (ms) | tier 1 | tier 2 split | tier 2 share |
+  |---|---|---|---|---|
+  | B=32, 4K | 0.909 | 0.792 | 0.102 | 11% |
+  | B=32, 16K | 3.320 | 2.982 | 0.322 | 10% |
+  | verify B=8, 4K | 0.550 | 0.451 | 0.069 | 13% |
+  | verify B=1, 16K | 0.344 | 0.250 | 0.055 | 16% |
+
+- **Tier 1 waits on loads for 62% of each tile.** In every decode case a 64-key tile costs about
+  9.7 µs: 0.6 scores, 0.46 exp2, 2.2 P·V, 0.3 merge, and 6.2 µs of load waits and loop control.
+  At 255 registers and 8 warps, one program fills an SM's register file, so no other program
+  can hide that wait. 770 B per key over 9.7 µs per 64 keys, on 188 SMs, is the 0.95 TB/s the
+  bench measures. With the compute at about 3.6 µs per tile, overlapping the next tile's loads
+  with this tile's work is worth more than any further byte cut.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
