@@ -85,14 +85,42 @@ v = float_to_bf16_bits(rng.standard_normal((100, 64)))
 out_bits = attention(q, k, v, default_alpha(64))   # bf16 bit patterns, shape (2, 64)
 ```
 
+## Speed goals
+
+The kernels are measured on an NVIDIA RTX PRO 6000 Blackwell (sm_120) against FlashInfer
+0.7.4, with `scripts/bench_vs_flashinfer.py`. The workload is bf16, d = 128, and 16 query heads
+over 8 KV heads. A shape counts only if every row is certified. The ratio is our best exact step
+time divided by FlashInfer's.
+
+1. **Decode within 2× of FlashInfer on DRAM-bound shapes.** These are one-token decode steps
+   whose KV cache comes from DRAM: 268 MB or more, where FlashInfer reads at 1.44–1.53 TB/s.
+   - Smaller caches (134 MB or less) stay in L2 when the bench repeats one layer, and
+     FlashInfer reads them at 2–4 TB/s. A model's other layers would evict them.
+   - Those shapes are reported but are not part of this goal.
+2. **Then: verify within 5× of FlashInfer.** Verify scores 8 draft tokens per sequence. The
+   goal covers every verify shape with n ≥ 4K, L2-resident ones included. Verify is the step
+   speculative decoding adds, and its gap is largest on the small shapes.
+
+Status as of run 1133 (DESIGN D35). Verify ratios are the bench's, from unrounded times:
+
+| goal | shape | FlashInfer (ms) | exact (ms) | ratio | met |
+|---|---|---|---|---|---|
+| 1 | decode B=1, 64K | 0.187 | 0.393 | 2.10× | no |
+| 1 | decode B=8, 16K | 0.359 | 0.734 | 2.04× | no |
+| 1 | decode B=32, 4K | 0.359 | 0.869 | 2.42× | no |
+| 1 | decode B=32, 16K | 1.406 | 3.173 | 2.26× | no |
+| 2 | verify B=1, 4K | 0.012 | 0.086 | 6.9× | no |
+| 2 | verify B=1, 16K | 0.021 | 0.326 | 15.6× | no |
+| 2 | verify B=8, 4K | 0.040 | 0.540 | 13.6× | no |
+| 2 | verify B=8, 16K | 0.363 | 1.609 | 4.4× | yes |
+
 ## Roadmap
 
 1. ~~Run the fused Triton kernel on NVIDIA~~: bit-identical on Blackwell (DESIGN D11). Intel iGPU
    Triton still needs a newer driver for `triton-xpu`.
-2. ~~Exact scores and P·V on tensor cores (int8 slices)~~: implemented (DESIGN D8, D10); scores
-   verified on NVIDIA. Pairs that tensor-core P·V cannot certify are recomputed on the device
-   with int64 P·V (tier 2, DESIGN D12). In progress: P·V on NVIDIA, and serving-shape
-   benchmarks against FlashInfer and FlashAttention (`scripts/bench_vs_flashinfer.py`).
+2. ~~Exact scores and P·V on tensor cores (int8 slices)~~: implemented (DESIGN D8, D10) and
+   bit-identical on NVIDIA. Pairs that tensor-core P·V cannot certify are recomputed on the
+   device with int64 P·V (tier 2, DESIGN D12). In progress: the speed goals above.
 3. Draft-tree verification end to end: bit-identical speculative decoding.
 4. Spec v1: optionally a higher-precision logit, which removes the remaining amplification on
    heavily cancelling outputs (DESIGN D5).
