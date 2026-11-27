@@ -285,6 +285,59 @@ def test_zero_digit_planes_skipped_without_changing_bits(block_m):
         assert np.array_equal(got[r], attention_row(Q[r], K[:L], V[:L], alpha)), r
 
 
+@pytest.mark.parametrize("pv", [True, False])
+@pytest.mark.parametrize("block_m", [4, 1])
+def test_zero_digit_plane_tiles_skip_mmas_without_changing_bits(block_m, pv):
+    """DESIGN D36: with tile_skip, a K digit plane that no key of a 32-key tile uses also skips
+    its MMAs. The data has tiles where every key leaves plane 0 unused, tiles where every key
+    leaves planes 0 and 1 unused, and mixed tiles. Bits, flags and partials must equal both the
+    per-key skip alone and loading every plane, and certified rows must equal the reference."""
+    import torch
+
+    from exactattn.triton_kernels import _LAST_DEBUG, launch, tc_slices, tc_v_slices
+
+    rng = np.random.default_rng(zlib.crc32(f"tiles/{block_m}/{pv}".encode()))
+    d, dv, R, n, bn = 64, 32, 8, 192, 32
+    Q, K, V = bf16(rng, (R, d)), bf16(rng, (n, d)), bf16(rng, (n, dv))
+    short = np.array([0x3F80, 0x3FC0, 0x4000, 0x3F40], dtype=np.uint16)   # 1, 1.5, 2, 0.75
+    sign = (rng.integers(0, 2, size=(n, d)) << 15).astype(np.uint16)
+    K[32:64] = (short[rng.integers(0, 4, size=(32, d))] | sign[32:64])   # tile 1: planes 0 and 1 unused
+    K[0:32:5, 5] = K[0:32:5, 5] + (8 << 7)                              # tile 0: some keys use plane 0
+    K[128:160:9, 7] = K[128:160:9, 7] + (8 << 7)                        # tile 4 too
+    kv_len = rng.integers(n - 40, n + 1, size=R).astype(np.int32)
+    kv_len[0] = n
+    alpha = default_alpha(d)
+    dev = torch.device(DEVICE)
+
+    def t16(x):
+        return torch.from_numpy(np.ascontiguousarray(x).view(np.int16)).to(dev)
+
+    k_tc = tc_slices(K, 4, dev)
+    v_tc = tc_v_slices(V, 3, dev) if pv else None
+    kw = k_tc[3].cpu().numpy().reshape(-1, bn)
+    t0 = ((kw >> 3) & 1).all(axis=1)          # tiles where no key uses plane 0
+    t01 = ((kw >> 4) & 1).all(axis=1)         # ... nor plane 1
+    assert t01[1] and not t0[0] and not t0[4], (t0, t01)
+    assert (t0 & ~t01).any(), (t0, t01)       # a randn tile with plane 0 unused but plane 1 used
+
+    def run(skip, tile):
+        OUT, FL, OF = launch(t16(Q), t16(K), t16(V), torch.from_numpy(kv_len).to(dev), n, alpha, splits=2,
+                             block_m=block_m, block_n=bn, block_dv=32, k_tc=k_tc, v_tc=v_tc, pv_tier2=False,
+                             plane_skip=skip, tile_skip=tile)
+        return [OUT.cpu(), FL.cpu(), OF.cpu()] + ([_LAST_DEBUG["PN"].cpu().clone()] if pv else [])
+
+    base = run(False, False)
+    for got_ in (run(True, False), run(True, True)):
+        for a_, b_ in zip(base, got_):
+            assert torch.equal(a_, b_)
+    flags = np.maximum(base[1].amax(dim=(0, 2)).numpy(), base[2].amax(dim=1).numpy())
+    got = (base[0].numpy() & 0xFFFF).astype(np.uint16)
+    assert (flags == 0).any()
+    for r in np.flatnonzero(flags == 0):
+        L = int(kv_len[r])
+        assert np.array_equal(got[r], attention_row(Q[r], K[:L], V[:L], alpha)), r
+
+
 @pytest.mark.parametrize("mode", ["row", "split"])
 @pytest.mark.parametrize("case", ["all", "mixed"])
 @pytest.mark.parametrize("block_m", [16, 2])

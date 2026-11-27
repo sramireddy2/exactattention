@@ -1957,6 +1957,37 @@ MMAs still run on zeros. So tier-1 decode is not purely bound by DRAM bytes, and
 lever is skipping the work: drop plane 0's MMAs for 64-key tiles where no key uses it (D34: 34%
 of randn tiles, 11% of Qwen3 tiles).
 
+## D36. Skip a K plane's MMAs when no key of the tile uses it
+
+Run 1133 found that D35's skipped loads save about half their bytes' worth of time. The masked
+loads still issue, and the plane's MMAs still multiply zeros. In the decode layout (`PACK` > 1:
+all `SQ` q digits share one MMA per K plane), each of the 4 K planes costs one MMA plus its
+`_slot_sum` unpack. A tile in which every key leaves plane 0 unused (KLOST bit 3) can drop a
+quarter of its score MMAs.
+
+- **Uniform per tile.** `_tc_logits` reduces `km0` and `km1` (from D35's per-key masks) to two
+  scalars: does any key of the tile need plane 0, or plane 1? Masked-off keys load zeros, so they
+  never count.
+- **Only the MMA branches.** The plane's predicated load stays outside the branch, so the
+  pipeliner sees the same loads as in D35. A runtime `if` around `_k_plane_acc` skips the dot
+  and unpack. Every key's plane is zero (or masked), so the skipped term is exactly zero and the
+  bits cannot change.
+- **Where.** `PSKIP` is now 0 (off), 1 (D35 per-key loads) or 2 (also per-tile MMAs).
+  `launch(tile_skip=None)` follows `plane_skip`, so the default is 2 for tier-1 row blocks under
+  16 rows and 0 for m16 verify and tier 2. The m16 layout (`PACK` = 1) is left as it was.
+- **Checks.**
+  - Test `test_zero_digit_plane_tiles_skip_mmas_without_changing_bits`, at block_m 4 and 1,
+    with and without tensor-core P·V. The data has a tile where no key uses plane 0 or 1, a
+    random tile with plane 0 unused (asserted from the flags), and mixed tiles. Skipping off,
+    per-key only and per-tile must give equal bits, flags and P·V partials, and certified rows
+    must equal the reference.
+  - All 25 `sm120_compile_check` builds pass. tcpv m2 128/8 spills 60 B (was 72) and m16
+    128/8 is unchanged at 836 B.
+
+Expected: the randn bench skips plane 0's MMAs in about 34% of 64-key tiles, about 8% of the
+score MMAs. Decode B=1 16K tier 1 (0.095 ms) and B=8 16K (step 0.734 ms) should drop a few
+percent; real Qwen3 tiles qualify about a third as often. Verify should not change.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model

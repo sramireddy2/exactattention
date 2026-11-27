@@ -396,6 +396,20 @@ def _slice_q(qm, qe, SQ: tl.constexpr, PACK: tl.constexpr, BM: tl.constexpr, D: 
 
 
 @triton.jit
+def _k_plane_acc(acc, q0, q1, q2, q3, kt, t_: tl.constexpr, NG: tl.constexpr, PACK: tl.constexpr,
+                 BM: tl.constexpr, SQ: tl.constexpr):
+    """acc plus K digit plane t_'s products with every packed q digit group (PACK > 1)."""
+    acc += _slot_sum(tl.dot(q0, kt, out_dtype=tl.int32), 0, PACK, BM, 0, SQ, 7 * t_)
+    if NG > 1:
+        acc += _slot_sum(tl.dot(q1, kt, out_dtype=tl.int32), 1, PACK, BM, 0, SQ, 7 * t_)
+    if NG > 2:
+        acc += _slot_sum(tl.dot(q2, kt, out_dtype=tl.int32), 2, PACK, BM, 0, SQ, 7 * t_)
+    if NG > 3:
+        acc += _slot_sum(tl.dot(q3, kt, out_dtype=tl.int32), 3, PACK, BM, 0, SQ, 7 * t_)
+    return acc
+
+
+@triton.jit
 def _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nmask, KST, KLSB, KERR, KLOST,
                AM, AE, D: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr, PACK: tl.constexpr,
                BM: tl.constexpr, PSKIP: tl.constexpr):
@@ -409,7 +423,8 @@ def _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nmask, KST, KLSB
     nn is int32 within it and KST is the digit-plane stride (int64 scalar), so the per-element
     address math is 32-bit. With PSKIP, a key whose low digit planes are all zero (KLOST bits 3
     and 4, DESIGN D35) does not load them: the masked load gives the zeros they hold, so the MMA
-    operands and the bits are unchanged. Returns (t, uncertified, key has NaN/inf)."""
+    operands and the bits are unchanged. With PSKIP >= 2 (PACK > 1 only, DESIGN D36), a plane
+    that no key of the tile uses also skips its MMAs. Returns (t, uncertified, key has NaN/inf)."""
     NG: tl.constexpr = (SQ + PACK - 1) // PACK
     dd = tl.arange(0, D)
     if PSKIP:
@@ -471,6 +486,11 @@ def _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nmask, KST, KLSB
             acc += (S6 + (S7 << 7)).to(tl.int64) << 42
     else:
         acc = tl.zeros((BM, nn.shape[0]), tl.int64)
+        if PSKIP >= 2:
+            # Per tile (DESIGN D36): does any key of the tile use plane 0, or plane 1? Masked-off
+            # keys load zeros, so they never need a plane.
+            use0 = tl.max(km0.to(tl.int32), axis=0)
+            use1 = tl.max(km1.to(tl.int32), axis=0)
         for t_ in tl.static_range(SK):
             km = nmask
             if PSKIP:
@@ -479,13 +499,16 @@ def _tc_logits(q0, q1, q2, q3, qlsb, qerr, qbig, qlost, KX, nn, nmask, KST, KLSB
                 if t_ == 1:
                     km = km1
             kt = tl.trans(tl.load((KX + t_ * KST) + (nn[:, None] * D + dd[None, :]), mask=km[:, None], other=0))
-            acc += _slot_sum(tl.dot(q0, kt, out_dtype=tl.int32), 0, PACK, BM, 0, SQ, 7 * t_)
-            if NG > 1:
-                acc += _slot_sum(tl.dot(q1, kt, out_dtype=tl.int32), 1, PACK, BM, 0, SQ, 7 * t_)
-            if NG > 2:
-                acc += _slot_sum(tl.dot(q2, kt, out_dtype=tl.int32), 2, PACK, BM, 0, SQ, 7 * t_)
-            if NG > 3:
-                acc += _slot_sum(tl.dot(q3, kt, out_dtype=tl.int32), 3, PACK, BM, 0, SQ, 7 * t_)
+            if PSKIP >= 2 and t_ <= 1:
+                # The load stays outside the branch, so pipelining sees the same loads. A plane
+                # that is zero for every key of the tile adds zero, so its MMAs are skipped.
+                use = use0
+                if t_ == 1:
+                    use = use1
+                if use != 0:
+                    acc = _k_plane_acc(acc, q0, q1, q2, q3, kt, t_, NG, PACK, BM, SQ)
+            else:
+                acc = _k_plane_acc(acc, q0, q1, q2, q3, kt, t_, NG, PACK, BM, SQ)
     klsb = tl.load(KLSB + nn, mask=nmask, other=0)
     kerr = tl.load(KERR + nn, mask=nmask, other=0)
     if not PSKIP:
@@ -1407,7 +1430,7 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
            q_tc=None, k_tc=None, tc_fallback: bool = True, v_tc=None, sw: int = 5, pv_tier2: bool = True,
            sq: int = 4, num_warps: int = 4, exp2: str = "int", num_stages: int | None = None,
            maxnreg: int | None = None, timers: bool = False, defer_scores=False, col_fallback: int = 4,
-           plane_skip: bool | None = None):
+           plane_skip: bool | None = None, tile_skip: bool | None = None):
     """Device-level launch with no host transfers and no sync.
 
     Qt (R, d), Kt (n, d), Vt (n, dv) are int16 views of bf16 on the device; KL (R,) is int32.
@@ -1432,6 +1455,8 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     plane_skip (DESIGN D35): tier 1 does not load a key's K and V digit planes that its flags say
     are all zero. Same bits. The default (None) skips in row blocks under 16 rows (decode), where
     DRAM bytes bound the step; 16-row verify blocks and tier 2 are latency-bound and load them.
+    tile_skip (DESIGN D36): where plane skipping is on, a K plane that no key of a key tile uses
+    also skips its MMAs (row blocks under 16 rows only). Same bits. None follows plane_skip.
     Returns (OUT int32 (R, dv) or
     (G, R, dv), split_flags, combine_flags), all on the device; flags are per flattened row."""
     batched = Qt.dim() == 3
@@ -1532,6 +1557,12 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     TMB = (torch.zeros((G * triton.cdiv(r_seg, block_m) * nsplit * (dv // block_dv), 24), dtype=torch.int64,
                        device=dev) if timers else None)
 
+    def pskip(bm, rerun):
+        # 0 off, 1 per-key plane loads (D35), 2 also per-tile plane MMAs (D36). Tier 1 only.
+        on = bool((bm < 16) if plane_skip is None else plane_skip) and not rerun
+        tile = bool(on if tile_skip is None else tile_skip) and on
+        return int(on) + int(tile)
+
     def split(rerun, bn, pv, v_args, sw_, sv_, anch_, bm, bdv, nw, grid0, stg):
         nrb_ = triton.cdiv(r_seg, bm)
         # Windowed-score channel chunk (DESIGN D17): about 16 int64 products per thread live at once.
@@ -1549,7 +1580,7 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
             EXP2T=exp2t, EXP2_INT=(exp2 == "int"), WDC=wdc, FL_DIV=block_dv // bdv,
             RESET_CNT=tier2 and not rerun, TIMERS=bool(timers and not rerun), DEFER=defer,
             DEFER_SPLIT=bool(rerun and defer_split), COLMAX=int(col_fallback), CDC=cdc,
-            PSKIP=bool((bm < 16) if plane_skip is None else plane_skip) and not rerun, num_warps=nw, **stg)
+            PSKIP=pskip(bm, rerun), num_warps=nw, **stg)
 
     ck = split(False, block_n, use_tc_pv, vtc, sw, sv, anch, block_m, block_dv, num_warps, 0, stages)
     # Registers and spills of the compiled split kernel (None under the CPU interpreter).
