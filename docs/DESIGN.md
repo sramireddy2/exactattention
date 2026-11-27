@@ -1929,6 +1929,34 @@ D34's proposal, built.
 Expected, from D34's bench rates: decode tier 1 reads about 155 B fewer per key, 17% of its
 bytes. Decode B=8 16K should drop from 0.763 ms toward 0.70, and verify should not change.
 
+**Run 1133** (job 16194058, commit c992de3). All stages pass. The 27_11 fixture is ALL MATCH
+with 0 fallback rows, every exact cell has 0 uncertified rows, and the tests pass. Best exact
+step (ms), 1133 vs 1132:
+
+| shape | 1132 | 1133 | change | vs FlashInfer |
+|---|---|---|---|---|
+| decode B=1 16K | 0.123 | 0.111 | −10% | 5.4× |
+| decode B=1 64K | 0.400 | 0.393 | −2% | 2.1× |
+| decode B=8 4K | 0.229 | 0.227 | −1% | 7.3× |
+| decode B=8 16K | 0.764 | 0.734 | −4% | 2.0× |
+| decode B=32 4K | 0.904 | 0.869 | −4% | 2.4× |
+| decode B=32 16K | 3.264 | 3.173 | −3% | 2.3× |
+| verify B=1 16K | 0.324 | 0.326 | +1% | 15.6× |
+| verify B=8 4K | 0.540 | 0.540 | 0% | 13.6× |
+| verify B=8 16K | 1.619 | 1.609 | −1% | 4.4× |
+
+Tier-1 split kernel from the profile, which hit its 1200 s limit after 3 of 7 sections:
+
+- decode B=1 16K: 0.103 → 0.095 (−8%)
+- verify B=1 16K: 0.243 → 0.244
+- verify q3: 1.635 → 1.644
+
+A chained job retries the profile. Verify is unchanged, as expected with `PSKIP` off. Decode
+gains 3–10%, about half the 17% of bytes skipped. The masked loads still issue, and plane 0's
+MMAs still run on zeros. So tier-1 decode is not purely bound by DRAM bytes, and the remaining
+lever is skipping the work: drop plane 0's MMAs for 64-key tiles where no key uses it (D34: 34%
+of randn tiles, 11% of Qwen3 tiles).
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
