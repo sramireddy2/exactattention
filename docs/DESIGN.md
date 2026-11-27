@@ -2029,6 +2029,48 @@ attempt. It shows two things D35 and D36 did not address.
   bench measures. With the compute at about 3.6 µs per tile, overlapping the next tile's loads
   with this tile's work is worth more than any further byte cut.
 
+## D37. Tier 2 reruns as sub-splits
+
+Run 1134 showed tier 2 taking 10–16% of the B=32 decode and verify steps (D36). It reruns
+only a handful of (row, 32-channel block) items. But each item ran over tier 1's KV splits, 6 at
+B=32, so a few dozen programs each walked 700–2,700 keys at one row while the rest of the GPU
+sat idle. The work is fine; the shape is wrong. A rerun item can use any split of its keys
+(SPEC §5.3): its partials only have to enclose the same exact sums.
+
+- **Sub-splits.** Tier 2's first `T2CAP` work items (64 by default, `launch(subsplit_cap=)`)
+  each run as `NS2` sub-splits of `SL2` keys. `SL2` is the larger of 128 and `ceil(n / 64)`,
+  rounded up to a multiple of 64 so any tier-2 tile divides it, which keeps `NS2` at 64 or
+  fewer. For example 4K keys runs as 32 sub-splits of 128, and 16K as 64 of 256. The grid is
+  (programs, max(`NSPLIT`, `NS2`)), with the programs striding over the work list as in D23.
+- **A side region.** Sub-split partials (R, Z, N and split flags) go to `NS2 * T2CAP` extra
+  entries after tier 1's `nsplit * R`. They are indexed by work-list slot, not by row, so the
+  side region is 12.6 MB at most for dv = 128, whatever the batch.
+  `_split_program` takes the entry as `OBASE + pid_s * OST + (OROW if OROW >= 0 else row)`.
+  Tier 1 passes 0, `ROWS`, −1. A sub-split item writes its own Z, and stores its own flag
+  entry instead of using `atomic_max`.
+- **No new launch.** The tier-2 combine grid gains `T2CAP` programs after its row blocks. Each
+  takes the slot equal to its index past the row blocks, merges that slot's `NS2` partials in
+  row 0 of its block, carries their split flags into the combine flag, rounds, and writes the
+  pair's output. Programs past the work-list count exit at once. The tier-1 combine marks
+  sub-split pairs NEED 3 (1 is a rerun and 2 a deferred rerun, D28), so tier 2's row-block
+  programs skip them.
+- **What stays.** Items past `T2CAP` use the old path. Deferral by split (D28 "split") keeps
+  tier 1's partials in the splits it did not defer, so it always uses the old path.
+- **D36 off.** `launch(tile_skip=False)` is the default now (PSKIP 1), after run 1134.
+- **Checks.**
+  - The new test `test_tier2_subsplits_give_the_same_bits` (defer off and "row") uses 300 keys,
+    which gives 3 sub-splits of 128. It compares all items as sub-splits (cap 64), none
+    (cap 0) and mixed (cap 2). Each must give equal row flags, equal certified bits and the
+    reference value.
+  - `test_fused_need_equals_torch_formula` now reads NEED as nonzero.
+  - All 25 `sm120_compile_check` builds pass. tcpv m2 128/8 is back to D35's 72 B spill.
+    Tier 2 is at 0 B, and the tier-2 combine is at 78 registers.
+
+Expected: B=32 4K tier 2 drops from 0.102 ms to about 0.02 ms, and B=32 16K from 0.322 to about
+0.04. That would take the bench ratios to about 2.2× and 2.05×. Verify B=8 4K and B=1 16K should
+lose most of their 0.06–0.07 ms of tier 2. Undoing D36 should give back its ~2% on every decode
+shape.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model

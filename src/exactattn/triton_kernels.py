@@ -795,7 +795,7 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
                    PR, PZ, PZE, PNR, PN, PNE, FLAG,
                    SPLIT_LEN, FZ, FN,
                    KX, KLSB, KERR, KLOST, NKEYS, VX, VLSB, VLOST, VBAD,
-                   R_SEG, NK_SEG, NRB, FL_NCB, TM, DFL,
+                   R_SEG, NK_SEG, NRB, FL_NCB, TM, DFL, OBASE, OST, OROW,
                    D: tl.constexpr, DV: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                    BLOCK_DV: tl.constexpr, FS: tl.constexpr, EXP2_MARGIN: tl.constexpr,
                    USE_TC: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr, TC_FALLBACK: tl.constexpr,
@@ -807,6 +807,9 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
     # Segments: G independent problems (e.g. sequence x KV head), each with R_SEG query rows
     # attending its own NK_SEG keys. Rows and keys are stored segment after segment, so
     # ROWS = G * R_SEG and NKEYS = G * NK_SEG. Each program handles one segment's row block.
+    # Partials go to entry OBASE + pid_s * OST + (row), and the row index is OROW when
+    # OROW >= 0: tier 2's sub-split items (DESIGN D37) write a side region indexed by work-list
+    # slot. Tier 1 and tier 2's other items pass 0, ROWS, -1.
     if TIMERS:
         # Diagnostic phase clocks (DESIGN D26): each read waits on a block reduction of its
         # phase's result, so it cannot be scheduled before the phase ends.
@@ -1024,7 +1027,7 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
             tP = tE
     if TIMERS:
         cB = _clk(tl.max(tl.max(PNEr, axis=1), axis=0).to(tl.int32) + tl.max(flag, axis=0))
-    off = pid_s * ROWS + rows
+    off = OBASE + pid_s * OST + tl.where((rows * 0 + OROW) >= 0, rows * 0 + OROW, rows)
     wmask = rmask
     if not RERUN:
         zmask = rmask & ((rows * 0 + pid_c) == 0)  # only channel block 0 writes Z
@@ -1045,15 +1048,23 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
         tl.store(PR + off, PRr, mask=rmask)
         tl.store(PZ + off, PZr, mask=rmask)
         tl.store(PZE + off, PZEr, mask=rmask)
+    else:
+        # A sub-split item (DESIGN D37) has no tier-1 Z at its sub-split's entry: write its own.
+        zm = rmask & ((rows * 0 + OROW) >= 0)
+        tl.store(PR + off, PRr, mask=zm)
+        tl.store(PZ + off, PZr, mask=zm)
+        tl.store(PZE + off, PZEr, mask=zm)
     o2 = off[:, None] * DV + cc[None, :]
     tl.store(PNR + o2, tl.where(PNRr > NEG32, PNRr.to(tl.int64), NEG), mask=wmask[:, None])
     tl.store(PN + o2, PNr, mask=wmask[:, None])
     tl.store(PNE + o2, PNEr, mask=wmask[:, None])
     # FLAG has FL_NCB channel blocks of tier 1's width; tier 2 runs FL_DIV narrower blocks per
-    # entry, so it takes the maximum (atomics: the result does not depend on their order).
-    fo = FLAG + (pid_s * ROWS + rows) * FL_NCB + pid_c // FL_DIV
+    # entry, so it takes the maximum (atomics: the result does not depend on their order). A
+    # sub-split item's entry is its own (one channel block per slot), so it is stored.
+    fo = FLAG + off * FL_NCB + pid_c // FL_DIV
     if RERUN:
-        tl.atomic_max(fo, flag, mask=wmask)
+        tl.atomic_max(fo, flag, mask=wmask & ((rows * 0 + OROW) < 0))
+        tl.store(fo, flag, mask=wmask & ((rows * 0 + OROW) >= 0))
     else:
         tl.store(fo, flag, mask=wmask)
     if TIMERS:
@@ -1097,7 +1108,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                      PR, PZ, PZE, PNR, PN, PNE, FLAG,
                      SPLIT_LEN, FZ, FN,
                      KX, KLSB, KERR, KLOST, NKEYS, VX, VLSB, VLOST, VBAD,
-                     R_SEG, NK_SEG, NRB, FL_NCB, CNT, WL, NCCB, TM, DFL, NEED,
+                     R_SEG, NK_SEG, NRB, FL_NCB, CNT, WL, NCCB, TM, DFL, NEED, NSPLIT, NS2, SL2, T2CAP, T2BASE,
                      D: tl.constexpr, DV: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                      BLOCK_DV: tl.constexpr, FS: tl.constexpr, EXP2_MARGIN: tl.constexpr,
                      USE_TC: tl.constexpr, SQ: tl.constexpr, SK: tl.constexpr, TC_FALLBACK: tl.constexpr,
@@ -1113,20 +1124,24 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
         # programs stride over the list, one row x one channel block per item, for this KV split.
         # The list's order depends on atomics, but each item writes only its own partials, so the
         # bits do not.
+        # The first T2CAP items run as NS2 sub-splits of SL2 keys each (DESIGN D37), into a side
+        # region of the partials at T2BASE indexed by slot; the rest run over tier 1's NSPLIT
+        # splits into tier 1's entries. Grid axis 1 covers the larger of the two counts.
         cnt = tl.load(CNT)
         for it in range(tl.program_id(0), cnt, tl.num_programs(0)):
             item = tl.load(WL + it)
-            go = True
+            sub = it < T2CAP
+            go = ((it < T2CAP) & (pid_s < NS2)) | ((it >= T2CAP) & (pid_s < NSPLIT))
             if DEFER_SPLIT:
                 # NEED 2 marks a deferred row (DESIGN D28). Its tier-1 partials are enclosures in
                 # every split it was not deferred in, so only the deferred splits are recomputed.
                 # The item's row is item // NCCB (tier 2 runs one row per program).
-                go = (tl.load(NEED + item) != 2) | (tl.load(DFL + pid_s * ROWS + item // NCCB) != 0)
+                go = go & ((tl.load(NEED + item) != 2) | (tl.load(DFL + pid_s * ROWS + item // NCCB) != 0))
             if go:
                 _split_program(item // NCCB, pid_s, item % NCCB, Q, K, V, KVLEN, ROWS, AM, AE, PR, PZ, PZE, PNR, PN, PNE,
-                               FLAG, SPLIT_LEN, FZ, FN, KX, KLSB, KERR, KLOST, NKEYS, VX, VLSB, VLOST, VBAD, R_SEG, NK_SEG,
-                               NRB,
-                               FL_NCB, TM, DFL, D, DV, BLOCK_M, BLOCK_N, BLOCK_DV, FS, EXP2_MARGIN, USE_TC, SQ, SK,
+                               FLAG, tl.where(sub, SL2, SPLIT_LEN), FZ, FN, KX, KLSB, KERR, KLOST, NKEYS, VX, VLSB, VLOST,
+                               VBAD, R_SEG, NK_SEG, NRB, FL_NCB, TM, DFL, tl.where(sub, T2BASE, 0),
+                               tl.where(sub, T2CAP, ROWS), tl.where(sub, it, -1), D, DV, BLOCK_M, BLOCK_N, BLOCK_DV, FS, EXP2_MARGIN, USE_TC, SQ, SK,
                                TC_FALLBACK, USE_TC_PV, SW, SV, ANCH, RERUN, PACK, EXP2T, EXP2_INT, WDC, FL_DIV, False,
                                DEFER, COLMAX, CDC, PSKIP)
     else:
@@ -1136,14 +1151,14 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                 tl.store(CNT, 0)
         _split_program(tl.program_id(0), pid_s, tl.program_id(2), Q, K, V, KVLEN, ROWS, AM, AE, PR, PZ, PZE, PNR, PN,
                        PNE, FLAG, SPLIT_LEN, FZ, FN, KX, KLSB, KERR, KLOST, NKEYS, VX, VLSB, VLOST, VBAD, R_SEG, NK_SEG, NRB,
-                       FL_NCB, TM, DFL, D, DV, BLOCK_M, BLOCK_N, BLOCK_DV, FS, EXP2_MARGIN, USE_TC, SQ, SK,
+                       FL_NCB, TM, DFL, 0, ROWS, -1, D, DV, BLOCK_M, BLOCK_N, BLOCK_DV, FS, EXP2_MARGIN, USE_TC, SQ, SK,
                        TC_FALLBACK, USE_TC_PV, SW, SV, ANCH, RERUN, PACK, EXP2T, EXP2_INT, WDC, FL_DIV, TIMERS, DEFER,
                        COLMAX, CDC, PSKIP)
 
 
 @triton.jit
 def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, OUT, OFLAG, NEED, FLAG, FL_NCB, CNT, WL,
-                       DFL, DV: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_DV: tl.constexpr,
+                       DFL, NCCB, NRP, NS2, T2CAP, T2BASE, DV: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_DV: tl.constexpr,
                        P: tl.constexpr, QMIN: tl.constexpr, OUT_FP32: tl.constexpr,
                        RERUN: tl.constexpr, WRITE_NEED: tl.constexpr, FL_DIV: tl.constexpr, DEFER: tl.constexpr):
     # Tier 1 with WRITE_NEED also writes tier 2's work (DESIGN D12, D16, D23): NEED = this
@@ -1152,15 +1167,34 @@ def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, O
     # With DEFER, a row tier 1 deferred (DFL, DESIGN D28) is rerun whatever this combine's flag.
     pid_m = tl.program_id(0)
     pid_c = tl.program_id(1)
-    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    ar = tl.arange(0, BLOCK_M)
+    rows = pid_m * BLOCK_M + ar
     rmask = rows < ROWS
-    cc = pid_c * BLOCK_DV + tl.arange(0, BLOCK_DV)
     wmask = rmask
     go = True
+    nsp = NSPLIT
     if RERUN:
         # Tier 2's combine: only programs with a NEED pair merge and round again (DESIGN D20).
-        wmask = (tl.load(NEED + rows * tl.num_programs(1) + pid_c, mask=rmask, other=0) != 0) & rmask
+        # Programs pid_m >= NRP each take one sub-split work item (DESIGN D37): slot it, whose
+        # NS2 partials sit at T2BASE + s * T2CAP + it, merged in row 0 of the block. The pairs
+        # those items cover have NEED 3, so the row-block programs skip them.
+        # Masks are built from (BLOCK_M,) vectors: the CPU interpreter turns a scalar & vector
+        # bool broadcast into integers, which tl.load rejects as a mask.
+        it = pid_m - NRP
+        t2 = it >= 0
+        cnt2 = tl.minimum(tl.load(CNT), T2CAP)
+        own = t2 & (it < cnt2) & (tl.program_id(1) == 0)
+        item = tl.load(WL + tl.maximum(it, 0), mask=own, other=0)
+        pid_c = tl.where(t2, item % NCCB, pid_c)
+        rows = tl.where(t2, item // NCCB + ar * 0, rows)
+        itv = ar * 0 + it
+        t2v = itv >= 0
+        rmask = ((ar == 0) & t2v & (itv < cnt2) & ((ar * 0 + tl.program_id(1)) == 0)) | (rmask & (itv < 0))
+        need = tl.load(NEED + rows * NCCB + pid_c, mask=rmask & (itv < 0), other=0)
+        wmask = (rmask & t2v) | (((need == 1) | (need == 2)) & rmask)
         go = tl.max(wmask.to(tl.int32), axis=0) > 0
+        nsp = tl.where(t2, NS2, NSPLIT)
+    cc = pid_c * BLOCK_DV + tl.arange(0, BLOCK_DV)
     if go:
         R = tl.full((BLOCK_M,), NEG, tl.int64)
         Z = tl.zeros((BLOCK_M,), tl.int64)
@@ -1171,10 +1205,17 @@ def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, O
         flag = tl.zeros((BLOCK_M,), tl.int32)
         sflag = tl.zeros((BLOCK_M,), tl.int32)
         dflag = tl.zeros((BLOCK_M,), tl.int32)
+        tflag = tl.zeros((BLOCK_M,), tl.int32)
         # Pipelined: the partials of later splits load (cp.async) while this one merges.
-        for i in tl.range(NSPLIT, num_stages=3):
-            s = tl.load(ORDER + i)
-            off = s * ROWS + rows
+        for i in tl.range(nsp, num_stages=3):
+            if RERUN:
+                # A sub-split item merges its sub-splits in index order: the bits cannot depend on it.
+                s = tl.load(ORDER + tl.minimum(i, NSPLIT - 1), mask=it < 0, other=0)
+                off = tl.where(t2, T2BASE + i * T2CAP + it + ar * 0, s * ROWS + rows)
+                tflag = tl.maximum(tflag, tl.load(FLAG + off * FL_NCB + pid_c // FL_DIV, mask=rmask & t2v, other=0))
+            else:
+                s = tl.load(ORDER + i)
+                off = s * ROWS + rows
             if WRITE_NEED:
                 sflag = tl.maximum(sflag, tl.load(FLAG + off * FL_NCB + pid_c // FL_DIV, mask=rmask, other=0))
                 if DEFER:
@@ -1200,6 +1241,8 @@ def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, O
             NE = f1 + f2
             flag = tl.maximum(flag, ((tl.abs(Z) + ZE) >= (1 << 62)).to(tl.int32))
             flag = tl.maximum(flag, tl.max(((tl.abs(N) + NE) >= (1 << 62)).to(tl.int32), axis=1))
+        # A sub-split item's split flags live in its own entries, so its combine flag carries them.
+        flag = tl.maximum(flag, tflag)
         has = R > NEG // 2
         chan = NR > NEG // 2
         zunit = R - FZ
@@ -1227,12 +1270,14 @@ def _ea_combine_kernel(PR, PZ, PZE, PNR, PN, PNE, ORDER, NSPLIT, ROWS, FZ, FN, O
         if not OUT_FP32:
             bits = (bits >> 16) & 0xFFFF
         tl.store(OUT + rows[:, None] * DV + cc[None, :], bits, mask=wmask[:, None])
-        tl.store(OFLAG + rows * tl.num_programs(1) + pid_c, flag, mask=wmask)
+        tl.store(OFLAG + rows * NCCB + pid_c, flag, mask=wmask)
         if WRITE_NEED:
-            pair = rows * tl.num_programs(1) + pid_c
+            pair = rows * NCCB + pid_c
             nd = ((flag != 0) | (dflag != 0)) & (sflag == 0) & rmask
-            tl.store(NEED + pair, tl.where(dflag != 0, 2, 1) * nd.to(tl.int32), mask=rmask)
             slot = tl.atomic_add(CNT + rows * 0, 1, mask=nd)     # one slot per pair, any order
+            # NEED 1 rerun, 2 deferred rerun (DESIGN D28), 3 rerun as sub-splits (slot < T2CAP, D37).
+            nv = tl.where(slot < T2CAP, 3, tl.where(dflag != 0, 2, 1))
+            tl.store(NEED + pair, nv * nd.to(tl.int32), mask=rmask)
             tl.store(WL + slot, pair, mask=nd)
 
 
@@ -1430,7 +1475,7 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
            q_tc=None, k_tc=None, tc_fallback: bool = True, v_tc=None, sw: int = 5, pv_tier2: bool = True,
            sq: int = 4, num_warps: int = 4, exp2: str = "int", num_stages: int | None = None,
            maxnreg: int | None = None, timers: bool = False, defer_scores=False, col_fallback: int = 4,
-           plane_skip: bool | None = None, tile_skip: bool | None = None):
+           plane_skip: bool | None = None, tile_skip: bool | None = False, subsplit_cap: int | None = None):
     """Device-level launch with no host transfers and no sync.
 
     Qt (R, d), Kt (n, d), Vt (n, dv) are int16 views of bf16 on the device; KL (R,) is int32.
@@ -1456,7 +1501,11 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     are all zero. Same bits. The default (None) skips in row blocks under 16 rows (decode), where
     DRAM bytes bound the step; 16-row verify blocks and tier 2 are latency-bound and load them.
     tile_skip (DESIGN D36): where plane skipping is on, a K plane that no key of a key tile uses
-    also skips its MMAs (row blocks under 16 rows only). Same bits. None follows plane_skip.
+    also skips its MMAs (row blocks under 16 rows only). Same bits. Off by default: run 1134
+    measured it about 2% slower. None follows plane_skip.
+    subsplit_cap (DESIGN D37): tier 2 runs its first this-many work items as sub-splits of a few
+    hundred keys, so a handful of items spread over the GPU, and any further items over tier 1's
+    KV splits. None picks 64; 0 runs every item over tier 1's splits. Same bits when certified.
     Returns (OUT int32 (R, dv) or
     (G, R, dv), split_flags, combine_flags), all on the device; flags are per flattened row."""
     batched = Qt.dim() == 3
@@ -1518,15 +1567,39 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
         # e < block_n * (2^(7 sw) + 2^(7 sv) + 1) < 2^(anch - 5), so acc +- e and 2e fit int64 when
         # anch <= 62 (DESIGN D18). That allows 64-key tiles at sw = 5, sv = 3.
         assert anch <= 62, f"P·V slices too wide for int64: sw={sw}, sv={sv}, block_n={block_n}"
+    tier2 = use_tc_pv and pv_tier2
+    # Combine channel blocks (at most 32): NEED, OF and tier 2's work items use them (DESIGN D19).
+    cbdv = min(block_dv, 32)
+    nccb = dv // cbdv
+    assert defer_scores in (False, True, "row", "split"), defer_scores
+    defer = bool(defer_scores and tier2 and use_tc and tc_fallback)
+    defer_split = defer and defer_scores == "split"
+    # Tier 2 sub-splits (DESIGN D37). A work item over tier 1's few KV splits is a handful of
+    # programs, each walking thousands of keys at one row: pure latency. The first t2cap items
+    # instead run ns2 sub-splits of sl2 keys (a multiple of 64, so any tier-2 tile divides it),
+    # at most 64 of them so the combine's serial merge stays short. Their partials go to a side
+    # region of t2cap entries per sub-split after tier 1's nsplit * R. Deferral by split keeps
+    # tier 1's other splits, so it keeps the old path.
+    t2cap = 0
+    sl2, ns2 = split_len, 0
+    if tier2 and not defer_split:
+        t2cap = min(R * nccb, 64 if subsplit_cap is None else int(subsplit_cap))
+    if t2cap > 0:
+        sl2 = max(128, -(-max(maxlen, 1) // 64))
+        sl2 = -(-sl2 // 64) * 64
+        ns2 = -(-max(maxlen, 1) // sl2)
+    t2base = nsplit * R
+    nent = t2base + ns2 * t2cap
     i64 = dict(dtype=torch.int64, device=dev)
-    PR_ = torch.empty((nsplit, R), **i64)
-    PZ_ = torch.empty((nsplit, R), **i64)
-    PZE_ = torch.empty((nsplit, R), **i64)
-    PNR_ = torch.empty((nsplit, R, dv), **i64)
-    PN_ = torch.empty((nsplit, R, dv), **i64)
-    PNE_ = torch.empty((nsplit, R, dv), **i64)
+    PR_ = torch.empty(nent, **i64)
+    PZ_ = torch.empty(nent, **i64)
+    PZE_ = torch.empty(nent, **i64)
+    PNR_ = torch.empty((nent, dv), **i64)
+    PN_ = torch.empty((nent, dv), **i64)
+    PNE_ = torch.empty((nent, dv), **i64)
     ncb = dv // block_dv
-    FL = torch.empty((nsplit, R, ncb), dtype=torch.int32, device=dev)   # every entry is written
+    FL_ = torch.empty((nent, ncb), dtype=torch.int32, device=dev)   # every entry read is written
+    FL = FL_[:t2base].view(nsplit, R, ncb)
     z32 = dz[torch.int32]
 
     # Software-pipelining depth of the split kernel's key loop. Each stage buffers a tile's operands
@@ -1540,17 +1613,10 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
         # (more latency hiding, more spills). A tiling choice, so it cannot change bits.
         stages["maxnreg"] = maxnreg
 
-    tier2 = use_tc_pv and pv_tier2
-    # Combine channel blocks (at most 32): NEED, OF and tier 2's work items use them (DESIGN D19).
-    cbdv = min(block_dv, 32)
-    nccb = dv // cbdv
     # Tier 2's work list: CNT items in WL, each a flattened (row, combine channel block) pair.
     CNT = torch.empty(1, dtype=torch.int32, device=dev) if tier2 else z32
     WL = torch.empty(R * nccb, dtype=torch.int32, device=dev) if tier2 else z32
     # Deferred score recompute (DESIGN D28): DFL marks, per split and row, a row tier 1 left to tier 2.
-    assert defer_scores in (False, True, "row", "split"), defer_scores
-    defer = bool(defer_scores and tier2 and use_tc and tc_fallback)
-    defer_split = defer and defer_scores == "split"
     DFL = torch.empty((nsplit, R), dtype=torch.int32, device=dev) if defer else z32   # all written
 
     # Diagnostic phase clocks of the tier-1 split kernel (DESIGN D26): 24 int64 per program.
@@ -1568,12 +1634,12 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
         # Windowed-score channel chunk (DESIGN D17): about 16 int64 products per thread live at once.
         wdc = max(1, min(d, (512 * nw) // (bm * bn)))
         cdc = max(1, min(d, (512 * nw) // bm))          # the same for one key column (DESIGN D30)
-        grid = (grid0 or G * nrb_, nsplit, 1 if rerun else dv // bdv)
+        grid = (grid0 or G * nrb_, max(nsplit, ns2) if rerun else nsplit, 1 if rerun else dv // bdv)
         tm = TMB if (timers and not rerun) else dz[torch.int64]
         return _ea_split_kernel[grid](
-            Qt, Kt, Vt, KL, R, am, ae, PR_, PZ_, PZE_, PNR_, PN_, PNE_, FL,
+            Qt, Kt, Vt, KL, R, am, ae, PR_, PZ_, PZE_, PNR_, PN_, PNE_, FL_,
             split_len, fz, fn, *tc, n, *v_args, r_seg, n_seg, nrb_, ncb, CNT, WL, nccb, tm, DFL,
-            NEED if (rerun and defer_split) else z32, D=d, DV=dv,
+            NEED if (rerun and defer_split) else z32, nsplit, ns2, sl2, t2cap, t2base, D=d, DV=dv,
             BLOCK_M=bm, BLOCK_N=bn, BLOCK_DV=bdv, FS=SCORE_FS,
             EXP2_MARGIN=exp2_margin, USE_TC=use_tc, SQ=sq, SK=sk, TC_FALLBACK=tc_fallback and (rerun or not defer),
             USE_TC_PV=pv, SW=sw_, SV=sv_, ANCH=anch_, RERUN=rerun, PACK=max(1, 16 // bm),
@@ -1604,8 +1670,11 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     cbm = 4
 
     def combine(need, rerun, write_need):
-        _ea_combine_kernel[(triton.cdiv(R, cbm), nccb)](PR_, PZ_, PZE_, PNR_, PN_, PNE_, ORD, nsplit, R, fz, fn,
-                                                        OUT, OF, need, FL, ncb, CNT, WL, DFL, DV=dv, BLOCK_M=cbm,
+        # Tier 2's combine adds one program per sub-split slot (DESIGN D37) after the row blocks.
+        nrp = triton.cdiv(R, cbm)
+        _ea_combine_kernel[(nrp + (t2cap if rerun else 0), nccb)](PR_, PZ_, PZE_, PNR_, PN_, PNE_, ORD, nsplit, R, fz,
+                                                        fn, OUT, OF, need, FL_, ncb, CNT, WL, DFL, nccb, nrp, ns2,
+                                                        t2cap, t2base, DV=dv, BLOCK_M=cbm,
                                                         BLOCK_DV=cbdv,
                                                         P=p, QMIN=qmin, OUT_FP32=(out == "fp32"),
                                                         RERUN=rerun, WRITE_NEED=write_need, FL_DIV=block_dv // cbdv,
@@ -1626,13 +1695,17 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
         # Tier 2's split grid is (programs, KV splits) whatever the batch, about two waves, and
         # each program strides over the work list (DESIGN D23). A grid over every row block would
         # be mostly empty programs, and at large batch their launch cost would exceed the work.
-        progs = max(1, min(R * nccb, -(-2 * _sm_count(dev) // nsplit)))
+        progs = max(1, min(R * nccb, -(-2 * _sm_count(dev) // max(nsplit, ns2))))
         split(True, block_n_t2, False, [dz[torch.int8], dz[torch.int64], dz[torch.int8], dz[torch.int8]], 1, 1, 0,
               block_m_t2, cbdv, 8, progs, {"num_stages": 2})
         combine(NEED, True, False)
     _LAST_DEBUG.update(timers=TMB, nsplit=nsplit, defer_flags=DFL if defer else None)
-    _LAST_DEBUG.update(block_m=block_m, block_m_t2=block_m_t2, pack=pack, split_flags=FL, combine_flags=OF, tier2_need=NEED, tier2_cnt=CNT, tier2_wl=WL, PR=PR_, PZ=PZ_, PZE=PZE_, PNR=PNR_, PN=PN_, PNE=PNE_,
-                       fz=fz, fn=fn)
+    t1 = slice(0, t2base)
+    _LAST_DEBUG.update(block_m=block_m, block_m_t2=block_m_t2, pack=pack, split_flags=FL, combine_flags=OF,
+                       tier2_need=NEED, tier2_cnt=CNT, tier2_wl=WL, PR=PR_[t1].view(nsplit, R),
+                       PZ=PZ_[t1].view(nsplit, R), PZE=PZE_[t1].view(nsplit, R),
+                       PNR=PNR_[t1].view(nsplit, R, dv), PN=PN_[t1].view(nsplit, R, dv),
+                       PNE=PNE_[t1].view(nsplit, R, dv), tier2_subsplit=(t2cap, ns2, sl2), fz=fz, fn=fn)
     return (OUT.view(G, r_seg, dv) if batched else OUT), FL, OF
 
 

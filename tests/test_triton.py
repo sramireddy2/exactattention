@@ -856,7 +856,8 @@ def test_fused_need_equals_torch_formula(block_dv):
     attention_triton(Q, K, V, alpha, kv_len, **kw)
     got = _LAST_DEBUG["tier2_need"]
     assert want.sum() > 0 and (sfl != 0).any()               # both cases present
-    assert torch_equal(got, want)
+    # NEED 3 marks a pair tier 2 reruns as sub-splits (DESIGN D37); any nonzero value is a rerun.
+    assert torch_equal((got != 0).to(want.dtype), want)
     # The work list (DESIGN D23) holds each NEED pair exactly once, in any order.
     cnt = int(_LAST_DEBUG["tier2_cnt"].cpu()[0])
     items = sorted(_LAST_DEBUG["tier2_wl"].cpu()[:cnt].tolist())
@@ -867,6 +868,50 @@ def torch_equal(a, b):
     import torch
 
     return torch.equal(a.cpu(), b.cpu())
+
+
+@pytest.mark.parametrize("defer", [False, "row"])
+def test_tier2_subsplits_give_the_same_bits(defer):
+    """DESIGN D37: tier 2 runs its first work items as sub-splits of 128 keys into a side region,
+    and the rest over tier 1's KV splits. All sub-split (cap 64), none (cap 0) and mixed (cap 2)
+    must give the same flags and the same certified bits, which equal the reference."""
+    import torch
+
+    from exactattn.triton_kernels import _LAST_DEBUG, launch, tc_slices, tc_v_slices
+
+    rng = np.random.default_rng(zlib.crc32(f"subsplit/{defer}".encode()))
+    d, dv, R, n = 64, 64, 8, 300
+    Q, K, V = bf16(rng, (R, d), "normal"), bf16(rng, (n, d), "normal"), bf16(rng, (n, dv), "wide")
+    kv_len = rng.integers(n // 2, n + 1, size=R).astype(np.int32)
+    kv_len[0] = n
+    alpha = default_alpha(d)
+    dev = torch.device(DEVICE)
+
+    def t16(x):
+        return torch.from_numpy(np.ascontiguousarray(x).view(np.int16)).to(dev)
+
+    k_tc, v_tc = tc_slices(K, 4, dev), tc_v_slices(V, 3, dev)
+
+    def run(cap):
+        OUT, FL, OF = launch(t16(Q), t16(K), t16(V), torch.from_numpy(kv_len).to(dev), n, alpha, splits=2,
+                             block_m=8, block_n=32, block_dv=64, k_tc=k_tc, v_tc=v_tc, defer_scores=defer,
+                             subsplit_cap=cap)
+        flags = np.maximum(FL.amax(dim=(0, 2)).cpu().numpy(), OF.amax(dim=1).cpu().numpy())
+        return (OUT.cpu().numpy() & 0xFFFF).astype(np.uint16), flags, int(_LAST_DEBUG["tier2_cnt"].cpu()[0]),             _LAST_DEBUG["tier2_subsplit"]
+
+    old, fo, cnt, sub0 = run(0)
+    assert sub0[0] == 0 and cnt > 2, (sub0, cnt)       # not vacuous: the mixed run has old-path items
+    for cap in (None, 2):
+        got, fg, cnt_, sub = run(cap)
+        assert sub[1] == 3 and sub[2] == 128, sub      # 300 keys: 3 sub-splits of 128
+        assert cnt_ == cnt
+        assert np.array_equal(fg, fo), (cap, fg, fo)
+        ok = fo == 0
+        assert ok.any()
+        assert np.array_equal(got[ok], old[ok]), cap
+    for r in np.flatnonzero(fo == 0):
+        L = int(kv_len[r])
+        assert np.array_equal(old[r], attention_row(Q[r], K[:L], V[:L], alpha)), r
 
 
 @pytest.mark.parametrize("mode", ["int64", "tcpv"])

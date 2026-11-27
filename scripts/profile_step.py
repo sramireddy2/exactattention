@@ -146,8 +146,11 @@ def tier2_share():
     if NEED is None:
         return "no tier 2"
     cnt = int(_LAST_DEBUG["tier2_cnt"][0])                  # work-list items: one pair each
+    cap, ns2, sl2 = _LAST_DEBUG.get("tier2_subsplit", (0, 0, 0))
+    sub = min(cnt, cap)
     return (f"NEED pairs {int((NEED != 0).sum())}/{NEED.numel()}; tier 2 reran {cnt} work items "
-            f"(row x 32-channel block, each over every KV split)")
+            f"(row x 32-channel block): {sub} as {ns2} sub-splits of {sl2} keys (DESIGN D37), "
+            f"{cnt - sub} over tier 1's {_LAST_DEBUG['nsplit']} KV splits")
 
 
 def main():
