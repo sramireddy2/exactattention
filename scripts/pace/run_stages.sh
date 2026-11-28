@@ -76,13 +76,13 @@ if [ "${EA_PLAN:-gpu_check}" = "flash" ] || [ "${EA_PLAN:-gpu_check}" = "profile
   fi
   STAGES=(
     "env|1800|nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv && which nvcc; python -c \"import torch, triton, flashinfer; print(torch.__version__, torch.version.cuda, triton.__version__, flashinfer.__version__, torch.cuda.get_device_name(0))\""
-    "tests_segments|1200|EA_TRITON_DEVICE=cuda $PYT tests/test_triton.py -k 'segments or slicing or pv'"
+    "tests_segments|1200|EA_TRITON_DEVICE=cuda $PYT tests/test_triton.py -k 'segments or slicing or pv or subsplits'"
     "fixture_tritontcpv_27_11|1500|$FIX --backend tritontcpv:cuda --only 27_11"
     "flashinfer_warmup|2400|$BF --batch 1 --keys 1024 --drafts 1,8 --modes int64 --iters 2 --out $OUT/warmup.md"
     "decode_b1|1500|$BF --batch 1 --keys 1024,4096,16384,65536 --drafts 1 --out $OUT/decode_b1.md"
     "decode_b8|1500|$BF --batch 8 --keys 1024,4096,16384 --drafts 1 --modes tc,tcpv --out $OUT/decode_b8.md"
     "decode_b32|1500|$BF --batch 32 --keys 1024,4096,16384 --drafts 1 --modes tc,tcpv --out $OUT/decode_b32.md"
-    "verify_t8|1500|$BF --batch 1,8 --keys 1024,4096,16384 --drafts 8 --modes tc,tcpv --out $OUT/verify_t8.md"
+    "verify_t8|2400|$BF --batch 1,8 --keys 1024,4096,16384 --drafts 8 --modes tc,tcpv --out $OUT/verify_t8.md"
     "profile_steps|1200|python scripts/profile_step.py --out $OUT/profile_steps.md"
   )
   if [ "$EA_PLAN" = "profile" ]; then

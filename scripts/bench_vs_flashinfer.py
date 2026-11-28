@@ -61,6 +61,8 @@ PAGE = 16
 # "d" defers the windowed score recompute to tier 2 (which reruns the whole row), "ds" defers it
 # with tier 2 rerunning only the deferred splits, and "dsx2" is "ds" at twice the splits (D28);
 # "w" recomputes every uncertified tile whole instead of by key column (D30).
+# A "p0" suffix turns tier 1's L2 prefetch off and "pm" keeps only its per-key words (D38), so
+# "p0", "x2p0" and "hp0" are the A/Bs of the default, "x2" and "h" configs.
 # The last configs are A/Bs, and cross-checks that none of these choices can change bits.
 CONFIGS = {"int64": [(32, 4, None, "int", 16, 4, None), (32, 4, None, "f64", 16, 4, None)],
            "tc": [(32, 4, None, "int", 16, 4, None), (64, 8, None, "int", 16, 4, None),
@@ -73,7 +75,9 @@ CONFIGS = {"int64": [(32, 4, None, "int", 16, 4, None), (32, 4, None, "f64", 16,
                     (128, 8, None, "int", 64, 4, "h"), (128, 8, None, "int", 64, 4, "x2"),
                     (128, 8, None, "int", 64, 4, "d"), (128, 8, None, "int", 64, 4, "ds"),
                     (128, 8, None, "int", 64, 4, "dsx2"), (64, 8, None, "int", 64, 4, "ds"),
-                    (128, 8, None, "int", 64, 4, "w")]}
+                    (128, 8, None, "int", 64, 4, "w"), (128, 8, None, "int", 64, 4, "p0"),
+                    (128, 8, None, "int", 64, 4, "x2p0"), (128, 8, None, "int", 64, 4, "hp0"),
+                    (128, 8, None, "int", 64, 4, "pm")]}
 
 
 def time_step(fn, iters: int, warmup: int = 3):
@@ -204,6 +208,10 @@ class Case:
     def exact(self, mode: str, sms: int, block_dv: int = 32, num_warps: int = 4, block_m=None, exp2="int",
               block_n: int = 16, sq: int = 4, regs=None, timers: bool = False):
         B, n, T = self.B, self.n, self.T
+        pf = None
+        if isinstance(regs, str) and regs.endswith(("p0", "pm")):
+            pf = 0 if regs.endswith("p0") else 1                            # DESIGN D38 A/Bs
+            regs = regs[:-2] or None
         defer = {"d": "row", "ds": "split", "dsx2": "split"}.get(regs, False)
         if defer:
             regs = "x2" if regs == "dsx2" else None
@@ -230,7 +238,8 @@ class Case:
         elif regs == "x2":
             splits = min(max(1, n // 128), 2 * splits)
         kw = dict(splits=splits, block_m=block_m, block_n=block_n, block_dv=block_dv,
-                  num_warps=num_warps, exp2=exp2, timers=timers, defer_scores=defer, col_fallback=colf)
+                  num_warps=num_warps, exp2=exp2, timers=timers, defer_scores=defer, col_fallback=colf,
+                  prefetch=pf)
         if regs == "s1":
             kw.update(num_stages=1)
         elif isinstance(regs, int):

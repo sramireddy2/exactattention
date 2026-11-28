@@ -40,6 +40,10 @@ CONFIGS = {
     "tcpv m2 64/8 r128": {**DECODE, "BLOCK_DV": 64, "num_warps": 8, "maxnreg": 128, "num_stages": 1},
     "tcpv m16 32/4": {},
     "tcpv m16 128/8": {"BLOCK_DV": 128, "num_warps": 8},     # verify steps (T = 8: 16 rows)
+    # Without the L2 prefetch (DESIGN D38), and with only the per-key words prefetched.
+    "tcpv m2 128/8 p0": {**DECODE, "BLOCK_DV": 128, "num_warps": 8, "PREF": 0},
+    "tcpv m2 128/8 pm": {**DECODE, "BLOCK_DV": 128, "num_warps": 8, "PREF": 1},
+    "tcpv m16 128/8 p0": {"BLOCK_DV": 128, "num_warps": 8, "PREF": 0},
     "tcpv m16 128/8 q3": {"BLOCK_DV": 128, "num_warps": 8, "SQ": 3},
     # Uncertified score tiles recomputed whole, not by key column (DESIGN D30).
     "tcpv m16 128/8 whole": {"BLOCK_DV": 128, "num_warps": 8, "COLMAX": 0},
@@ -81,6 +85,9 @@ def kernel_config(over):
     cfg["WDC"] = max(1, min(cfg["D"], (512 * nw) // (cfg["BLOCK_M"] * cfg["BLOCK_N"])))
     cfg.setdefault("CDC", max(1, min(cfg["D"], (512 * nw) // cfg["BLOCK_M"])))
     cfg.setdefault("PSKIP", int(cfg["BLOCK_M"] < 16 and not cfg["RERUN"]))   # as launch picks it (D35; D36 off)
+    # L2 prefetch of the tiles ahead (DESIGN D38), as launch picks it on NVIDIA.
+    cfg.setdefault("PREF", 2 if (cfg["USE_TC"] and cfg["USE_TC_PV"] and not cfg["RERUN"]) else 0)
+    cfg.setdefault("PD", 2)
     cfg["FL_DIV"] = 1
     return cfg, nw, ns
 

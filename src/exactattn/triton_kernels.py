@@ -791,6 +791,61 @@ def _smid(dep):
 
 
 @triton.jit
+def _l2_prefetch(addr, on):
+    """prefetch.global.L2 of the line holding each int64 address where on != 0 (DESIGN D38). A hint
+    with no result: it reads nothing into registers and changes no value, so no bit depends on it.
+    NVIDIA PTX only, so launch turns it off under the CPU interpreter and on other GPUs."""
+    return tl.inline_asm_elementwise(
+        "{ .reg .pred p; setp.ne.b32 p, $2, 0; @p prefetch.global.L2 [$1]; mov.b32 $0, 0; }",
+        "=r,l,r", [addr, on], dtype=tl.int32, is_pure=False, pack=1)
+
+
+@triton.jit
+def _prefetch_meta(KLSB, KERR, KLOST, VLSB, VBAD, keys, on):
+    """L2 prefetch of a key tile's per-key words (DESIGN D38): one address per 128-byte line (and
+    the tile's last key, in case a line boundary falls inside the tile), as one (N, 8) tensor so
+    each thread issues a couple of hints rather than every thread a replicated vector's."""
+    BN: tl.constexpr = keys.shape[0]
+    i = tl.arange(0, BN)
+    last = i == BN - 1
+    col = tl.arange(0, 8)[None, :]
+    a = tl.where(col == 0, (KLSB + keys).to(tl.int64, bitcast=True)[:, None],
+                 tl.where(col == 1, (KERR + keys).to(tl.int64, bitcast=True)[:, None],
+                          tl.where(col == 2, (VLSB + keys).to(tl.int64, bitcast=True)[:, None],
+                                   tl.where(col == 3, (KLOST + keys).to(tl.int64, bitcast=True)[:, None],
+                                            (VBAD + keys).to(tl.int64, bitcast=True)[:, None]))))
+    e8 = ((i % 16) == 0) | last                     # int64 words: 16 per line
+    e4 = ((i % 32) == 0) | last                     # int32 flag words
+    e1 = (i == 0) | last                            # int8 flag words
+    m = (col < 3) & e8[:, None]
+    m = m | ((col == 3) & e4[:, None]) | ((col == 4) & e1[:, None])
+    return _l2_prefetch(a, (m & on[:, None]).to(tl.int32))
+
+
+@triton.jit
+def _prefetch_planes(KX, KST, VX, VST, VLOST, keys, on, kw, vw, c0, D: tl.constexpr, DV: tl.constexpr,
+                     SK: tl.constexpr, SV: tl.constexpr, PSKIP: tl.constexpr):
+    """L2 prefetch of a key tile's digit rows (DESIGN D38): K planes in columns 0..SK-1, V planes
+    from column 4, the lost-V row in column 7, each masked as the tile's loads will be. kw and vw
+    are the tile's K and V flag words, so planes D35 skips and lost-V rows of keys with no lost
+    element (D33) are not fetched. One key's row of a plane is D (or DV) int8: one line at 128."""
+    tl.static_assert(SK <= 4 and SV <= 3)
+    col = tl.arange(0, 8)[None, :]
+    kr = keys[:, None] * D
+    vr = keys[:, None] * DV + c0
+    ka = (KX + kr).to(tl.int64, bitcast=True) + tl.minimum(col, 3).to(tl.int64) * KST
+    va = (VX + vr).to(tl.int64, bitcast=True) + tl.minimum(tl.maximum(col - 4, 0), 2).to(tl.int64) * VST
+    la = (VLOST + vr).to(tl.int64, bitcast=True) + col.to(tl.int64) * 0
+    a = tl.where(col < 4, ka, tl.where(col < 7, va, la))
+    use = ((col < SK) | ((col >= 4) & (col < 4 + SV))) & on[:, None]
+    use = use | ((col == 7) & ((vw & 2) != 0)[:, None] & on[:, None])
+    if PSKIP:
+        use = use & ~((col == 0) & ((kw & 8) != 0)[:, None]) & ~((col == 1) & ((kw & 16) != 0)[:, None])
+        use = use & ~((col == 4) & ((vw & 4) != 0)[:, None])
+    return _l2_prefetch(a, use.to(tl.int32))
+
+
+@triton.jit
 def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
                    PR, PZ, PZE, PNR, PN, PNE, FLAG,
                    SPLIT_LEN, FZ, FN,
@@ -802,7 +857,8 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
                    USE_TC_PV: tl.constexpr, SW: tl.constexpr, SV: tl.constexpr, ANCH: tl.constexpr,
                    RERUN: tl.constexpr, PACK: tl.constexpr, EXP2T, EXP2_INT: tl.constexpr,
                    WDC: tl.constexpr, FL_DIV: tl.constexpr, TIMERS: tl.constexpr, DEFER: tl.constexpr,
-                   COLMAX: tl.constexpr, CDC: tl.constexpr, PSKIP: tl.constexpr):
+                   COLMAX: tl.constexpr, CDC: tl.constexpr, PSKIP: tl.constexpr, PREF: tl.constexpr,
+                   PD: tl.constexpr):
     # One program's work: row block pid_m (segment-major), KV split pid_s, channel block pid_c.
     # Segments: G independent problems (e.g. sequence x KV head), each with R_SEG query rows
     # attending its own NK_SEG keys. Rows and keys are stored segment after segment, so
@@ -883,6 +939,19 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
             tA = _clk(n0)
         nn = n0 + tl.arange(0, BLOCK_N)
         vis = (nn[None, :] < kvl[:, None]) & rmask[:, None]              # (M, N)
+        if PREF > 0:
+            # L2 prefetch ahead of the pipeliner (DESIGN D38). Its next-tile copies wait on plain
+            # loads of that tile's flag words (their masks): a DRAM round trip per tile. The flag
+            # and per-key words of the tile PD + 1 ahead (PD with PREF 1) are hinted now. With
+            # PREF 2, the tile PD ahead loads its flag words here (in L2 from those hints a tile
+            # ago) and hints its digit rows at the end of this tile, after this tile's work.
+            mk = n0 + (PD + (PREF >= 2)) * BLOCK_N + tl.arange(0, BLOCK_N)
+            _prefetch_meta(KLSB, KERR, KLOST, VLSB, VBAD, mk, mk < k1)
+            if PREF >= 2:
+                pk = n0 + PD * BLOCK_N + tl.arange(0, BLOCK_N)
+                pon = pk < k1
+                pkw = tl.load(KLOST + pk, mask=pon, other=0)
+                pvw = tl.load(VBAD + pk, mask=pon, other=0)
         # ---- scores ----
         if USE_TC:
             # Tensor cores: int8 slice products, certified. The bf16 K tile is read and decoded
@@ -1016,6 +1085,8 @@ def _split_program(pid_m, pid_s, pid_c, Q, K, V, KVLEN, ROWS, AM, AE,
         PNEr = f1 + f2
         flag = tl.maximum(flag, ((tl.abs(PZr) + PZEr) >= (1 << 62)).to(tl.int32))
         flag = tl.maximum(flag, tl.max(((tl.abs(PNr) + PNEr) >= (1 << 62)).to(tl.int32), axis=1))
+        if PREF >= 2:
+            _prefetch_planes(KX, KST, VX, VST, VLOST, pk, pon, pkw, pvw, pid_c * BLOCK_DV, D, DV, SK, SV, PSKIP)
         if TIMERS:
             tE = _clk(tl.max(tl.max(PNEr, axis=1), axis=0).to(tl.int32) + tl.max(flag, axis=0))
             T1 += tB - tA
@@ -1116,7 +1187,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                      RERUN: tl.constexpr, PACK: tl.constexpr, EXP2T, EXP2_INT: tl.constexpr,
                      WDC: tl.constexpr, FL_DIV: tl.constexpr, RESET_CNT: tl.constexpr, TIMERS: tl.constexpr,
                      DEFER: tl.constexpr, DEFER_SPLIT: tl.constexpr, COLMAX: tl.constexpr, CDC: tl.constexpr,
-                     PSKIP: tl.constexpr):
+                     PSKIP: tl.constexpr, PREF: tl.constexpr, PD: tl.constexpr):
     pid_s = tl.program_id(1)
     if RERUN:
         # Tier 2 (DESIGN D12, D23): the tier-1 combine appended each (row, channel block) pair to
@@ -1143,7 +1214,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                                VBAD, R_SEG, NK_SEG, NRB, FL_NCB, TM, DFL, tl.where(sub, T2BASE, 0),
                                tl.where(sub, T2CAP, ROWS), tl.where(sub, it, -1), D, DV, BLOCK_M, BLOCK_N, BLOCK_DV, FS, EXP2_MARGIN, USE_TC, SQ, SK,
                                TC_FALLBACK, USE_TC_PV, SW, SV, ANCH, RERUN, PACK, EXP2T, EXP2_INT, WDC, FL_DIV, False,
-                               DEFER, COLMAX, CDC, PSKIP)
+                               DEFER, COLMAX, CDC, PSKIP, 0, PD)
     else:
         if RESET_CNT:
             # Tier 1 runs first in a step: zero tier 2's work-list count here, not with a fill launch.
@@ -1153,7 +1224,7 @@ def _ea_split_kernel(Q, K, V, KVLEN, ROWS, AM, AE,
                        PNE, FLAG, SPLIT_LEN, FZ, FN, KX, KLSB, KERR, KLOST, NKEYS, VX, VLSB, VLOST, VBAD, R_SEG, NK_SEG, NRB,
                        FL_NCB, TM, DFL, 0, ROWS, -1, D, DV, BLOCK_M, BLOCK_N, BLOCK_DV, FS, EXP2_MARGIN, USE_TC, SQ, SK,
                        TC_FALLBACK, USE_TC_PV, SW, SV, ANCH, RERUN, PACK, EXP2T, EXP2_INT, WDC, FL_DIV, TIMERS, DEFER,
-                       COLMAX, CDC, PSKIP)
+                       COLMAX, CDC, PSKIP, PREF, PD)
 
 
 @triton.jit
@@ -1475,7 +1546,8 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
            q_tc=None, k_tc=None, tc_fallback: bool = True, v_tc=None, sw: int = 5, pv_tier2: bool = True,
            sq: int = 4, num_warps: int = 4, exp2: str = "int", num_stages: int | None = None,
            maxnreg: int | None = None, timers: bool = False, defer_scores=False, col_fallback: int = 4,
-           plane_skip: bool | None = None, tile_skip: bool | None = False, subsplit_cap: int | None = None):
+           plane_skip: bool | None = None, tile_skip: bool | None = False, subsplit_cap: int | None = None,
+           prefetch: int | None = None, prefetch_dist: int = 2):
     """Device-level launch with no host transfers and no sync.
 
     Qt (R, d), Kt (n, d), Vt (n, dv) are int16 views of bf16 on the device; KL (R,) is int32.
@@ -1506,6 +1578,10 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     subsplit_cap (DESIGN D37): tier 2 runs its first this-many work items as sub-splits of a few
     hundred keys, so a handful of items spread over the GPU, and any further items over tier 1's
     KV splits. None picks 64; 0 runs every item over tier 1's splits. Same bits when certified.
+    prefetch (DESIGN D38): tier 1 with tensor-core P·V hints key tiles ahead into L2. 1 hints the
+    per-key words of the tile prefetch_dist ahead, 2 also the digit rows that tile will load.
+    None picks 2 on NVIDIA GPUs and 0 elsewhere (the CPU interpreter has no PTX). A hint changes
+    no value, so no bit.
     Returns (OUT int32 (R, dv) or
     (G, R, dv), split_flags, combine_flags), all on the device; flags are per flattened row."""
     batched = Qt.dim() == 3
@@ -1623,6 +1699,12 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
     TMB = (torch.zeros((G * triton.cdiv(r_seg, block_m) * nsplit * (dv // block_dv), 24), dtype=torch.int64,
                        device=dev) if timers else None)
 
+    # L2 prefetch (DESIGN D38): tier 1 with tensor-core P·V, on NVIDIA only (inline PTX).
+    nvidia = dev.type == "cuda" and torch.version.hip is None
+    pref = (2 if nvidia else 0) if prefetch is None else int(prefetch)
+    pref = pref if (use_tc and use_tc_pv and nvidia) else 0
+    assert pref in (0, 1, 2)
+
     def pskip(bm, rerun):
         # 0 off, 1 per-key plane loads (D35), 2 also per-tile plane MMAs (D36). Tier 1 only.
         on = bool((bm < 16) if plane_skip is None else plane_skip) and not rerun
@@ -1646,7 +1728,8 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
             EXP2T=exp2t, EXP2_INT=(exp2 == "int"), WDC=wdc, FL_DIV=block_dv // bdv,
             RESET_CNT=tier2 and not rerun, TIMERS=bool(timers and not rerun), DEFER=defer,
             DEFER_SPLIT=bool(rerun and defer_split), COLMAX=int(col_fallback), CDC=cdc,
-            PSKIP=pskip(bm, rerun), num_warps=nw, **stg)
+            PSKIP=pskip(bm, rerun), PREF=0 if rerun else pref, PD=max(1, int(prefetch_dist)), num_warps=nw,
+            **stg)
 
     ck = split(False, block_n, use_tc_pv, vtc, sw, sv, anch, block_m, block_dv, num_warps, 0, stages)
     # Registers and spills of the compiled split kernel (None under the CPU interpreter).
@@ -1699,7 +1782,7 @@ def launch(Qt, Kt, Vt, KL, maxlen: int, alpha, *, out: str = "bf16", splits: int
         split(True, block_n_t2, False, [dz[torch.int8], dz[torch.int64], dz[torch.int8], dz[torch.int8]], 1, 1, 0,
               block_m_t2, cbdv, 8, progs, {"num_stages": 2})
         combine(NEED, True, False)
-    _LAST_DEBUG.update(timers=TMB, nsplit=nsplit, defer_flags=DFL if defer else None)
+    _LAST_DEBUG.update(timers=TMB, nsplit=nsplit, defer_flags=DFL if defer else None, prefetch=pref)
     t1 = slice(0, t2base)
     _LAST_DEBUG.update(block_m=block_m, block_m_t2=block_m_t2, pack=pack, split_flags=FL, combine_flags=OF,
                        tier2_need=NEED, tier2_cnt=CNT, tier2_wl=WL, PR=PR_[t1].view(nsplit, R),

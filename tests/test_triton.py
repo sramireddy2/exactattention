@@ -285,6 +285,64 @@ def test_zero_digit_planes_skipped_without_changing_bits(block_m):
         assert np.array_equal(got[r], attention_row(Q[r], K[:L], V[:L], alpha)), r
 
 
+@pytest.mark.parametrize("block_m", [2, 16])
+def test_l2_prefetch_keeps_pv_bits(block_m):
+    """DESIGN D38: tier 1's L2 prefetch of the tiles ahead is a hint, so every mode of it (off,
+    per-key words, words and digit rows) must give the same bits, flags and P·V partials. The keys
+    mix skippable planes (D35) and lost V elements (D33), so the prefetch masks matter, and each
+    KV split spans several 32-key tiles, so the prefetch distance does. On NVIDIA the default must
+    be mode 2; elsewhere (the CPU interpreter) launch turns it off."""
+    import torch
+
+    from exactattn.triton_kernels import _LAST_DEBUG, launch, tc_slices, tc_v_slices
+
+    rng = np.random.default_rng(zlib.crc32(f"prefetch/{block_m}".encode()))
+    d, dv, R, n = 64, 32, 8, 300
+    Q, K, V = bf16(rng, (R, d)), bf16(rng, (n, d)), bf16(rng, (n, dv), "wide")
+    short = np.array([0x3F80, 0x3FC0, 0x4000, 0x3F40], dtype=np.uint16)   # 1, 1.5, 2, 0.75
+    sign = (rng.integers(0, 2, size=(n, d)) << 15).astype(np.uint16)
+    K[3::5] = (short[rng.integers(0, 4, size=(n, d))] | sign)[3::5]       # top K planes only
+    V[2::5] = (short[rng.integers(0, 4, size=(n, dv))] | sign[:, :dv])[2::5]
+    kv_len = rng.integers(n // 2, n + 1, size=R).astype(np.int32)
+    kv_len[0] = n
+    alpha = default_alpha(d)
+    dev = torch.device(DEVICE)
+
+    def t16(x):
+        return torch.from_numpy(np.ascontiguousarray(x).view(np.int16)).to(dev)
+
+    k_tc, v_tc = tc_slices(K, 4, dev), tc_v_slices(V, 3, dev)
+    vw = v_tc[3].cpu().numpy()
+    assert ((vw & 2) != 0).any() and ((vw & 4) != 0).any()
+
+    def run(pf, dist=2):
+        OUT, FL, OF = launch(t16(Q), t16(K), t16(V), torch.from_numpy(kv_len).to(dev), n, alpha, splits=2,
+                             block_m=block_m, block_n=32, block_dv=32, k_tc=k_tc, v_tc=v_tc, pv_tier2=False,
+                             prefetch=pf, prefetch_dist=dist)
+        got = _LAST_DEBUG["prefetch"]
+        return got, [OUT.cpu(), FL.cpu(), OF.cpu(), _LAST_DEBUG["PN"].cpu().clone(),
+                     _LAST_DEBUG["PNE"].cpu().clone()]
+
+    nvidia = dev.type == "cuda" and torch.version.hip is None
+    mode, base = run(0)
+    assert mode == 0
+    mode, dflt = run(None)
+    assert mode == (2 if nvidia else 0)
+    for pf, dist in ((1, 2), (2, 2), (2, 1), (2, 3)):
+        mode, got = run(pf, dist)
+        assert mode == (pf if nvidia else 0)
+        for a_, b_ in zip(base, got):
+            assert torch.equal(a_, b_), (pf, dist)
+    for a_, b_ in zip(base, dflt):
+        assert torch.equal(a_, b_)
+    flags = np.maximum(base[1].amax(dim=(0, 2)).numpy(), base[2].amax(dim=1).numpy())
+    out = (base[0].numpy() & 0xFFFF).astype(np.uint16)
+    assert (flags == 0).any()
+    for r in np.flatnonzero(flags == 0):
+        L = int(kv_len[r])
+        assert np.array_equal(out[r], attention_row(Q[r], K[:L], V[:L], alpha)), r
+
+
 @pytest.mark.parametrize("pv", [True, False])
 @pytest.mark.parametrize("block_m", [4, 1])
 def test_zero_digit_plane_tiles_skip_mmas_without_changing_bits(block_m, pv):

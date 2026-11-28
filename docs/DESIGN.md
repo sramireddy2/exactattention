@@ -2115,6 +2115,78 @@ Tier 2 by launch, from the profile (ms, split + combine):
   computes, or by fitting two programs on an SM. Smaller sub-splits and a parallel tier-2
   combine are worth at most 0.02–0.1 ms on the two B=32 shapes.
 
+## D38. L2 prefetch of the key tiles ahead
+
+Run 1136 left tier 1 alone at 1.97–2.13× FlashInfer on the goal 1 shapes. 59% of each 64-key
+tile is "rest": load waits and loop control (D37).
+
+**Where the wait is.** `scripts/sm120_sass_profile.py`'s parser, run on the decode build (tcpv
+m2 128/8), lists the key loop's memory operations by source line. Triton's pipeliner (depth 2)
+already copies the next tile's K and V digit planes, the lost-V rows and the per-key words with
+`LDGSTS` (asynchronous). Two loads are plain synchronous `LDG`:
+- the next tile's K flag word (`KLOST`, 3 `LDG`);
+- the next tile's V flag word (`VBAD`, 5 `LDG`).
+
+Their values are the masks of the plane copies (D35's skips, D33's lost-V rows). So each tile
+issues the next tile's copies only after one or two DRAM round trips on those words. At one
+program per SM nothing else hides that wait.
+
+**What is prefetched.** A new constexpr `PREF` takes three values:
+- 0: off.
+- 1: the tile `PD` ahead. At the top of each tile, `prefetch.global.L2` hints that tile's per-key
+  words: `KLSB`, `KERR`, `VLSB` (int64), `KLOST` (int32) and `VBAD` (int8). That is one address
+  per 128-byte line, plus the tile's last key.
+- 2 (the default): the per-key words of the tile `PD + 1` ahead, and the digit rows of the tile
+  `PD` ahead.
+  - The `PD` tile's two flag words are loaded at the top of the iteration. A tile earlier they
+    were hinted, so these are L2 hits.
+  - After this tile's merge, its K planes, V planes and lost-V rows are hinted, masked as its
+    loads will be. A plane D35 skips is not fetched, and neither is the lost-V row of a key with
+    no lost element. So DRAM reads no byte the kernel would not read anyway.
+
+`PD` defaults to 2. With the pipeliner one tile ahead, the hinted tile has about a tile's time,
+roughly 10 µs, to reach L2. By the time the pipeliner loads its flag words and issues its
+copies, they are L2 hits.
+
+**How.**
+- `_l2_prefetch` is one predicated `prefetch.global.L2` per element, via `inline_asm_elementwise`
+  (not pure, so it is never removed). It has no result and changes no value, so no bit depends
+  on it.
+- `_prefetch_meta` and `_prefetch_planes` build one (64, 8) address tensor per tile: 512
+  elements over 256 threads. Each thread then issues 2 hints, instead of every thread issuing a
+  replicated 64-vector.
+- The key loop gains 4 `CCTL` (prefetch) instructions per thread per tile.
+- The masks also stop at the split's end, `k1`.
+
+**Where it runs.**
+- `launch(prefetch=None, prefetch_dist=2)`: mode 2 for tier 1 with tensor-core scores and P·V on
+  NVIDIA, and 0 elsewhere. The CPU interpreter has no PTX.
+- Tier 2 always passes 0.
+- `prefetch=0/1/2` forces a mode. `_LAST_DEBUG["prefetch"]` reports the mode that ran.
+
+**Checks.**
+- New test `test_l2_prefetch_keeps_pv_bits`, at block_m 2 and 16.
+  - The data has 300 keys in two KV splits of 32-key tiles, top-plane-only K and V rows, and
+    lost V elements.
+  - Modes 0, 1 and 2, and distances 1, 2 and 3, must give the same outputs, flags and P·V
+    partials. Certified rows must equal the reference.
+  - The default must be mode 2 on NVIDIA and 0 under the interpreter.
+  - On the interpreter it can only check the plumbing. The bit check is the GPU run:
+    `tests_segments` now also selects `subsplits`, so D37's test runs on the GPU too.
+- All 28 `sm120_compile_check` builds pass. They include new `p0` and `pm` A/B builds.
+  - tcpv m2 128/8 spills 80 B (72 B without the prefetch).
+  - tcpv m16 128/8 spills 904 B (836 B).
+- Bench A/Bs:
+  - the suffix `p0` turns the prefetch off and `pm` keeps only the per-key words;
+  - `p0`, `x2p0` and `hp0` pair with the winning default, `x2` and `h` configs.
+- `verify_t8`'s cap goes from 1500 to 2400 s. It took 20 minutes in run 1136 and now has four
+  more configs.
+
+Expected: if the two flag-word round trips are most of the 5.6 µs of "rest", a 64-key decode
+tile drops from about 9.7 µs toward 6–7 µs. Tier 1 is then about 1.3–1.4× FlashInfer's bytes
+time, enough for goal 1 on all four shapes. If the copies themselves are the wait, the gain is
+smaller: L2 hits instead of DRAM misses on loads that were already asynchronous.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model
