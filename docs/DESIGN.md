@@ -2071,6 +2071,50 @@ Expected: B=32 4K tier 2 drops from 0.102 ms to about 0.02 ms, and B=32 16K from
 lose most of their 0.06–0.07 ms of tier 2. Undoing D36 should give back its ~2% on every decode
 shape.
 
+### Run 1136 (job 16244019): B=32 3–4% faster, tier 1 now the limit on every goal shape
+
+Run 1135 went out without `EA_PLAN=flash`, so it ran only the correctness plan, on an H200.
+Every fixture matched (0 fallback rows on all backends) and no test failed, but
+`tests_triton_rest` hit its 1500 s cap twice. Run 1136 is the benchmark on the RTX PRO 6000.
+The fixture matched there too, and every bench row was certified.
+
+| shape | 1133 | 1134 | 1136 | vs 1133 | ratio |
+|---|---|---|---|---|---|
+| decode B=1 64K | 0.393 | 0.402 | 0.398 | +1.3% | 2.13× |
+| decode B=8 16K | 0.734 | 0.748 | 0.749 | +2.0% | 2.09× |
+| decode B=32 4K | 0.869 | 0.883 | 0.838 | −3.6% | 2.33× |
+| decode B=32 16K | 3.173 | 3.223 | 3.066 | −3.4% | 2.18× |
+| verify B=8 4K | 0.540 | 0.529 | 0.523 | −3.1% | 15.5× |
+| verify B=1 16K | 0.326 | 0.325 | 0.330 | +1.2% | 15.5× |
+| verify B=8 16K | 1.609 | 1.608 | 1.671 | +3.9% | 4.6× |
+
+The ratio column uses the FlashInfer times from run 1136. FlashInfer measured verify B=8 4K at
+0.034 ms here, against 0.040 ms in 1133.
+
+Tier 2 by launch, from the profile (ms, split + combine):
+
+| shape | items | 1134 | 1136 |
+|---|---|---|---|
+| decode B=32 4K | 4 | 0.102 + 0.004 | 0.039 + 0.012 (32 × 128 keys) |
+| decode B=32 16K | 6 | 0.322 + 0.004 | 0.135 + 0.023 (64 × 256 keys) |
+| verify B=8 4K | 3 | 0.069 + 0.005 | 0.042 + 0.013 (32 × 128 keys) |
+| verify B=1 16K | 2 | 0.055 + 0.015 | 0.055 + 0.022 (64 × 256 keys) |
+
+- **Tier 2 halved, but did not reach the expected ~0.02–0.04 ms.** A sub-split of 128 or 256
+  keys still costs 40–135 µs. That is about 14–20 µs per 64-key tile of int64 P·V, mostly fixed
+  per tile. Verify B=1 16K already had 64 splits of 256 keys, so it gained nothing.
+- **The combine grew.** It went from 4 to 12–23 µs, because each sub-split item merges its
+  `NS2` partials one after another in a single program.
+- **Undoing D36 did not give back 2% on B=1 64K and B=8 16K.** They stay 1–2% behind 1133.
+  Tier 1 on those shapes is 0.368 and 0.728 ms, against 0.380 and 0.751 in 1134. The rest is
+  run-to-run noise at this level, and both runs used the same node.
+- **Tier 1 alone misses 2× on three of the four goal shapes.** Its time over FlashInfer is 1.97×
+  for B=1 64K, 2.03× for B=8 16K, 2.13× for B=32 4K and 2.06× for B=32 16K. The tier-1 phase
+  clocks are unchanged from 1134: 59% of a program is still load waits and loop control. So
+  goal 1 now depends on tier-1 load latency, either by loading the next tile while this one
+  computes, or by fitting two programs on an SM. Smaller sub-splits and a parallel tier-2
+  combine are worth at most 0.02–0.1 ms on the two B=32 shapes.
+
 ## Open questions
 
 - **Q1. Real activations.** How wide must the score, Z and N windows be on real model

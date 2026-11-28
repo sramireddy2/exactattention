@@ -101,19 +101,22 @@ time divided by FlashInfer's.
    goal covers every verify shape with n ≥ 4K, L2-resident ones included. Verify is the step
    speculative decoding adds, and its gap is largest on the small shapes.
 
-Status as of run 1133 (DESIGN D35), still the best measured. Run 1134 (D36) was about 2%
-slower on decode (DESIGN D36). Verify ratios are the bench's, from unrounded times:
+Status as of run 1136 (DESIGN D37), the current code. Run 1133 (D35) was 1–2% faster on
+decode B=1 64K and B=8 16K: 2.10× and 2.04×. Ratios are the bench's, from unrounded times:
 
 | goal | shape | FlashInfer (ms) | exact (ms) | ratio | met |
 |---|---|---|---|---|---|
-| 1 | decode B=1, 64K | 0.187 | 0.393 | 2.10× | no |
-| 1 | decode B=8, 16K | 0.359 | 0.734 | 2.04× | no |
-| 1 | decode B=32, 4K | 0.359 | 0.869 | 2.42× | no |
-| 1 | decode B=32, 16K | 1.406 | 3.173 | 2.26× | no |
-| 2 | verify B=1, 4K | 0.012 | 0.086 | 6.9× | no |
-| 2 | verify B=1, 16K | 0.021 | 0.326 | 15.6× | no |
-| 2 | verify B=8, 4K | 0.040 | 0.540 | 13.6× | no |
-| 2 | verify B=8, 16K | 0.363 | 1.609 | 4.4× | yes |
+| 1 | decode B=1, 64K | 0.187 | 0.398 | 2.13× | no |
+| 1 | decode B=8, 16K | 0.359 | 0.749 | 2.09× | no |
+| 1 | decode B=32, 4K | 0.359 | 0.838 | 2.33× | no |
+| 1 | decode B=32, 16K | 1.406 | 3.066 | 2.18× | no |
+| 2 | verify B=1, 4K | 0.013 | 0.086 | 6.8× | no |
+| 2 | verify B=1, 16K | 0.021 | 0.330 | 15.5× | no |
+| 2 | verify B=8, 4K | 0.034 | 0.523 | 15.5× | no |
+| 2 | verify B=8, 16K | 0.363 | 1.671 | 4.6× | yes |
+
+The first kernel alone (tier 1) is 1.97–2.13× FlashInfer on the goal 1 shapes, so goal 1 now
+depends on tier 1's load latency (DESIGN D37, run 1136).
 
 ## Roadmap
 
